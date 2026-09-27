@@ -17,7 +17,7 @@ else:
 REMOTE_DB='/data/database/archive.sqlite3'
 REMOTE_EXPORTS={'gui':'/data/exports/gui/index.html','export-xlsx':'/data/exports/分析.xlsx'}
 LOCAL_EXPORTS={'gui':Path('gui/index.html'),'export-xlsx':Path('分析.xlsx')}
-FORWARDED={'status','audit','verify','sql','tag','sync'}
+FORWARDED={'status','audit','verify','sql','tag','sync','records'}
 BLOCKED={'backup','import','export','install-service','login','watch'}
 
 def read_marker():

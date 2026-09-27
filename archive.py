@@ -9,6 +9,7 @@ from ikarchive.planner import Planner
 from ikarchive.collector import catalog, sync, ROOT
 from ikarchive.xlsx_export import export_xlsx
 from ikarchive.gui import write_gui
+from ikarchive.records import RecordReader
 from scripts.data_root import data_root
 
 OUTPUT=data_root()
@@ -211,6 +212,17 @@ def main():
     p=sub.add_parser('sql');p.add_argument('query')
     p=sub.add_parser('install-service');p.add_argument('--interval',type=int,default=120);p.add_argument('--account');p.add_argument('--nxapi-data')
     p=sub.add_parser('tag');p.add_argument('tag_action',choices=('add','remove','list'));p.add_argument('--account');p.add_argument('--match-key');p.add_argument('--tag');p.add_argument('--note')
+    p_rec=sub.add_parser('records')
+    rec_sub=p_rec.add_subparsers(dest='subaction',required=True)
+    p_list=rec_sub.add_parser('list')
+    p_list.add_argument('--account',required=True)
+    p_list.add_argument('--kind',choices=('vs','coop'),default=None)
+    p_list.add_argument('--limit',type=int,default=50)
+    p_list.add_argument('--offset',type=int,default=0)
+    p_get=rec_sub.add_parser('get')
+    p_get.add_argument('--account',required=True)
+    p_get.add_argument('--kind',choices=('vs','coop'),required=True)
+    p_get.add_argument('--match-key',required=True)
     sub.add_parser('login')
     p=sub.add_parser('watch');p.add_argument('--interval',type=int,default=120)
     args=parser.parse_args();args.db=args.db.resolve()
@@ -220,6 +232,38 @@ def main():
         return subprocess.call([os.environ.get('NODE','node'),str(binary)])
     if args.db==DEFAULT.resolve() and nas_storage_marker() is not None:
         raise ValueError('NAS_STORAGE_ACTIVE: use scripts/nas_archive.py; local default database access is disabled')
+    if args.command=='records':
+        if not args.account:
+            raise ValueError('account must be a non-empty string')
+        with RecordReader(args.db) as reader:
+            if args.subaction=='list':
+                result=reader.list_matches(
+                    account=args.account,
+                    kind=args.kind,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
+                print(json.dumps(result,ensure_ascii=False,indent=2))
+                return 0
+            if args.subaction=='get':
+                if not args.match_key:
+                    raise ValueError('match_key must be a non-empty string')
+                item=reader.get_match(
+                    account=args.account,
+                    kind=args.kind,
+                    match_key=args.match_key,
+                )
+                if item is None:
+                    print('null')
+                    return 0
+                if item.get('source') is not None and 'body_bytes' in item['source']:
+                    src=dict(item['source'])
+                    body_bytes=src.pop('body_bytes')
+                    src['body_base64']=base64.b64encode(body_bytes).decode('ascii')
+                    item=dict(item)
+                    item['source']=src
+                print(json.dumps(item,ensure_ascii=False,indent=2))
+                return 0
     if args.command=='watch':
         import time
         if args.interval<60:raise ValueError('interval must be >=60')

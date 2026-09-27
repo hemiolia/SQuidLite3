@@ -34,6 +34,10 @@ NASへの移行を設定済みの場合、同じ起動ファイルがNASで最�
 
 NASでの収集構成、暗号化バックアップ、および復元方法については [docs/operations/nas-migration.md](docs/operations/nas-migration.md) を参照。
 
+Macを経由せず、NASの生成HTML・Excelを非公開クラウドへ配信する手順は [NAS軽量生成物配信](docs/operations/nas-export-publisher.md) を参照。
+
+保存した対戦・バイトを読み取るCLIは `python3 scripts/nas_archive.py records list --account ACCOUNT`。単件は `records get --account ACCOUNT --kind vs --match-key KEY`（バイトは `--kind coop`）で取得できる。詳細の元HTTP本文は `source.body_base64`、派生JSON文字列は `detail_json` に分けて返す。ローカルDBを使う環境では `python3 archive.py --db PATH records ...` を使う。
+
 ## 検証
 
 `npm test` は公開サンプルと人工データだけを見る。本人の全記録を取り終えたことにはならない。
