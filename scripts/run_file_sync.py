@@ -4,13 +4,24 @@
 sync_nas.py -> sync_gdrive.py の順に実行し、CLI引数をそのまま伝播する。
 """
 from pathlib import Path
+import argparse
 import subprocess
 import sys
+if __package__:
+    from .data_root import client_mode, data_root
+else:
+    from data_root import client_mode, data_root
 
 
 def run_sync(args: list[str] | None = None) -> int:
     if args is None:
         args = sys.argv[1:]
+    local_parser = argparse.ArgumentParser(add_help=False)
+    local_parser.add_argument('--local', type=Path)
+    local_args, _ = local_parser.parse_known_args(args)
+    local_root = local_args.local if local_args.local is not None else data_root()
+    if client_mode(local_root):
+        raise RuntimeError('NAS_CLIENT_MODE_FILE_SYNC_DISABLED: file sync cannot run from a NAS client root')
 
     script_dir = Path(__file__).resolve().parent
     nas_script = (script_dir / 'sync_nas.py').resolve()

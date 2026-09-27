@@ -21,10 +21,11 @@ import uuid
 
 if __package__:
     from .sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+    from .data_root import client_mode, data_root
 else:
     from sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+    from data_root import client_mode, data_root
 
-DEFAULT_LOCAL = Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR', str(Path.home() / 'Documents/イカリング3アーカイブ')))
 DEFAULT_REMOTE_HOST = 'nas'
 DEFAULT_REMOTE_DIR = '/home/Natsuki/ikaring-archive'
 
@@ -566,13 +567,15 @@ def _run_sync(args, local_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--local', type=Path, default=DEFAULT_LOCAL, help='ローカルデータディレクトリ')
+    parser.add_argument('--local', type=Path, help='ローカルデータディレクトリ')
     parser.add_argument('--remote-host', default=DEFAULT_REMOTE_HOST, help='SSHホスト名 (例: nas)')
     parser.add_argument('--remote-dir', default=DEFAULT_REMOTE_DIR, help='NAS側データディレクトリ')
     parser.add_argument('--mode', choices=['both', 'push', 'pull'], default='both', help='同期モード')
     parser.add_argument('--dry-run', action='store_true', help='変更を行わず確認のみ')
     args = parser.parse_args()
-    local_dir = args.local.resolve()
+    local_dir = (args.local if args.local is not None else data_root()).resolve()
+    if client_mode(local_dir):
+        raise ValueError('NAS_CLIENT_MODE_FILE_SYNC_DISABLED: local file sync cannot use a NAS client root')
     with sync_lock(local_dir):
         _run_sync(args, local_dir)
 

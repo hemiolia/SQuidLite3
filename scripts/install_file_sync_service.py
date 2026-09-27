@@ -11,6 +11,10 @@ import subprocess
 import sys
 from typing import Any
 import uuid
+if __package__:
+    from .data_root import client_mode
+else:
+    from data_root import client_mode
 
 SERVICE_LABEL = 'local.ikaring3.file-sync'
 DEFAULT_START_INTERVAL = 300
@@ -168,6 +172,8 @@ def install_service(
     run_launchctl: bool = True,
     uid: int | None = None,
 ) -> dict[str, Any]:
+    if client_mode():
+        raise RuntimeError('NAS_CLIENT_MODE_FILE_SYNC_DISABLED: file sync service cannot be installed in NAS client mode')
     if sys.platform != 'darwin':
         raise RuntimeError("LaunchAgentのインストールはmacOS (darwin) のみ対応しています")
 

@@ -6,7 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts.nas_archive import data_root, read_marker
+from scripts.data_root import data_root, marker_present
+from scripts.nas_archive import read_marker
 
 
 def main(argv=None):
@@ -18,8 +19,7 @@ def main(argv=None):
     if sys.version_info < (3, 10):
         raise RuntimeError('Python 3.10以上が必要です: https://www.python.org/downloads/')
 
-    marker_path = data_root() / 'config' / 'storage-location.json'
-    if marker_path.is_symlink() or marker_path.exists():
+    if marker_present(data_root()):
         read_marker()
         if a.check:
             if not shutil.which('ssh'):

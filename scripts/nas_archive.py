@@ -9,6 +9,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+if __package__:
+    from .data_root import client_mode, data_root, marker_path
+else:
+    from data_root import client_mode, data_root, marker_path
 
 REMOTE_DB='/data/database/archive.sqlite3'
 REMOTE_EXPORTS={'gui':'/data/exports/gui/index.html','export-xlsx':'/data/exports/分析.xlsx'}
@@ -16,11 +20,8 @@ LOCAL_EXPORTS={'gui':Path('gui/index.html'),'export-xlsx':Path('分析.xlsx')}
 FORWARDED={'status','audit','verify','sql','tag','sync'}
 BLOCKED={'backup','import','export','install-service','login','watch'}
 
-def data_root():
-    return Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR',str(Path.home()/'Documents/イカリング3アーカイブ')))
-
 def read_marker():
-    path=data_root()/'config'/'storage-location.json'
+    path=marker_path(data_root())
     try:
         if path.is_symlink():raise ValueError('symlink')
         data=json.loads(path.read_text(encoding='utf-8'))
@@ -79,7 +80,8 @@ def main(argv=None):
     result=subprocess.run(archive_command(marker,command,args))
     if result.returncode:return result.returncode
     if command in REMOTE_EXPORTS:
-        destination=data_root()/'exports'/LOCAL_EXPORTS[command]
+        destination=(Path.home()/'Library/Caches/ikaring-archive/exports' if client_mode()
+                     else data_root()/'exports')/LOCAL_EXPORTS[command]
         result_code=copy_remote_export(marker,REMOTE_EXPORTS[command],destination)
         if result_code:return result_code
         print(str(destination))

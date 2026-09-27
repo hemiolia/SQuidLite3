@@ -24,6 +24,8 @@ class TestFileSyncService(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.base_path = Path(self.temp_dir.name).resolve()
+        self.env = patch.dict(os.environ, {'IKARING_ARCHIVE_DATA_DIR': str(self.base_path / 'local')})
+        self.env.start()
         self.repo_dir = self.base_path / "repo"
         self.scripts_dir = self.repo_dir / "scripts"
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -37,6 +39,7 @@ class TestFileSyncService(unittest.TestCase):
         self.logs_dir = self.base_path / "Library" / "Logs" / "ikaring-archive-file-sync"
 
     def tearDown(self):
+        self.env.stop()
         self.temp_dir.cleanup()
 
     def test_generate_plist_payload(self):
@@ -307,6 +310,15 @@ class TestFileSyncService(unittest.TestCase):
 
 
 class TestRunFileSync(unittest.TestCase):
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {'IKARING_ARCHIVE_DATA_DIR': self.temp_dir.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp_dir.cleanup()
 
     @patch('subprocess.run')
     def test_run_sync_success_order_and_args(self, mock_run):

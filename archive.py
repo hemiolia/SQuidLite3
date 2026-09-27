@@ -9,8 +9,9 @@ from ikarchive.planner import Planner
 from ikarchive.collector import catalog, sync, ROOT
 from ikarchive.xlsx_export import export_xlsx
 from ikarchive.gui import write_gui
+from scripts.data_root import data_root
 
-OUTPUT=Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR',str(Path.home()/'Documents/イカリング3アーカイブ')))
+OUTPUT=data_root()
 DEFAULT=OUTPUT/'database/archive.sqlite3'
 AUTH_INCIDENTS={'AUTH_REQUIRED','AUTH_EXPIRED','SESSION_EXPIRED'}
 

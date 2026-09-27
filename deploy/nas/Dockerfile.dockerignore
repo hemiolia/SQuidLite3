@@ -2,6 +2,8 @@
 # is the build context. Keep every path excluded until explicitly allowed.
 *
 !archive.py
+!scripts/
+!scripts/data_root.py
 !package.json
 !package-lock.json
 !.npmrc

@@ -16,10 +16,11 @@ import uuid
 
 if __package__:
     from .sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+    from .data_root import client_mode, data_root
 else:
     from sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+    from data_root import client_mode, data_root
 
-DEFAULT_LOCAL = Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR', str(Path.home() / 'Documents/イカリング3アーカイブ')))
 DEFAULT_GDRIVE = Path.home() / 'Library/CloudStorage/GoogleDrive-originnatsumikanf@gmail.com/マイドライブ/イカリング3アーカイブ'
 
 IGNORE_PATTERNS = {'.DS_Store', '._.DS_Store'}
@@ -283,13 +284,15 @@ def _run_sync(args, local_dir, gdrive_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--local', type=Path, default=DEFAULT_LOCAL, help='ローカルデータディレクトリ')
+    parser.add_argument('--local', type=Path, help='ローカルデータディレクトリ')
     parser.add_argument('--gdrive', type=Path, default=DEFAULT_GDRIVE, help='Google Drive側データディレクトリ')
     parser.add_argument('--mode', choices=['both', 'push', 'pull'], default='both', help='同期モード')
     parser.add_argument('--dry-run', action='store_true', help='変更を行わず確認のみ')
     args = parser.parse_args()
-    local_dir = args.local.resolve()
+    local_dir = (args.local if args.local is not None else data_root()).resolve()
     gdrive_dir = args.gdrive.resolve()
+    if client_mode(local_dir):
+        raise ValueError('NAS_CLIENT_MODE_FILE_SYNC_DISABLED: local file sync cannot use a NAS client root')
     with sync_lock(local_dir):
         _run_sync(args, local_dir, gdrive_dir)
 

@@ -27,7 +27,7 @@ if (( ${#python_sources[@]} == 0 || ${#node_sources[@]} == 0 )); then
     exit 2
 fi
 source_files=(
-    archive.py package.json package-lock.json .npmrc sql/schema.sql
+    archive.py scripts/data_root.py package.json package-lock.json .npmrc sql/schema.sql
     deploy/nas/Dockerfile deploy/nas/Dockerfile.dockerignore
     config/font-unicode-ranges.json
     assets/fonts/Splatoon2-Unified.otf
@@ -73,7 +73,7 @@ exec 9> "$runtime/.deploy.lock"
 flock -n 9 || { echo "Another deployment is running" >&2; exit 1; }
 stage="$(mktemp -d "$runtime/.app-stage.XXXXXXXX")"
 tar -C "$stage" -xf -
-for required in archive.py package.json package-lock.json .npmrc sql/schema.sql deploy/nas/Dockerfile deploy/nas/Dockerfile.dockerignore; do
+for required in archive.py scripts/data_root.py package.json package-lock.json .npmrc sql/schema.sql deploy/nas/Dockerfile deploy/nas/Dockerfile.dockerignore; do
     if [[ ! -f "$stage/$required" ]]; then
         echo "Transfer is incomplete" >&2
         exit 2
