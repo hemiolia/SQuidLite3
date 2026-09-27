@@ -16,6 +16,8 @@ Python 3.10 以上と Node.js 22 以上が入っている必要がある。
 
 保存先の既定は `~/Documents/イカリング3アーカイブ` である。ソースとは分けてある。
 
+NASへの移行を設定済みの場合、同じ起動ファイルがNASで最新の画面を生成し、手元で開く。手元ではPythonとSSHクライアントを使い、収集はNASで継続する。状態確認は `python3 scripts/nas_archive.py status`、分析表の取得は `python3 scripts/nas_archive.py export-xlsx` を使う。
+
 ターミナルを知らない人向けの導入は、まだ作っていない。
 
 ## 認証

@@ -2,7 +2,7 @@
 """
 NAS (nas:/home/Natsuki/ikaring-archive) とローカルのイカリング3アーカイブを双方向同期するスクリプト。
 UGOSのrsync制限を回避し、SSH経由でタイムスタンプ・サイズ比較により差分のみを安全かつ高速に転送します。
-database/、secrets/、認証データ、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
+database/、secrets/、認証データ、rclone設定(rclone.conf/rclone-*.conf)、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
 """
 
 import argparse
@@ -19,13 +19,18 @@ import tempfile
 import time
 import uuid
 
+if __package__:
+    from .sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+else:
+    from sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+
 DEFAULT_LOCAL = Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR', str(Path.home() / 'Documents/イカリング3アーカイブ')))
 DEFAULT_REMOTE_HOST = 'nas'
 DEFAULT_REMOTE_DIR = '/home/Natsuki/ikaring-archive'
 
 IGNORE_PATTERNS = {'.DS_Store', '._.DS_Store'}
 IGNORE_SUFFIXES = {'.tmp', '.lock', '-wal', '-shm'}
-IGNORE_GLOBS = {'*.sqlite*', '*.db*', '*.gpg', '*token*', '*credential*', '.env*'}
+IGNORE_GLOBS = {'*.sqlite*', '*.db*', '*.gpg', '*token*', '*credential*', '.env*', 'rclone.conf', 'rclone-*.conf', '.sync-state-*.json'}
 IGNORE_DIR_NAMES = {
     'database', 'secrets', 'nxapi-nodejs',
     'runtime', 'spool', '.history', '.git', 'backups', '.sync-conflicts'
@@ -184,7 +189,7 @@ print(json.dumps(result))
     res = subprocess.run(cmd, input=remote_code, capture_output=True, text=True, check=True)
     return json.loads(res.stdout.strip())
 
-def push_file(local_path: Path, rel_path: str, remote_host: str, remote_dir: str, is_conflict: bool = False, local_dir: Path = None):
+def push_file(local_path: Path, rel_path: str, remote_host: str, remote_dir: str, is_conflict: bool = False, local_dir: Path = None, expected_dest_sha: str = None):
     if local_dir is None:
         parts_count = len(Path(rel_path).parts)
         local_dir = local_path.parents[parts_count - 1] if parts_count <= len(local_path.parents) else local_path.parent
@@ -289,13 +294,14 @@ if (os.path.dirname(stage) == root and
 
     # Stage 2: 上流 exit 0 を確認した後の別SSH検証commit
     commit_code = f"""
-import os, sys, shutil
+import os, sys, shutil, hashlib
 
 remote_dir = {json.dumps(remote_dir)}
 rel_path = {json.dumps(rel_path)}
 stage_dir = {json.dumps(stage_dir)}
 stage_prefix = {json.dumps(stage_prefix)}
 conflict_id = {json.dumps(conflict_id)}
+expected_dest_sha = {repr(expected_dest_sha)}
 
 filename = os.path.basename(rel_path)
 tmp_file = os.path.join(stage_dir, filename)
@@ -331,6 +337,19 @@ target_dir = os.path.dirname(target_path)
 
 try:
     os.makedirs(target_dir, exist_ok=True)
+    if expected_dest_sha is not None:
+        if expected_dest_sha == '':
+            if os.path.lexists(target_path):
+                raise RuntimeError('Destination appeared during sync')
+        else:
+            if not os.path.isfile(target_path) or os.path.islink(target_path):
+                raise RuntimeError('Destination changed during sync')
+            digest = hashlib.sha256()
+            with open(target_path, 'rb') as current:
+                for chunk in iter(lambda: current.read(65536), b''):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected_dest_sha:
+                raise RuntimeError('Destination changed during sync')
     if conflict_id and os.path.exists(target_path):
         conflict_path = os.path.join(remote_dir, '.sync-conflicts', conflict_id, rel_path)
         curr = remote_dir
@@ -361,7 +380,7 @@ print("COMMIT_OK")
     if commit_res.returncode != 0:
         raise RuntimeError(f"Failed to commit {rel_path} on remote: {commit_res.stderr.strip()}")
 
-def pull_file(remote_host: str, remote_dir: str, rel_path: str, local_path: Path, local_dir: Path = None, is_conflict: bool = False):
+def pull_file(remote_host: str, remote_dir: str, rel_path: str, local_path: Path, local_dir: Path = None, is_conflict: bool = False, expected_dest_sha: str = None):
     if local_dir is None:
         parts_count = len(Path(rel_path).parts)
         local_dir = local_path.parents[parts_count - 1] if parts_count <= len(local_path.parents) else local_path.parent
@@ -425,6 +444,14 @@ sys.exit(res.returncode)
         with open(extracted_file, 'rb') as f:
             os.fsync(f.fileno())
 
+        if expected_dest_sha is not None:
+            verify_path_safety(local_dir, local_path)
+            if expected_dest_sha == '':
+                if os.path.lexists(local_path):
+                    raise RuntimeError(f'Destination appeared during sync: {rel_path}')
+            elif not local_path.is_file() or compute_sha256(local_path) != expected_dest_sha:
+                raise RuntimeError(f'Destination changed during sync: {rel_path}')
+
         if is_conflict and local_path.exists():
             root = local_dir if local_dir is not None else local_path.parents[len(Path(rel_path).parts) - 1]
             conflict_id = uuid.uuid4().hex
@@ -439,7 +466,7 @@ sys.exit(res.returncode)
 
         os.replace(extracted_file, local_path)
 
-def plan_sync(local_files: dict, remote_files: dict, mode: str = 'both') -> tuple:
+def plan_sync(local_files: dict, remote_files: dict, mode: str = 'both', baseline: dict = None) -> tuple:
     """
     同期プランを計算する。両側サイズ最大値で1GiB上限を検査し、
     内容一致（SHA256同一）ならスキップ、異内容はis_conflict=Trueで退避対象とする。
@@ -474,12 +501,20 @@ def plan_sync(local_files: dict, remote_files: dict, mode: str = 'both') -> tupl
             if loc['sha256'] == rem['sha256']:
                 continue
 
+            common = baseline.get(k) if baseline is not None else None
+            push_safe = common is not None and rem['sha256'] == common
+            pull_safe = common is not None and loc['sha256'] == common
+
             if mode == 'push':
-                to_push.append((k, f"更新 (size {loc['size']} vs {rem['size']})", True))
+                to_push.append((k, f"更新 (size {loc['size']} vs {rem['size']})", not push_safe))
             elif mode == 'pull':
-                to_pull.append((k, f"更新 (size {rem['size']} vs {loc['size']})", True))
+                to_pull.append((k, f"更新 (size {rem['size']} vs {loc['size']})", not pull_safe))
             else:  # both
-                if loc['mtime'] > rem['mtime']:
+                if push_safe:
+                    to_push.append((k, 'ローカルのみ更新', False))
+                elif pull_safe:
+                    to_pull.append((k, 'リモートのみ更新', False))
+                elif loc['mtime'] > rem['mtime']:
                     to_push.append((k, f"ローカルが新しい ({loc['mtime']} > {rem['mtime']})", True))
                 elif rem['mtime'] > loc['mtime']:
                     to_pull.append((k, f"リモートが新しい ({rem['mtime']} > {loc['mtime']})", True))
@@ -488,25 +523,17 @@ def plan_sync(local_files: dict, remote_files: dict, mode: str = 'both') -> tupl
 
     return to_push, to_pull
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--local', type=Path, default=DEFAULT_LOCAL, help='ローカルデータディレクトリ')
-    parser.add_argument('--remote-host', default=DEFAULT_REMOTE_HOST, help='SSHホスト名 (例: nas)')
-    parser.add_argument('--remote-dir', default=DEFAULT_REMOTE_DIR, help='NAS側データディレクトリ')
-    parser.add_argument('--mode', choices=['both', 'push', 'pull'], default='both', help='同期モード')
-    parser.add_argument('--dry-run', action='store_true', help='変更を行わず確認のみ')
-    args = parser.parse_args()
-
-    local_dir = args.local.resolve()
+def _run_sync(args, local_dir):
     print(f"=== NAS同期開始 [{args.mode}] ===")
     print(f"ローカル: {local_dir}")
     print(f"リモート: {args.remote_host}:{args.remote_dir}")
 
+    baseline = load_baseline(local_dir, '.sync-state-nas.json')
     print("ファイル一覧を取得中...")
     local_files = scan_local(local_dir)
     remote_files = scan_remote(args.remote_host, args.remote_dir)
 
-    to_push, to_pull = plan_sync(local_files, remote_files, mode=args.mode)
+    to_push, to_pull = plan_sync(local_files, remote_files, mode=args.mode, baseline=baseline)
 
     print(f"\n同期予定: Push={len(to_push)}件, Pull={len(to_pull)}件")
 
@@ -520,13 +547,34 @@ def main():
 
     for idx, (k, reason, is_conflict) in enumerate(to_push, 1):
         print(f"[{idx}/{len(to_push)}] Push: {k} ({reason})")
-        push_file(local_dir / k, k, args.remote_host, args.remote_dir, is_conflict=is_conflict, local_dir=local_dir)
+        expected = None if is_conflict else (remote_files[k]['sha256'] if k in remote_files else '')
+        push_file(local_dir / k, k, args.remote_host, args.remote_dir, is_conflict=is_conflict,
+                  local_dir=local_dir, expected_dest_sha=expected)
 
     for idx, (k, reason, is_conflict) in enumerate(to_pull, 1):
         print(f"[{idx}/{len(to_pull)}] Pull: {k} ({reason})")
-        pull_file(args.remote_host, args.remote_dir, k, local_dir / k, local_dir=local_dir, is_conflict=is_conflict)
+        expected = None if is_conflict else (local_files[k]['sha256'] if k in local_files else '')
+        pull_file(args.remote_host, args.remote_dir, k, local_dir / k, local_dir=local_dir,
+                  is_conflict=is_conflict, expected_dest_sha=expected)
+
+    final_local = scan_local(local_dir)
+    final_remote = scan_remote(args.remote_host, args.remote_dir)
+    save_baseline(local_dir, '.sync-state-nas.json',
+                  merged_baseline(baseline, final_local, final_remote))
 
     print("\n=== NAS同期完了 ===")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--local', type=Path, default=DEFAULT_LOCAL, help='ローカルデータディレクトリ')
+    parser.add_argument('--remote-host', default=DEFAULT_REMOTE_HOST, help='SSHホスト名 (例: nas)')
+    parser.add_argument('--remote-dir', default=DEFAULT_REMOTE_DIR, help='NAS側データディレクトリ')
+    parser.add_argument('--mode', choices=['both', 'push', 'pull'], default='both', help='同期モード')
+    parser.add_argument('--dry-run', action='store_true', help='変更を行わず確認のみ')
+    args = parser.parse_args()
+    local_dir = args.local.resolve()
+    with sync_lock(local_dir):
+        _run_sync(args, local_dir)
 
 if __name__ == '__main__':
     main()

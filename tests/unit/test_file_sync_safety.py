@@ -81,6 +81,10 @@ class TestFileSyncSafety(unittest.TestCase):
         self.assertTrue(sync_gdrive.should_ignore(".git/config"))
         self.assertTrue(sync_gdrive.should_ignore("backups/old.sqlite3"))
         self.assertTrue(sync_gdrive.should_ignore(".sync-conflicts/uuid/file.txt"))
+        self.assertTrue(sync_gdrive.should_ignore("logs/development/rclone-write.conf"))
+        self.assertTrue(sync_gdrive.should_ignore("rclone.conf"))
+        self.assertTrue(sync_nas.should_ignore("logs/development/rclone-write.conf"))
+        self.assertTrue(sync_nas.should_ignore("rclone.conf"))
 
     # 2. 特殊文字path
     def test_special_character_paths(self):
@@ -490,6 +494,105 @@ class TestFileSyncSafety(unittest.TestCase):
 
         # The existing destination file MUST remain untouched!
         self.assertEqual(dst_file.read_text(), original_content)
+
+    # 13. rclone設定除外（大文字小文字非依存・ネスト）と通常receipt JSON/exports対照保持
+    def test_rclone_conf_exclusion_and_receipt_inclusion_all_paths(self):
+        """
+        Verify that:
+        - rclone.conf and rclone-*.conf (case-insensitive) are excluded across all paths:
+          * GDrive scan (sync_gdrive.scan_dir)
+          * NAS local scan (sync_nas.scan_local)
+          * NAS remote scan code (sync_nas.scan_remote)
+          * should_ignore functions
+        - Nested logs/development/rclone-write.conf is excluded across all paths
+        - Normal receipt JSON files (e.g. logs/development/upload-receipt.json) and
+          exports files (e.g. exports/report.txt, exports/analysis.xlsx) are NOT excluded
+        - Existing exclusions (database, secrets, auth, tokens, credentials, .history, etc.) remain intact
+        """
+        setup_dirs = [
+            self.local_dir / "logs" / "development",
+            self.local_dir / "logs" / "backup",
+            self.local_dir / "exports",
+            self.local_dir / "secrets",
+            self.local_dir / "database",
+            self.local_dir / "auth",
+        ]
+        for d in setup_dirs:
+            d.mkdir(parents=True, exist_ok=True)
+
+        exclude_files = [
+            "logs/development/rclone-write.conf",
+            "logs/development/RCLONE-WRITE.CONF",
+            "logs/development/rclone.conf",
+            "logs/development/Rclone.Conf",
+            "logs/rclone-backup.conf",
+            "rclone.conf",
+            "rclone-custom.conf",
+            "secrets/token.txt",
+            "database/archive.sqlite3",
+            "auth/token.json",
+        ]
+        for rel in exclude_files:
+            p = self.local_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("secret_or_config_content")
+
+        include_files = [
+            "logs/development/upload-receipt.json",
+            "logs/backup/migration-cloud-upload.json",
+            "exports/report.txt",
+            "exports/analysis.xlsx",
+            "exports/gui.html",
+        ]
+        for rel in include_files:
+            p = self.local_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("public_or_receipt_data")
+
+        for mod in (sync_gdrive, sync_nas):
+            for rel in exclude_files:
+                self.assertTrue(mod.should_ignore(rel), f"Expected {rel} to be ignored by {mod.__name__}")
+            for rel in include_files:
+                self.assertFalse(mod.should_ignore(rel), f"Expected {rel} NOT to be ignored by {mod.__name__}")
+
+        # Path A: GDrive scan
+        gdrive_scanned = sync_gdrive.scan_dir(self.local_dir)
+        for rel in exclude_files:
+            self.assertNotIn(rel, gdrive_scanned, f"Expected {rel} to be excluded from GDrive scan")
+        for rel in include_files:
+            self.assertIn(rel, gdrive_scanned, f"Expected {rel} to be included in GDrive scan")
+
+        # Path B: NAS local scan
+        nas_scanned = sync_nas.scan_local(self.local_dir)
+        for rel in exclude_files:
+            self.assertNotIn(rel, nas_scanned, f"Expected {rel} to be excluded from NAS local scan")
+        for rel in include_files:
+            self.assertIn(rel, nas_scanned, f"Expected {rel} to be included in NAS local scan")
+
+        # Path C: NAS remote scan generated code execution
+        for rel in exclude_files:
+            p = self.remote_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("remote_secret_or_config")
+        for rel in include_files:
+            p = self.remote_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("remote_receipt_or_export")
+
+        real_run = subprocess.run
+        def fake_ssh_run(cmd, *args, **kwargs):
+            if cmd[0] == "ssh":
+                local_cmd = ["python3", "-"]
+                return real_run(local_cmd, *args, **kwargs)
+            return real_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=fake_ssh_run):
+            remote_scanned = sync_nas.scan_remote("mock-nas", str(self.remote_dir))
+
+        for rel in exclude_files:
+            self.assertNotIn(rel, remote_scanned, f"Expected {rel} to be excluded from NAS remote scan")
+        for rel in include_files:
+            self.assertIn(rel, remote_scanned, f"Expected {rel} to be included in NAS remote scan")
 
 if __name__ == '__main__':
     unittest.main()

@@ -21,8 +21,10 @@ WORKDIR /app
 COPY scripts/nas_create_verified_backup.sh /app/scripts/
 COPY scripts/verified_backup_support.py /app/scripts/
 COPY scripts/nas_backup_cycle.py /app/scripts/
+COPY scripts/nas_backup_scheduler.py /app/scripts/
 
-RUN chmod +x /app/scripts/*.sh /app/scripts/*.py
+RUN find /app/scripts -type d -exec chmod 755 {} + \
+    && find /app/scripts -type f -exec chmod 755 {} +
 
 USER 1000:10
 

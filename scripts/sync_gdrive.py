@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Google Drive (マイドライブ/イカリング3アーカイブ) とローカルのイカリング3アーカイブを双方向同期するスクリプト。
-database/、secrets/、認証データ、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
+database/、secrets/、認証データ、rclone設定(rclone.conf/rclone-*.conf)、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
 """
 
 import argparse
@@ -14,12 +14,17 @@ import sys
 import tempfile
 import uuid
 
+if __package__:
+    from .sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+else:
+    from sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
+
 DEFAULT_LOCAL = Path(os.environ.get('IKARING_ARCHIVE_DATA_DIR', str(Path.home() / 'Documents/イカリング3アーカイブ')))
 DEFAULT_GDRIVE = Path.home() / 'Library/CloudStorage/GoogleDrive-originnatsumikanf@gmail.com/マイドライブ/イカリング3アーカイブ'
 
 IGNORE_PATTERNS = {'.DS_Store', '._.DS_Store'}
 IGNORE_SUFFIXES = {'.tmp', '.lock', '-wal', '-shm'}
-IGNORE_GLOBS = {'*.sqlite*', '*.db*', '*.gpg', '*token*', '*credential*', '.env*'}
+IGNORE_GLOBS = {'*.sqlite*', '*.db*', '*.gpg', '*token*', '*credential*', '.env*', 'rclone.conf', 'rclone-*.conf', '.sync-state-*.json'}
 IGNORE_DIR_NAMES = {
     'database', 'secrets', 'nxapi-nodejs',
     'runtime', 'spool', '.history', '.git', 'backups', '.sync-conflicts'
@@ -112,7 +117,7 @@ def scan_dir(base_dir: Path) -> dict:
             result[rel] = {'size': stat.st_size, 'mtime': int(stat.st_mtime), 'sha256': sha256}
     return result
 
-def copy_file(src: Path, dst: Path, root_dir: Path = None, rel_path: str = None, is_conflict: bool = False, src_root: Path = None):
+def copy_file(src: Path, dst: Path, root_dir: Path = None, rel_path: str = None, is_conflict: bool = False, src_root: Path = None, expected_dest_sha: str = None):
     """
     元ファイルは完全転送+fsync済み一時fileからatomic replace。
     双方に存在する異内容は上書き前に宛先旧版を当該ルートの.sync-conflicts/<uuid>/<relative>へ保存。
@@ -144,6 +149,17 @@ def copy_file(src: Path, dst: Path, root_dir: Path = None, rel_path: str = None,
 
         shutil.copystat(src, tmp_path)
 
+        # A normal update is allowed only while the destination still matches
+        # the common version observed at planning time. An absent destination
+        # must remain absent; a concurrent edit is retried as a conflict later.
+        if expected_dest_sha is not None:
+            verify_path_safety(root_dir, dst)
+            if expected_dest_sha == '':
+                if os.path.lexists(dst):
+                    raise RuntimeError(f'Destination appeared during sync: {rel_path}')
+            elif not dst.is_file() or compute_sha256(dst) != expected_dest_sha:
+                raise RuntimeError(f'Destination changed during sync: {rel_path}')
+
         if is_conflict and dst.exists():
             conflict_id = uuid.uuid4().hex
             conflict_path = root_dir / '.sync-conflicts' / conflict_id / rel_path
@@ -163,7 +179,7 @@ def copy_file(src: Path, dst: Path, root_dir: Path = None, rel_path: str = None,
             except OSError:
                 pass
 
-def plan_sync(local_files: dict, gdrive_files: dict, mode: str = 'both') -> tuple:
+def plan_sync(local_files: dict, gdrive_files: dict, mode: str = 'both', baseline: dict = None) -> tuple:
     """
     同期プランを計算する。両側サイズ最大値で1GiB上限を検査し、
     内容一致（SHA256同一）ならスキップ、異内容はis_conflict=Trueで退避対象とする。
@@ -198,12 +214,20 @@ def plan_sync(local_files: dict, gdrive_files: dict, mode: str = 'both') -> tupl
             if loc['sha256'] == gdr['sha256']:
                 continue
 
+            common = baseline.get(k) if baseline is not None else None
+            push_safe = common is not None and gdr['sha256'] == common
+            pull_safe = common is not None and loc['sha256'] == common
+
             if mode == 'push':
-                to_push.append((k, f"更新 (size {loc['size']} vs {gdr['size']})", True))
+                to_push.append((k, f"更新 (size {loc['size']} vs {gdr['size']})", not push_safe))
             elif mode == 'pull':
-                to_pull.append((k, f"更新 (size {gdr['size']} vs {loc['size']})", True))
+                to_pull.append((k, f"更新 (size {gdr['size']} vs {loc['size']})", not pull_safe))
             else:  # both
-                if loc['mtime'] > gdr['mtime']:
+                if push_safe:
+                    to_push.append((k, 'ローカルのみ更新', False))
+                elif pull_safe:
+                    to_pull.append((k, 'Google Driveのみ更新', False))
+                elif loc['mtime'] > gdr['mtime']:
                     to_push.append((k, f"ローカルが新しい ({loc['mtime']} > {gdr['mtime']})", True))
                 elif gdr['mtime'] > loc['mtime']:
                     to_pull.append((k, f"Google Driveが新しい ({gdr['mtime']} > {loc['mtime']})", True))
@@ -212,17 +236,7 @@ def plan_sync(local_files: dict, gdrive_files: dict, mode: str = 'both') -> tupl
 
     return to_push, to_pull
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--local', type=Path, default=DEFAULT_LOCAL, help='ローカルデータディレクトリ')
-    parser.add_argument('--gdrive', type=Path, default=DEFAULT_GDRIVE, help='Google Drive側データディレクトリ')
-    parser.add_argument('--mode', choices=['both', 'push', 'pull'], default='both', help='同期モード')
-    parser.add_argument('--dry-run', action='store_true', help='変更を行わず確認のみ')
-    args = parser.parse_args()
-
-    local_dir = args.local.resolve()
-    gdrive_dir = args.gdrive.resolve()
-
+def _run_sync(args, local_dir, gdrive_dir):
     print(f"=== Google Drive同期開始 [{args.mode}] ===")
     print(f"ローカル: {local_dir}")
     print(f"Google Drive: {gdrive_dir}")
@@ -231,11 +245,12 @@ def main():
         print(f"エラー: Google Driveディレクトリが存在しません: {gdrive_dir}", file=sys.stderr)
         sys.exit(1)
 
+    baseline = load_baseline(local_dir, '.sync-state-gdrive.json')
     print("ファイル一覧を取得中...")
     local_files = scan_dir(local_dir)
     gdrive_files = scan_dir(gdrive_dir)
 
-    to_push, to_pull = plan_sync(local_files, gdrive_files, mode=args.mode)
+    to_push, to_pull = plan_sync(local_files, gdrive_files, mode=args.mode, baseline=baseline)
 
     print(f"\n同期予定: Push={len(to_push)}件, Pull={len(to_pull)}件")
 
@@ -249,13 +264,34 @@ def main():
 
     for idx, (k, reason, is_conflict) in enumerate(to_push, 1):
         print(f"[{idx}/{len(to_push)}] Push: {k} ({reason})")
-        copy_file(local_dir / k, gdrive_dir / k, root_dir=gdrive_dir, rel_path=k, is_conflict=is_conflict, src_root=local_dir)
+        expected = None if is_conflict else (gdrive_files[k]['sha256'] if k in gdrive_files else '')
+        copy_file(local_dir / k, gdrive_dir / k, root_dir=gdrive_dir, rel_path=k,
+                  is_conflict=is_conflict, src_root=local_dir, expected_dest_sha=expected)
 
     for idx, (k, reason, is_conflict) in enumerate(to_pull, 1):
         print(f"[{idx}/{len(to_pull)}] Pull: {k} ({reason})")
-        copy_file(gdrive_dir / k, local_dir / k, root_dir=local_dir, rel_path=k, is_conflict=is_conflict, src_root=gdrive_dir)
+        expected = None if is_conflict else (local_files[k]['sha256'] if k in local_files else '')
+        copy_file(gdrive_dir / k, local_dir / k, root_dir=local_dir, rel_path=k,
+                  is_conflict=is_conflict, src_root=gdrive_dir, expected_dest_sha=expected)
+
+    final_local = scan_dir(local_dir)
+    final_gdrive = scan_dir(gdrive_dir)
+    save_baseline(local_dir, '.sync-state-gdrive.json',
+                  merged_baseline(baseline, final_local, final_gdrive))
 
     print("\n=== Google Drive同期完了 ===")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--local', type=Path, default=DEFAULT_LOCAL, help='ローカルデータディレクトリ')
+    parser.add_argument('--gdrive', type=Path, default=DEFAULT_GDRIVE, help='Google Drive側データディレクトリ')
+    parser.add_argument('--mode', choices=['both', 'push', 'pull'], default='both', help='同期モード')
+    parser.add_argument('--dry-run', action='store_true', help='変更を行わず確認のみ')
+    args = parser.parse_args()
+    local_dir = args.local.resolve()
+    gdrive_dir = args.gdrive.resolve()
+    with sync_lock(local_dir):
+        _run_sync(args, local_dir, gdrive_dir)
 
 if __name__ == '__main__':
     main()

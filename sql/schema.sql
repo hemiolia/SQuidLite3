@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS matches(account TEXT NOT NULL,kind TEXT NOT NULL,matc
 CREATE TABLE IF NOT EXISTS match_refs(account TEXT NOT NULL,kind TEXT NOT NULL,remote_id TEXT NOT NULL,match_key TEXT NOT NULL,PRIMARY KEY(account,kind,remote_id),FOREIGN KEY(account,kind,match_key) REFERENCES matches(account,kind,match_key));
 CREATE TABLE IF NOT EXISTS sightings(response_id INTEGER NOT NULL REFERENCES responses(id),account TEXT NOT NULL,kind TEXT NOT NULL,match_key TEXT NOT NULL,path TEXT NOT NULL,summary_json TEXT NOT NULL,PRIMARY KEY(response_id,path));
 CREATE TABLE IF NOT EXISTS documents(response_id INTEGER NOT NULL REFERENCES responses(id),account TEXT NOT NULL,kind TEXT NOT NULL,match_key TEXT NOT NULL,json_text TEXT NOT NULL,PRIMARY KEY(response_id,kind,match_key));
-CREATE TABLE IF NOT EXISTS jobs(account TEXT NOT NULL,operation TEXT NOT NULL,variables_json TEXT NOT NULL,kind TEXT,match_key TEXT,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_response_id INTEGER REFERENCES responses(id),PRIMARY KEY(account,operation,variables_json));
+CREATE TABLE IF NOT EXISTS jobs(account TEXT NOT NULL,operation TEXT NOT NULL,variables_json TEXT NOT NULL,kind TEXT,match_key TEXT,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,empty_retries INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_response_id INTEGER REFERENCES responses(id),PRIMARY KEY(account,operation,variables_json));
 CREATE TABLE IF NOT EXISTS endpoint_heads(account TEXT NOT NULL,operation TEXT NOT NULL,response_id INTEGER NOT NULL REFERENCES responses(id),PRIMARY KEY(account,operation));
 CREATE TABLE IF NOT EXISTS control(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS match_classification(
@@ -101,6 +101,7 @@ CREATE VIEW unavailable_details AS
   WHERE j.account=m.account AND j.match_key=m.match_key AND j.state IN ('pending','retry')
  );
 CREATE TABLE IF NOT EXISTS entities(account TEXT NOT NULL,typename TEXT NOT NULL,entity_id TEXT NOT NULL,response_id INTEGER NOT NULL REFERENCES responses(id),json_text TEXT NOT NULL,PRIMARY KEY(account,typename,entity_id));
+CREATE INDEX IF NOT EXISTS entities_response_id ON entities(response_id);
 CREATE TABLE IF NOT EXISTS page_fingerprints(account TEXT NOT NULL,operation TEXT NOT NULL,binding TEXT NOT NULL,field_path TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(account,operation,binding,field_path,sha256));
 CREATE TABLE IF NOT EXISTS assets(url TEXT PRIMARY KEY,state TEXT NOT NULL DEFAULT 'pending',body_sha256 TEXT REFERENCES bodies(sha256),content_type TEXT,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_error TEXT);
 CREATE TABLE IF NOT EXISTS asset_refs(response_id INTEGER NOT NULL REFERENCES responses(id),url TEXT NOT NULL REFERENCES assets(url),path TEXT NOT NULL,PRIMARY KEY(response_id,path));

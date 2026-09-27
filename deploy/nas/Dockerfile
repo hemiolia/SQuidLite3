@@ -27,5 +27,8 @@ COPY sql/schema.sql ./sql/
 COPY config/font-unicode-ranges.json ./config/
 COPY assets/fonts/Splatoon2-Unified.otf ./assets/fonts/
 
+RUN find archive.py src sql config assets -type d -exec chmod 755 {} + \
+    && find archive.py src sql config assets -type f -exec chmod 644 {} +
+
 USER 1000:10
 CMD ["python3", "archive.py", "--db", "/data/database/archive.sqlite3", "watch", "--interval", "120"]

@@ -12,10 +12,17 @@
 - 稼働中（書き込みプロセスが動作中）のSQLiteデータベースファイルを、SMB、Google Drive、rsync、双方向ファイル同期ツール等によって直接コピー・転送することは厳禁とする。
 - 稼働中DBの転送はWALファイルとの不整合やページ破損、スプリットブレインの原因となる。バックアップや転送は、必ずSQLiteのオンラインバックアップAPIを用いて整合性のある静止点スナップショットを取得し、完全性検査を行った上で実施する。
 
-### 1.3 軽量ファイルの双方向同期と競合旧版退避
+### 1.3 軽量ファイルの双方向同期と競合旧版退避（導入検証中）
 - `exports/` ディレクトリ下のレポート（HTML/XLSX等）など軽量ファイルの同期は、専用スクリプト（`sync_nas.py` および `sync_gdrive.py`）により制御する。
-- データベースファイル（`*.sqlite*`）、秘密情報（`secrets/`、トークン、認証情報）、ランタイム一時ファイル（`runtime/`、スプール、ログ）は同期対象から除外（ignore）される。
-- 両側で同一ファイルが更新された（競合した）場合、一方を無断で上書き破棄せず、転送先にある既存の旧版を `.sync-conflicts/<UUID>/<相対パス>` へ退避・保存した上で、アトミックに新版へ置き換える。
+- **定期運転の状況**: 3way baselineと共通排他は実装・検証済みで、実NASとGoogle Driveの手動同期を2回完走した。LaunchAgentは登録済みだが、macOS側のファイルアクセス許可の確認待ちで自動実行は未成功である。
+- **3way baselineと競合制御**:
+  - 片側だけの更新は通常更新としてアトミックに反映する。
+  - 両側で独立編集（競合）が発生した場合は、mtime（更新日時）を採用しつつ、上書きされる側の既存旧版を `.sync-conflicts/<UUID>/<相対パス>` へ安全に退避・保存した上でアトミックに新版へ置き換える。
+  - プロセス間の共通排他ロック（lock）を適用して並行実行による不整合を防ぐ。
+- **同期除外対象**:
+  - データベースファイル（`*.sqlite*`）、秘密情報・認証情報（`secrets/`、`auth`、`token`、`credential`、`rclone.conf`、`rclone-*.conf` 等）、ランタイム一時スプール、およびNAS/Google Driveの同期状態管理ファイル（stateファイル）は同期対象から除外（ignore）される。
+  - なお、`logs/` ディレクトリ全体は除外しない（通常のレシートJSONや運用ログ等は同期対象とし、秘密を含む個別設定・秘密ファイルのみを除外する）。
+- **サービスインストーラー**: `python3 scripts/install_file_sync_service.py --print` で設定を確認し、`--install` で5分間隔のLaunchAgentを登録する。実行元はPythonの `scripts/run_file_sync.py`。Mac側のファイルアクセス許可と実行ログの成功を確認するまで、登録だけで稼働済みとはしない。
 
 ### 1.4 クラウド（Google Drive）への暗号スナップショット全量往復検証とチャンク分割設計
 - クラウドへ保存するバックアップは、ローカルで生成した静止点スナップショットを圧縮（zstd）および対称暗号化（AES256）したファイルと、その整合性を記録したマニフェストファイルに限定する。
@@ -34,13 +41,18 @@
   - Google Drive connectorの二段上限（512MiB/100MiB）を回避するためのchunk分割経路は、`scripts/backup_chunks.py` および `scripts/verify_cloud_chunks.py` を用いる手動chunk経路である。
   - これら2つは独立した別経路であり、同一処理であると誤解してはならない。
 
-### 1.5 安全原則: クラウド未検証時のローカル削除不可
+### 1.5 安全原則: クラウド未検証時のローカル削除不可（安全原則の遵守とローカル削除完了）
 - クラウドへの暗号化バックアップが全量往復検証を経て完全に保全されたことを確認するまでは、Macローカルの正本DBや既存のローカルバックアップファイルを絶対に削除してはならない。`nas_backup_cycle.py` を使う場合はレシート生成も確認する。
+- **安全原則遵守の実績（2026-09-27 07:33削除完了）**:
+  - 移行9/26 03:19静止点（raw 26,412,634,112 bytes, SHA 069290e0ae6f0982ac8dd0db67df31f53a015246d110970041a2a3f4ef29c6e5）、旧22GB、9/25 11:59、旧432MB、および最新daily静止点について、全37 cloud partsからの復号一致、両manifest full readback一致（status complete）を含むNAS保全およびクラウド全量raw一致を確認。
+  - さらに、Mac collector停止（disabled/未登録）、NAS marker存在、ローカルhash検証時からのinode/mtime/size不変、WAL無し、writer lock下であることを再確認した上で、許可済みのローカルDB 4本＋暗号作業用複製65個（論理合計 83,729,271,876 bytes）を安全に削除完了。実空き容量は 3,237,855,232 bytes から 38,921,396,224 bytes へ大幅に回復した。
+  - 元DB位置には `relocated.json` を保存し、NASおよびクラウド上の旧版は保持している（private証拠: `operations-20260926/local-cleanup-complete.json` および各 `cloud-complete.json`）。
 
 ### 1.6 移行マーカーとスプリットブレイン防止
 - 移行マーカー（`config/storage-location.json`）は、コレクターの稼働主体がNASへ正常に切り替わったことを示す制御設定ファイルである。
 - このマーカーが存在する場合、Macローカルの `archive.py` はローカル既定DBへのアクセスを遮断（`NAS_STORAGE_ACTIVE` 例外を発生）し、操作は `scripts/nas_archive.py` を経由してNAS側コンテナで実行することが強制される。
 - **自動フォールバックの禁止**: NASとの接続切断や障害が発生した場合に、自動的にMacローカルDBへ書き込み先をフォールバックさせる処理は行わない。自動フォールバックを許容すると、NASとMacの双方に異なる新データが書き込まれる「スプリットブレイン」が生じ、データの整合性回復が困難になるためである。障害時は取得を停止し、手動で状態を確認して復旧する。
+- **Start.command による安全なルーティング**: Macの起動スクリプト `Start.command`（`scripts/start.py`）は、起動時に `config/storage-location.json` のNASマーカーを検証し、正常なNASマーカーを検出した場合は自動的に `scripts/nas_archive.py gui` へ処理をルーティングする。これにより、Mac側でのNode.js/npm依存関係やニンテンドーアカウントへのログイン処理を一切不要とし、NAS側で生成された最新GUIを安全に表示する。マーカー不正時は即座に処理を拒否し、ローカルへの自動フォールバックは行わない。
 
 ### 1.7 復元手順の安全性
 - バックアップからの復元（リストア）は、既存の本番稼働中DBへ直接上書きしてはならない。
@@ -57,62 +69,105 @@
 ### 1.10 ソース公開範囲の境界
 - GitHub等のリポジトリへの公開は、コレクターおよび管理ツールのソースコードのみを対象とする。
 - 実戦績データ、SQLiteデータベース、スプール、トークンや秘密情報、ローカルログ、個人を特定するデータは一切含めない。
-- なお、ソースコード以外の追加の公開・バックアップ要求（暗号化DBを別非公開領域へ保管するか等）については現時点で未確定である。
+- **GitHub暗号化DB保管役割の保留**: GitHubリポジトリへの暗号化DB自体の保管役割についてはユーザー未回答のまま保留中である。そのため、既存の公開リポジトリはソースコードと復元手順のみを保持し、暗号化DBファイル等は含めない。
 
 ---
 
 ## 2. 実装スクリプトの仕様と役割
 
-| スクリプト | 実行場所 | 主な役割と安全機構 |
+| スクリプト / サービス | 実行場所 | 主な役割と安全機構 |
 | :--- | :--- | :--- |
 | `scripts/deploy_nas_container.sh` | Macから実行 | コレクターのソースコードのみを抽出し、tarストリームでSSH経由でNASへ転送。NAS側で排他ロック（flock）を取得しDockerイメージをビルド。旧版ソースを `runtime/releases/` に退避しアトミックに差し替え。 |
 | `scripts/nas_create_verified_backup.sh` | NAS内 | SQLiteオンラインバックアップAPIによる静止点作成、空き容量事前検査（4倍+1GiB）、zstd圧縮+GPG AES256暗号化、復号+伸長ハッシュ往復検証、`quick_check` 検査、マニフェスト生成。全検証完了後に確定パスへアトミック移動。 |
+| `scripts/run_nas_daily_backup.sh` | NASホスト内（手動補助） | 日次バックアップ実行用シェル。非ブロッキング排他ロック（`logs/backup/.daily.lock`）、日次ログ生成、バックアップコンテナ（`ikaring-archive-backup:current`）実行およびステータス管理。 |
+| Docker schedulerコンテナ | NAS内（常駐サービス） | NASホストcron権限制限を回避し、日次バックアップを毎朝4:00 Asia/Tokyoに自動起動（UID 1000:10、`restart: unless-stopped`、失敗時15分retry、同日成功後重複なし）。 |
 | `scripts/gdrive_upload_verified.sh` | Mac/NAS | NAS上の暗号化バックアップとマニフェストをGoogle Driveへストリームアップロード。アップロード中一時オブジェクトのサイズ/MD5検証、`rclone cat` による全量読み戻しとSHA256往復検証、確定名へのmoveto。成功結果は標準出力のJSONで返す。単体実行ではレシートファイルを作らない。失敗時は一時物のみ削除し既存保護。 |
 | `scripts/nas_archive.py` | Macから実行 | `config/storage-location.json` を検証し、SSH経由でNASコンテナ内の `archive.py` コマンドを実行。エクスポート生成物（GUI HTMLや分析XLSX）を安全にローカルへ取得。未移行時やマーカー不正時は即時エラー。 |
+| `scripts/start.py` / `Start.command` | Macから実行 | 起動時に `config/storage-location.json` のNAS markerを検証し、正常時は `scripts/nas_archive.py gui` へルーティング。MacローカルでのNode/npm/loginを不要化。マーカー不正時は拒否しlocalフォールバック禁止。 |
 | `scripts/nas_backup_cycle.py` | NAS内（定期実行） | 排他ロック取得、バックアップ作成、成果物整合性検証、rcloneによるGDriveへのイミュータブルアップロード、全量往復検証、確定レシート（`cloud-receipts/`）の生成を一括調整するコーディネーター。単一暗号化ファイル（単一cipher）直接経路であり、chunk分割自動化は未実装（connector手動chunk経路と同一処理ではない）。 |
-| `scripts/sync_nas.py` / `sync_gdrive.py` | Macから実行 | `exports/` 等の軽量ファイルを双方向同期。DBや秘密、巨大ファイル（1GiB超）およびMac固有の `config/storage-location.json` は除外。競合発生時は旧版を `.sync-conflicts/` に退避。シンボリックリンクや脱出パスの拒否。 |
+| `scripts/sync_nas.py` / `sync_gdrive.py` | Macから実行 | `exports/` 等の軽量ファイルを双方向同期。3way baseline実装・手動往復検証済み（片側更新は通常更新、両側独立編集はmtime採用＋旧版退避、共通ロック、NAS/GDrive state同期除外）。定期運転はOSファイルアクセス許可確認待ち。 |
+| `scripts/install_file_sync_service.py` | Macから実行 | 軽量ファイル同期LaunchAgentサービス定義の生成（`--print`）および登録（`--install`）。コード検査済み・登録済み。OSファイルアクセス許可確認待ちで自動実行は未成功。 |
 | `scripts/backup_chunks.py` | Mac/NAS | 暗号化暗号文を既定64MiB（最大256MiB）のチャンクに分割（`split`）およびアトミック再結合（`join`）。暗号文全体SHA256、各partのSHA256、元暗号マニフェストの参照整合性を二重検証。既存出力先の上書き拒否。 |
 | `scripts/verify_cloud_chunks.py` | Mac/NAS | クラウド上のチャンク分割バックアップを `rclone cat` でストリーム読取し、暗号文結合・GPG復号・zstd伸長をパイプライン処理して暗号文SHA256および展開後rawバイト数・SHA256を元マニフェストと照合。ローカルに暗号文や平文ファイルを作らず完全性検証を実施（新規quick_checkは行わず元snapshotの証拠と照合）。 |
 
 ---
 
-## 3. 実測境界と現在のステータス（2026-09-25現在）
+## 3. 実測境界と現在のステータス（2026-09-27 07:34 JST実測現在）
 
-運用手順の実施にあたり、確認済みの事実と未完了の事項を厳密に区別する。
+運用手順の実施にあたり、確認済みの事実と未完了の事項を厳密に区別する。過去の経緯・実績は経過記録として明記し、最新の実測状況と峻別する。
 
-### 3.1 達成済みの実測事実
-- **静止点データの転送および暗号化検証成功**:
-  - 2026-09-25 06:50時点のMac側DB（26,218,319,872 bytes）の圧縮転送が行われ、NAS側においてSHA256ハッシュ一致および `PRAGMA quick_check` の正常完了が確認された。
-  - 2026-09-25 11:59時点の静止点クローン（26,287,431,680 bytes）について、ローカルでの `PRAGMA quick_check` 検査、zstd+AES256暗号化、およびストリーム復号SHA256照合に成功（raw SHA256: `3021be82de4cbda88b5f1843ce3fa31ee25c5c61eabba4b4347fcf7ba4678dab`、cipher: 2,403,551,447 bytes、cipher SHA256: `7e7f5b89e14ba3188038697b04a8925dd581de28f6757fbbf105871714c2db5e`、receipt: `logs/development/astra-local-latest-encryption-20260925.json`）。
-- **NAS Dockerビルド成功**:
-  `scripts/deploy_nas_container.sh` により、NAS環境上でDockerイメージ（`ikaring-archive:current`、Image ID: `476e595cb513`）のビルドが正常に完了した。
-- **Google Drive connector二段上限の実測と64MiBチャンク分割の実証**:
+### 3.1 達成済みの実測事実（最新および経過実績）
+- **NAS正本コレクターの安定稼働とSQL高速化（2026-09-27 12:34 JST更新）**:
+  - NAS正本コレクターはイメージ `ddde94a6a8a8` で稼働中。販売ギア・リプレイ詳細の正常null再試行に上限24時間の待機を追加し、反映後の全7履歴更新と認証正常を確認。旧コンテナと変更前の整合性検査済みDBを保持。
+  - Macローカルのコレクター（LaunchAgent）は無効化（disabled）済みであり、未登録を確認。二重コレクターは存在せず、NASが唯一の正本となっている。
+  - 全7履歴current、認証正常、595試合・詳細待ち0件・取得不能詳細10件、画像4970件を実測。
+  - 状態取得SQLにおいて、肥大化していたentitiesテーブルに対する細い `response_id` 索引（状態COUNT索引）を追加したことで、COUNT処理は約0.005秒に短縮され、`status` 全体の応答時間が数分から約1.6秒へ大幅に高速化。
+  - Mac側の `Start.command`（`scripts/start.py`）は、`config/storage-location.json` のNASマーカー検証により自動的に `scripts/nas_archive.py gui` へルーティングされ、MacローカルでのNode/npm依存関係および本人ログインを不要化している。
+- **日次バックアップDocker schedulerの定期自動実行と完走成功（経過と実績）**:
+  - 【初回手動サイクル経過】2026-09-26 22:40にスクリプト手動実行による初回日次バックアップサイクル（NASローカル復元quick_check、クラウドcipher全量readback SHA-256一致）が完走・成功しレシートを生成（手動実行による初回サイクルの成功記録であり、定期実行の成功とは区別して整理）。
+  - 【定期Docker scheduler設置】NASホストの一般ユーザーにcrontab実行権限がない制限を回避するため、Dockerコンテナによるスケジューラー方式（UID 1000:10、`restart: unless-stopped`、毎朝4:00 Asia/Tokyo、失敗時15分retry、同日成功後の重複実行なし）を実設置。
+  - 【定期自動実行の初完走成功】2026-09-27 04:00に定期Docker schedulerが自動起動し、05:16に成功（クラウド全量cipher readback SHA一致、scheduler `last_success_due_day=2026-09-27`）。
+  - 【最新世代のクラウド全量復号照合】さらに2026-09-27 07時台に、この最新daily世代（raw 26,697,261,056 bytes）をGoogle Driveから全量復号し、原点とraw SHA-256一致、マニフェスト（`quick_check: ok`）の原rawとbyte完全一致を確認。NASローカルでの平文復元およびquick_checkもbackup cycle内で実行済み。
+- **移行静止点（2026-09-26 03:19点）のクラウド保全・全量復号検証完了**:
+  - 移行静止点（2026-09-26 03:19時点のDB）: raw 26,412,634,112 bytes, SHA-256 `069290e0ae6f0982ac8dd0db67df31f53a015246d110970041a2a3f4ef29c6e5`。
+  - クラウド上の全37 cloud partsからストリーム全量復号を実施し、rawバイト数およびSHA-256ハッシュが原点と完全一致することを確認。
+  - 元暗号マニフェストおよびチャンクマニフェストの両manifestについても、クラウドからの全量読み戻し（full readback）ハッシュ一致を確認（status: complete）。
+  - private証拠: `operations-20260926/migration-cloud-complete.json`。
+- **過去全世代（旧22GB・9/25 11:59・旧432MB）のNAS保全およびクラウド全量raw一致確認**:
+  - 旧22GB版スナップショット（全27片、22,264,725,504 bytes）: NAS保全およびクラウド全量復号raw一致確認済み（status: complete）。
+  - 2026-09-25 11:59静止点スナップショット（全36片、26,287,431,680 bytes）: NAS保全（別名保持）およびクラウド全量復号raw一致確認済み（status: complete）。
+  - 旧432MB版（432,381,952 bytes, SHA-256 `aff52aa81853165af8cd97e3e12fb805ca578df04595f23473e3b7a82ba48afa`）: NAS保全およびクラウドからの全量raw復号一致を確認。
+  - NASおよびクラウド上の旧版暗号スナップショットはすべて破棄せず安全に保持。
+- **保全済みローカル原本DBおよび作業用複製の削除完了（2026-09-27 07:33実測）**:
+  - 移行静止点、旧22GB、9/25 11:59、旧432MB、最新daily静止点の全世代について、NAS保全証拠およびクラウド全量復号証拠を確認。
+  - 削除直前の厳格な安全事前検査:
+    1. Macコレクターがdisabled（未登録）であり二重コレクターが存在しないことの確認
+    2. `config/storage-location.json` のNAS markerが存在することの確認
+    3. NAS側保全物のファイルサイズ確認
+    4. ローカルhash検証時からinode、mtime、sizeが一切変更されていないことの再確認
+    5. WALファイルが存在しないことの確認
+    6. writer lock下での作業であることの確認
+  - 上記事前検査をすべて満たした上で、許可済みのローカル旧DB 4本＋暗号作業用複製65個（論理合計 83,729,271,876 bytes）を安全に削除完了。
+  - Macローカルディスクの実空き容量が 3,237,855,232 bytes（約3.0GiB）から 38,921,396,224 bytes（約36.2GiB）へ大幅に回復。
+  - 元DB配置場所には所在移転を示す `relocated.json` を保存。
+  - NASおよびクラウド上の旧版データはすべて保持。
+  - private証拠: `operations-20260926/local-cleanup-complete.json` および各 `cloud-complete.json`。
+- **Google Drive書込みOAuth認可とrclone設定（2026-09-26実測）**:
+  - 2026-09-26 21:19にwrite OAuth（Google Drive書込み権限スコープ）の認可を完了。専用の書き込み設定（`rclone-write.conf`）をNAS secrets配下へ権限600で配置済み。秘密情報は記録・公開しない。
+- **Google Drive connector二段上限の実測と64MiBチャンク分割の実証（過去事実）**:
   - Google Drive connectorにおいて、転送開始前の上限（512MiB）および後段HTTP 413上限（100MiB）の二段上限が実測された。
-  - 二段上限回避のための既定64MiB part分割（`scripts/backup_chunks.py`）およびストリーム復号・完全性往復検証（`scripts/verify_cloud_chunks.py`）の実装と単体・結合検証が完了した。
+  - 二段上限回避のための既定64MiB part分割（`scripts/backup_chunks.py`）およびストリーム復号・完全性往復検証（`scripts/verify_cloud_chunks.py`）の実装と単体・結合検証が完了している。
 
-### 3.2 未完了項目と現在の制約事項
-- **移行実運転は未完了**:
-  NAS上のDockerコンテナを本番常駐プロセスとして起動し、定期収集を切り替える工程は実施されていない。「移行実運転完了」と扱ってはならない。
-- **現在NAS到達不能によるMac collector一時復帰**:
-  NASへのネットワーク接続が不能（Host is down）となったため、戦績取得の欠損を防ぐ目的でMacローカルのLaunchAgent（コレクター）を再起動して収集を一時復帰させている。
-  したがって、現在MacローカルのDBは更新が進んでおり、過去の静止点は最新正本ではない。NAS再接続時にはMac側を再停止し、最新静止点の再転送・検証が必須である。
-- **2世代の静止点クラウド保全は完了、稼働正本の移行は未完了**:
-  2026-09-26 02:54確認時点で、旧22GB版（27片）と9/25 11:59静止点26GB版（36片）は全量ストリーム復号後のサイズ・SHA-256、および2マニフェストの読み戻し一致まで検証し、完了レシートを保存した。稼働DBはその後も更新しているため、この成功を現在の最新正本のNAS移行完了として扱わない。NAS復帰後に最新静止点を再作成して移行・保全する。
-- **Google Drive rclone設定の権限制約**:
-  既存の `gdrive_origin:` 設定は権限が読み取り専用（`drive.readonly`）であり、直接の書込み試行はHTTP 403 Forbiddenとなる。
-- **日次無人rclone用書込み認証の保留**:
-  NASからの自動アップロードに必要な書込み権限付きトークン・認証の整備については、ユーザーからの返答待ちの状態である。
+### 3.2 未完了項目と現在の制約事項（未着手・検証中タスク）
+- **軽量ファイル同期の定期運転は未稼働（導入検証中）**:
+  - `sync_nas.py` および `sync_gdrive.py` による軽量ファイル（`exports/` 等）の定期同期は、3way baseline実装・手動往復検証を完了。LaunchAgentを登録済みだが、OSファイルアクセス許可の確認待ちで定常運転には入っていない。
+  - 検証済みの仕様:
+    - 片側だけの更新は通常更新としてアトミックに同期
+    - 両側独立編集（競合）はmtime採用＋旧版退避（`.sync-conflicts/`）
+    - 共通排他ロック（lock）の適用
+    - NASおよびGoogle Driveの同期状態ファイル（stateファイル）は同期対象から除外
+  - `scripts/install_file_sync_service.py`（`--print`/`--install`）のコード検査と実登録は完了。登録時ログは `~/Library/Logs/ikaring-archive-file-sync/` にあり、OS許可後に終了コード0と転送結果を確認する。
+- **GitHub暗号化DB保管役割の保留（未回答）**:
+  - GitHubリポジトリへ暗号化DB自体を保管する役割を持たせるか、それとも公開ソースコードと復元手順のみとするかについては、ユーザー未回答のまま保留中である。
+  - 既存公開リポジトリはソースコードと復元手順のみを保持し、実データや暗号化DBは含めない。
+- **将来の統合GUIおよび追加承認済み開発タスク**:
+  - 統合GUI等の既存承認済みタスクは未着手として保持。
 
 > [!WARNING]
 > **重要な安全注意事項**:
-> - 「NASコンテナの実起動成功」「移行実運転完了」「ローカルデータの削除完了」と扱ってはならない。現時点で移行は未完了であり、元DBを削除する前のNAS最新点検証条件およびクラウド保全の完全性検証条件を満たすまでは、Mac上のローカル正本DBおよびバックアップファイルを絶対に削除してはならない。
+> - 軽量ファイル同期は手動往復成功・サービス登録済みだが、自動実行はOSファイルアクセス許可確認待ち。登録だけを運転成功とは扱わない。
+> - GitHubへの暗号化DB保管役割は未回答であり、公開リポジトリへ実データや暗号化DBを含めてはならない。
+> - 稼働中DBのネットワーク直接コピー禁止、暗号鍵の分離保全、およびアトミック置換手順等の安全原則を厳守する。
 
 ---
 
 ## 4. 運用手順
 
-### 4.1 NAS再接続後の静止点再同期手順
-現在Mac側で収集が継続しているため、NASが再起動・復帰した際は、最新の静止点を再作成して転送し直す必要がある。
+### 4.1 【参考手順】Mac正本から初回移行・再同期時の手順（初回切替用）
+
+> [!NOTE]
+> **運用状態との分離**: 現在はNASコレクターが正本として安定稼働しており、Mac側コレクターは無効化（disabled）、Macローカル原本DBは保全確認後に安全に削除完了している（詳細は3節参照）。
+> 本節の手順は、今後Mac正本環境から初回移行を行う場合や、万一の緊急切戻し後に再度NASへ正本切替・同期を行う場合にのみ使用する参考手順であり、現在の定常稼働状態を示すものではない。
 
 1. **Mac側コレクターの停止**:
    二重取得および転送中のDB更新を防ぐため、MacのLaunchAgentを停止する。
@@ -163,6 +218,13 @@ NAS環境でのコンテナ起動は、外部ポートを開放せず、ボリ�
    - 認証トークンの読み込み確認
    - 7履歴経路の取得テスト実行（7件の戦績を意味しない）
    - エクスポートファイルおよびDB更新の確認
+3. **日次バックアップDocker schedulerコンテナの起動パラメーター**:
+   - ホストcronの権限制限を回避するため、Dockerコンテナとしてスケジューラーを常駐実行する。
+   - 実行ユーザー: `UID=1000:GID=10`
+   - 再起動ポリシー: `--restart unless-stopped`
+   - スケジュール設定: 毎朝4:00（Asia/Tokyo）
+   - 再試行および重複防止: 失敗時は15分間隔で再試行（retry）、同日成功後の重複実行なし（`last_success_due_day` による整合性管理）。
+   - 実行処理: 常駐backupコンテナ内の `scripts/nas_backup_scheduler.py` が `scripts/nas_backup_cycle.py` を直接実行する。Docker socketをマウントせず、コンテナ内から別コンテナを起動しない。`scripts/run_nas_daily_backup.sh` はNASホストから単発実行する補助手段である。
 
 ### 4.3 移行マーカーの配置とクライアント運用切替
 NAS側のコンテナ収集が安定して稼働したことを実測した後、Astraが移行マーカーを作成する。
@@ -177,20 +239,24 @@ NAS側のコンテナ収集が安定して稼働したことを実測した後�
      "database": "/data/database/archive.sqlite3"
    }
    ```
-2. **Macクライアント操作の切り替え**:
-   - 今後のGUI起動や分析出力、状態確認は `scripts/nas_archive.py` を使用する。
+2. **Macクライアント操作の切り替えとStart.commandのルーティング**:
+   - `Start.command`（`scripts/start.py`）を実行すると、Node.js/npmの検査や依存関係インストール、本人ログイン処理を行う前に `config/storage-location.json` を検証する。
+   - 正常なNASマーカーが確認された場合は、自動的に `scripts/nas_archive.py gui` が呼び出され、MacローカルでのNode/npm/loginを一切不要としてNAS側で生成された最新GUI HTMLをブラウザで開く。マーカー不正時は即座に処理を拒否し、ローカルへの自動フォールバックは行わない。
+   - CLI操作を行う場合は `scripts/nas_archive.py` を使用する。
      ```bash
      python3 scripts/nas_archive.py status
      python3 scripts/nas_archive.py gui
      python3 scripts/nas_archive.py export-xlsx
      ```
-   - Macローカルの `archive.py` 直接実行は安全機構によりブロックされることを確認する。
+   - Macローカルの `archive.py` 直接実行は安全機構（`NAS_STORAGE_ACTIVE`）によりブロックされることを確認する。
 
 ### 4.4 バックアップおよびクラウド保全運用（定期単一cipher経路とconnector手動chunk分割経路）
 クラウド保全には、rcloneによる定期単一cipher直接アップロード経路（`nas_backup_cycle.py`）と、Google Drive connector二段上限を回避するためのconnector手動chunk分割経路（`backup_chunks.py` / `verify_cloud_chunks.py`）の2つの運用経路が存在する。定期 `nas_backup_cycle.py` は単一cipher直接経路でありchunk自動化は未実装であるため、手動chunk経路と同一処理だと誤解してはならない。
 
 #### 4.4.1 定期 nas_backup_cycle.py による単一cipher直接保全経路
 NAS内で定期的に無人実行されるバックアップサイクルであり、以下の処理を一貫して実施する。
+2026-09-26 22:40の手動初回完走（レシート生成）を経て、2026-09-27 04:00〜05:16にDocker schedulerによる定期自動実行の初完走・成功（cloud全量cipher readback SHA一致）を実測。さらに07時台に最新daily世代（raw 26,697,261,056 bytes）のクラウドからの全量復号rawバイト数・SHA-256一致、およびマニフェスト（`quick_check: ok`）との完全一致を確認している。
+
 1. `scripts/nas_create_verified_backup.sh` を呼び出し、オンラインバックアップ作成、空き容量事前検査（4倍+1GiB）、zstd+AES256暗号化、復号ハッシュ照合、`quick_check` 検査を経て、単一暗号化ファイル（`*.zst.gpg`）および元暗号マニフェスト（`*.manifest.json`）を生成する。
 2. 生成された単一暗号化ファイルとマニフェストを、rcloneを用いてGoogle Driveへストリームアップロードする。
 3. `rclone cat` による全量読み戻しとSHA-256往復検証を実施する。

@@ -17,6 +17,10 @@ DETAIL_ROOTS={
 EXPECTED_NULL_ROOTS={
     'useCurrentFestQuery':'currentFest',
 }
+RELATED_EMPTY_ROOTS={
+    'SaleGearDetailQuery':'saleGear',
+    'DownloadSearchReplayQuery':'replay',
+}
 
 class Store:
     def __init__(self,path,readonly=False):
@@ -32,6 +36,9 @@ class Store:
         self.db=sqlite3.connect(path,timeout=30);self.db.row_factory=sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
         self.db.executescript((Path(__file__).resolve().parents[3]/'sql/schema.sql').read_text());self.db.commit()
+        if 'empty_retries' not in {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}:
+            self.db.execute('ALTER TABLE jobs ADD COLUMN empty_retries INTEGER NOT NULL DEFAULT 0')
+            self.db.commit()
         self._reclassify();self.path.chmod(0o600)
     def close(self):self.db.close()
     def issue(self,code,context,response=None,run=None):
@@ -67,7 +74,7 @@ class Store:
         okay=outcome=='done'
         with self.db:
             for path in omissions:self.issue('SELECTED_FIELD_MISSING',{'operation':op,'path':path},rid)
-            if outcome=='retry':
+            if outcome=='retry' and not self._is_related_empty(r,obj,data,omissions):
                 self.issue('INCOMPLETE_RESPONSE',{'operation':op,'status':r['http_status'],'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False},rid)
             elif outcome=='unavailable':
                 self.issue('DETAIL_UNAVAILABLE',{'operation':op,'reason':'SERVER_RETURNED_NULL'},rid)
@@ -117,9 +124,16 @@ class Store:
         root=EXPECTED_NULL_ROOTS.get(operation)
         if root and root in data and data.get(root) is None:
             return 'done'
+        if self._is_related_empty(r,obj,data,omissions):
+            return 'retry'
         if not data or not any(v is not None for v in data.values()):
             return 'retry'
         return 'done'
+    def _is_related_empty(self,r,obj,data,omissions=()):
+        root=RELATED_EMPTY_ROOTS.get(r['operation'])
+        return (root is not None and r['http_status']==200 and isinstance(obj,dict)
+            and 'errors' not in obj and not omissions and isinstance(data,dict)
+            and root in data and data[root] is None)
     def _advance_endpoint_head(self,r,fetched_at):
         current=self.db.execute('SELECT response_id FROM endpoint_heads WHERE account=? AND operation=?',(r['account'],r['operation'])).fetchone()
         replace=current is None
@@ -138,6 +152,7 @@ class Store:
         data=obj.get('data') if isinstance(obj,dict) else None
         omissions=planner.missing_fields(r['operation'],data,json.loads(r['variables_json'])) if r['query_id'] and isinstance(data,dict) and r['operation'] in planner.routes else []
         outcome=self._response_outcome(r,obj,data,omissions)
+        related_empty=self._is_related_empty(r,obj,data,omissions)
         okay=outcome=='done'
         with self.db:
             fetches=self.db.execute('SELECT * FROM response_fetches WHERE response_id=? AND acknowledged=0 ORDER BY julianday(fetched_at),event_id',(r['id'],)).fetchall()
@@ -155,8 +170,19 @@ class Store:
                         # current again without losing B or duplicating the match.
                         self._matches({**dict(r),'fetched_at':fetched['fetched_at']},data,True)
                     if okay:self._advance_endpoint_head(r,fetched['fetched_at'])
-                    self.db.execute('UPDATE jobs SET state=?,attempts=attempts+1,next_attempt=?,last_response_id=? WHERE account=? AND operation=? AND variables_json=?',
-                        (outcome,time.time()+(86400 if outcome in ('done','unavailable') else 300),r['id'],r['account'],r['operation'],r['variables_json']))
+                    if r['operation'] in RELATED_EMPTY_ROOTS:
+                        job=self.db.execute('SELECT empty_retries FROM jobs WHERE account=? AND operation=? AND variables_json=?',
+                            (r['account'],r['operation'],r['variables_json'])).fetchone()
+                        if job:
+                            empty_retries=job['empty_retries']+1 if related_empty else 0
+                            if related_empty and empty_retries==1:
+                                self.issue('RELATED_DETAIL_EMPTY',{'operation':r['operation'],'reason':'SERVER_RETURNED_NULL'},r['id'])
+                            delay=min(86400,300*2**min(empty_retries-1,9)) if related_empty else (86400 if outcome in ('done','unavailable') else 300)
+                            self.db.execute('UPDATE jobs SET state=?,attempts=attempts+1,empty_retries=?,next_attempt=?,last_response_id=? WHERE account=? AND operation=? AND variables_json=?',
+                                (outcome,empty_retries,time.time()+delay,r['id'],r['account'],r['operation'],r['variables_json']))
+                    else:
+                        self.db.execute('UPDATE jobs SET state=?,attempts=attempts+1,next_attempt=?,last_response_id=? WHERE account=? AND operation=? AND variables_json=?',
+                            (outcome,time.time()+(86400 if outcome in ('done','unavailable') else 300),r['id'],r['account'],r['operation'],r['variables_json']))
                 self.db.execute('UPDATE response_fetches SET acknowledged=1 WHERE event_id=?',(fetched['event_id'],))
     def _write_weapon_snapshots(self,r,data,fetched_at,event_id):
         for item in weapon_snapshots(data):

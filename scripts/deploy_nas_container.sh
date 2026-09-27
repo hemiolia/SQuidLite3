@@ -84,6 +84,13 @@ done
 # diagnosis, never removed by this script or a concurrent invocation.
 docker build --file "$stage/deploy/nas/Dockerfile" --tag "$image" "$stage"
 
+# Verify that the generated image can execute under the runtime user without network
+# and without mounts before replacing runtime/app. A failure retains the existing app.
+if ! docker run --rm --network none "$image" python3 archive.py --help >/dev/null; then
+    echo "Runtime pre-flight check failed for $image as the configured runtime user; retaining existing app" >&2
+    exit 1
+fi
+
 release=""
 old_app_moved=0
 rollback() {
