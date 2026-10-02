@@ -3,11 +3,10 @@
 import argparse, base64, json, os, plistlib, re, shutil, sqlite3, subprocess, sys, uuid
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent/'src/python'))
-from ikarchive.store import Store, now, js
+from ikarchive.store import Store, now, js, database_is_slice
 from ikarchive.locking import acquire
 from ikarchive.planner import Planner
 from ikarchive.collector import catalog, sync, ROOT
-from ikarchive.xlsx_export import export_xlsx
 from ikarchive.gui import write_gui
 from ikarchive.records import RecordReader
 from scripts.data_root import data_root
@@ -74,9 +73,15 @@ def apply_tag(store,args):
     else:
         store.db.execute('DELETE FROM match_tags WHERE account=? AND match_key=? AND tag=?',(account,args.match_key,tag))
     store.db.commit()
-    return {'account_selected':True,'match_key':args.match_key,'tag':tag,'action':args.tag_action}
+    rows=[tuple(row) for row in store.db.execute(
+        'SELECT tag,note,created_at,updated_at FROM match_tags WHERE account=? AND match_key=? ORDER BY tag',
+        (account,args.match_key))]
+    from ikarchive.slices import sync_tags_to_slices
+    sync=sync_tags_to_slices(store.path,account,args.match_key,rows)
+    return {'account_selected':True,'match_key':args.match_key,'tag':tag,'action':args.tag_action,'slice_sync':sync['slice_sync']}
 
 def audit(store):
+    from ikarchive.event_evidence import event_evidence
     row=store.db.execute('SELECT json_text FROM manifests ORDER BY fetched_at DESC LIMIT 1').fetchone()
     if not row:return {'error':'CATALOG_MISSING','all_server_records_verified':False}
     m=json.loads(row[0]);p=Planner(m);ops=[]
@@ -85,7 +90,7 @@ def audit(store):
         responses=store.db.execute('SELECT count(*) FROM responses WHERE operation=?',(name,)).fetchone()[0]
         entities=p.routes.get(name,{}).get('bindings',{})
         ops.append({'operation':name,'classification':'excluded' if name in p.excluded else 'unsupported' if name in p.unsupported else 'related' if entities else 'root','reason':p.excluded.get(name) or p.unsupported.get(name),'states':states,'responses':responses,'needs_entities':entities})
-    return {'catalog_at':m.get('fetched_at'),'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported,'operations':ops,'storage':store.status(),'all_server_records_verified':False,'limit':'Server-internal records and records no longer exposed by SplatNet cannot be proven complete from the client API.'}
+    return {'catalog_at':m.get('fetched_at'),'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported,'operations':ops,'storage':store.status(),'event_evidence':event_evidence(store.db),'all_server_records_verified':False,'limit':'Server-internal records and records no longer exposed by SplatNet cannot be proven complete from the client API.'}
 
 def dispatch(store,args):
     if args.command=='init':result=store.status()
@@ -94,9 +99,23 @@ def dispatch(store,args):
     elif args.command=='sync':
         if args.budget<1 or args.delay<0:raise ValueError('budget>=1, delay>=0')
         from ikarchive.publish import publish_outputs
+        from ikarchive.slices import refresh_slices
+        # 収集が例外で終わっても、ここまでに確定した試合を派生ファイルへ反映する。
+        sync_error=None
         try:result=sync(store,args.account,args.nxapi_data,args.budget,args.delay)
-        finally:published=publish_outputs(store)
+        except Exception as exc:
+            sync_error=exc
+            result=None
+        try:published=publish_outputs(store)
+        except Exception as exc:
+            published={'error':type(exc).__name__}
+        try:slices=refresh_slices(store.path, store.path.parent / 'slices')
+        except Exception as exc:
+            if sync_error is None:raise
+            raise sync_error from exc
+        if sync_error is not None:raise sync_error
         result['exports']=published
+        result['slices']=slices
     elif args.command=='status':result=store.status()
     elif args.command=='audit':result=audit(store)
     elif args.command=='verify':
@@ -127,7 +146,7 @@ def dispatch(store,args):
             Path(str(tmp)+'-wal').unlink(missing_ok=True)
             Path(str(tmp)+'-shm').unlink(missing_ok=True)
         result={'backup':str(dest),'integrity':integrity}
-    elif args.command=='export-xlsx':result=export_xlsx(store,args.destination)
+    elif args.command=='export-xlsx':raise ValueError('LEGACY_ANALYSIS_XLSX_RETIRED')
     elif args.command=='gui':
         font_path=os.environ.get('IKARING_ARCHIVE_FONT')
         result=write_gui(store,args.destination,font_path=font_path)
@@ -197,6 +216,280 @@ def dispatch(store,args):
         if incident.exists():incident.unlink()
     print(json.dumps(result,ensure_ascii=False,indent=2));return 0
 
+def _write_shard_json(value):
+    sys.stdout.write(json.dumps(value,ensure_ascii=True,separators=(',',':'))+'\n')
+
+def _write_shard_text(value):
+    # Escape in bounded chunks so large TEXT values do not require a second
+    # full-size JSON string allocation. Joining these escaped fragments inside
+    # the surrounding quotes preserves one ordinary JSON string value.
+    sys.stdout.write('"')
+    for offset in range(0,len(value),8192):
+        encoded=json.dumps(value[offset:offset+8192],ensure_ascii=True,separators=(',',':'))
+        sys.stdout.write(encoded[1:-1])
+    sys.stdout.write('"')
+
+def _write_shard_cell(value):
+    if value is None:
+        kind,encoding='null','none';encoded_value=None
+    elif type(value) is int:
+        if value < -(1<<63) or value > (1<<63)-1:raise ValueError('SHARD_CELL_INTEGER_OUT_OF_RANGE')
+        kind,encoding='integer','decimal';encoded_value=str(value)
+    elif type(value) is float:
+        kind,encoding='real','float.hex';encoded_value=value.hex()
+    elif type(value) is str:
+        kind,encoding='text','unicode';encoded_value=value
+    elif type(value) is bytes:
+        kind,encoding='blob','hex';encoded_value=value
+    else:
+        raise ValueError('SHARD_CELL_TYPE_UNSUPPORTED')
+    sys.stdout.write('{"sqlite_type":'+json.dumps(kind)+',"encoding":'+json.dumps(encoding)+',"value":')
+    if kind=='null':sys.stdout.write('null')
+    elif kind=='text':_write_shard_text(encoded_value)
+    elif kind=='blob':
+        sys.stdout.write('"')
+        for offset in range(0,len(encoded_value),32768):
+            sys.stdout.write(encoded_value[offset:offset+32768].hex())
+        sys.stdout.write('"')
+    else:
+        sys.stdout.write(json.dumps(encoded_value,separators=(',',':')))
+    sys.stdout.write('}')
+
+def _write_shard_row(ordinal,values,columns,*,source_rowid=None,include_source_identity=False):
+    if len(values)!=len(columns):raise ValueError('SHARD_ROW_WIDTH_INVALID')
+    sys.stdout.write('{"ordinal":'+str(ordinal))
+    if include_source_identity:
+        sys.stdout.write(',"source_rowid":')
+        _write_shard_cell(source_rowid)
+    sys.stdout.write(',"values":[')
+    for index,value in enumerate(values):
+        if index:sys.stdout.write(',')
+        _write_shard_cell(value)
+    sys.stdout.write(']}\n')
+
+def _delta_generation_ids(delta_dirs):
+    plans=[]
+    for directory in delta_dirs:
+        path=Path(directory)/'delta-plan.json'
+        try:
+            with path.open('r',encoding='utf-8') as stream:
+                plan=json.load(stream)
+        except (OSError,UnicodeError,json.JSONDecodeError) as exc:
+            raise ValueError('SHARD_DELTA_INVALID') from exc
+        if not isinstance(plan,dict):raise ValueError('SHARD_DELTA_INVALID')
+        plans.append(plan)
+    last_reset=max((index for index,plan in enumerate(plans)
+                    if plan.get('replaces_delta_chain') is True),default=-1)
+    selected=plans[last_reset:]
+    generations=[plan.get('generation_id') for plan in selected]
+    if not generations or any(not isinstance(item,str) for item in generations):
+        raise ValueError('SHARD_DELTA_INVALID')
+    return generations
+
+def _run_delta_shard_cli(args):
+    from ikarchive.delta_reader import DeltaChainReader, DeltaReaderError
+    from ikarchive.shard_reader import LosslessShardReader
+    try:
+        with LosslessShardReader(args.root,expected_generation=args.generation) as baseline:
+            try:
+                with DeltaChainReader(baseline,args.delta_dirs) as reader:
+                    delta_generations=_delta_generation_ids(args.delta_dirs)
+                    if delta_generations[-1]!=reader.generation_id:
+                        raise ValueError('SHARD_DELTA_INVALID')
+                    baseline_generation=baseline.snapshot_identifier
+                    current_generation=reader.generation_id
+                    tables=reader.tables()
+                    if args.command=='shard-list':
+                        result={
+                            'reader_role':'lossless_delta_chain_reader',
+                            'baseline_only':False,
+                            # Keep the historical key tied to the baseline;
+                            # current state is named explicitly below.
+                            'generation':baseline_generation,
+                            'baseline_generation':baseline_generation,
+                            'latest_generation':current_generation,
+                            'delta_generations':delta_generations,
+                            'source_sha256':baseline.source_sha256,
+                            'baseline_source_sha256':baseline.source_sha256,
+                            'baseline_source_schema_sha256':baseline.source_schema_sha256,
+                            'source_schema_sha256':reader.source_schema_sha256,
+                            'table_count':len(tables),
+                            'tables':tables,
+                            'schema_objects':reader.schema_objects(),
+                        }
+                        _write_shard_json(result)
+                        return 0
+
+                    table=next((item for item in tables if item['name']==args.table),None)
+                    if table is None:raise ValueError('SHARD_TABLE_NOT_FOUND')
+                    columns=table['columns']
+                    selector_count=None
+                    if args.mode is None:
+                        rows=iter(reader.iter_rows(args.table))
+                        ordinal_kind='current_table_stream_ordinal'
+                        scope={'kind':'full_table','table':args.table}
+                    else:
+                        selector_count=sum(1 for _ in reader.iter_selected_matches(
+                            args.mode,rule_token=args.rule_token))
+                        def numbered():
+                            for ordinal,values in enumerate(reader.iter_selected_matches(
+                                    args.mode,rule_token=args.rule_token)):
+                                yield ordinal,None,values
+                        rows=iter(numbered())
+                        ordinal_kind='selector_stream_ordinal'
+                        scope={
+                            'kind':'mode_selector' if args.rule_token is None else 'mode_rule_selector',
+                            'analysis_set':args.mode,
+                            'rule_token':args.rule_token,
+                            'selected_match_count':selector_count,
+                            'source_value_closure':'full current source remains available through unfiltered table reads',
+                            'information_scope':(
+                                'selected rows are derived from the current full match_classification and matches tables; '
+                                'the verified baseline-plus-delta chain retains every source table and value'
+                            ),
+                        }
+
+                    sentinel=object()
+                    current=next(rows,sentinel)
+                    full_count=reader.row_count(args.table)
+                    header={
+                        'type':'header',
+                        'generation':baseline_generation,
+                        'baseline_generation':baseline_generation,
+                        'latest_generation':current_generation,
+                        'delta_generations':delta_generations,
+                        'source_sha256':baseline.source_sha256,
+                        'baseline_source_sha256':baseline.source_sha256,
+                        'source_schema_sha256':reader.source_schema_sha256,
+                        'table':args.table,
+                        'columns':columns,
+                        'column_xinfo':reader.columns(args.table),
+                        'foreign_keys':reader.foreign_keys(args.table),
+                        'table_full_row_count':full_count,
+                        'ordinal_kind':ordinal_kind,
+                        'source_rowid_kind':'nullable_original_source_rowid',
+                        'scope':scope,
+                    }
+                    _write_shard_json(header)
+                    sys.stdout.flush()
+                    returned=0
+                    while current is not sentinel:
+                        if args.limit is not None and returned>=args.limit:
+                            break
+                        ordinal,source_rowid,values=current
+                        _write_shard_row(ordinal,values,columns,source_rowid=source_rowid,
+                                         include_source_identity=args.mode is None)
+                        returned+=1
+                        current=next(rows,sentinel)
+                    truncated=current is not sentinel
+                    _write_shard_json({'type':'footer','returned_rows':returned,'truncated':truncated,'limit':args.limit})
+                    sys.stdout.flush()
+                    return 0
+            except DeltaReaderError as exc:
+                raise ValueError('SHARD_DELTA_INVALID') from exc
+            except (RuntimeError,ValueError,OSError,sqlite3.Error,StopIteration,TypeError,KeyError,UnicodeError) as exc:
+                if isinstance(exc,ValueError) and str(exc).startswith('SHARD_'):
+                    raise
+                raise ValueError('SHARD_DELTA_INVALID') from exc
+    except (RuntimeError,ValueError,OSError,sqlite3.Error,TypeError,KeyError,UnicodeError) as exc:
+        if isinstance(exc,ValueError) and str(exc).startswith('SHARD_'):
+            raise
+        raise ValueError('SHARD_PACKAGE_INVALID') from exc
+
+def _run_shard_cli(args):
+    if args.command=='shard-read':
+        if args.rule_token is not None and args.mode is None:
+            raise ValueError('SHARD_RULE_REQUIRES_MODE')
+        if args.limit is not None and args.limit<=0:
+            raise ValueError('SHARD_LIMIT_MUST_BE_POSITIVE')
+        if (args.mode is not None or args.rule_token is not None) and args.table!='matches':
+            raise ValueError('SHARD_SELECTOR_REQUIRES_MATCHES')
+    if args.delta_dirs:
+        return _run_delta_shard_cli(args)
+    try:
+        from ikarchive.shard_reader import LosslessShardReader
+        with LosslessShardReader(args.root,expected_generation=args.generation) as reader:
+            # The reader has already checked this exact manifest against disk,
+            # all proofs, hashes, and the full SQLite file inventory.
+            manifest=json.loads((args.root/'manifest.json').read_text(encoding='utf-8'))
+            if args.command=='shard-list':
+                result={
+                    'reader_role':reader.reader_role,
+                    'baseline_only':reader.baseline_only,
+                    'generation':manifest['snapshot_identifier'],
+                    'source_sha256':manifest['source_sha256'],
+                    'source_schema_sha256':manifest['source_schema_sha256'],
+                    'table_count':len(reader.tables()),
+                    'tables':reader.tables(),
+                    'schema_objects':reader.schema_objects(),
+                }
+                _write_shard_json(result)
+                return 0
+
+            table=next((item for item in reader.tables() if item['name']==args.table),None)
+            if table is None:raise ValueError('SHARD_TABLE_NOT_FOUND')
+            columns=table['columns']
+            selector=None
+            if args.mode is None:
+                rows=iter(reader.iter_rows_with_identity(args.table))
+                ordinal_kind='source_table_archive_ordinal'
+                scope={'kind':'full_table','table':args.table}
+            else:
+                relative=(f'by-mode/{args.mode}.sqlite3' if args.rule_token is None else
+                          f'by-rule/{args.mode}__{args.rule_token}.sqlite3')
+                selector=next((row for row in manifest['by_mode' if args.rule_token is None else 'by_rule']
+                               if row['file']==relative),None)
+                if selector is None:raise ValueError('SHARD_SELECTOR_NOT_FOUND')
+                selected=reader.iter_selected_matches(args.mode,rule_token=args.rule_token)
+                def numbered():
+                    for ordinal,values in enumerate(selected):yield ordinal,None,values
+                rows=iter(numbered())
+                ordinal_kind='selector_stream_ordinal'
+                scope={
+                    'kind':'mode_selector' if args.rule_token is None else 'mode_rule_selector',
+                    'analysis_set':args.mode,
+                    'rule_token':args.rule_token,
+                    'selected_match_count':selector['matches'],
+                    'information_scope':'seed matches; all source tables and values remain available through shared shard dependencies',
+                }
+
+            # Pull the first row before writing a header so invalid selector
+            # metadata or dependency proofs cannot yield a misleading stream.
+            sentinel=object()
+            current=next(rows,sentinel)
+            header={
+                'type':'header',
+                'generation':manifest['snapshot_identifier'],
+                'source_sha256':manifest['source_sha256'],
+                'table':args.table,
+                'columns':columns,
+                'column_xinfo':reader.columns(args.table),
+                'table_full_row_count':table['row_count'],
+                'ordinal_kind':ordinal_kind,
+                'source_rowid_kind':table['rowid_kind'],
+                'source_rowid_projection':'original_source' if args.mode is None else 'available_in_full_table_stream',
+                'scope':scope,
+            }
+            _write_shard_json(header)
+            sys.stdout.flush()
+            returned=0
+            while current is not sentinel:
+                if args.limit is not None and returned>=args.limit:
+                    break
+                ordinal,source_rowid,values=current
+                _write_shard_row(ordinal,values,columns,source_rowid=source_rowid,
+                                 include_source_identity=args.mode is None)
+                returned+=1
+                current=next(rows,sentinel)
+            truncated=current is not sentinel
+            _write_shard_json({'type':'footer','returned_rows':returned,'truncated':truncated,'limit':args.limit})
+            sys.stdout.flush()
+            return 0
+    except (RuntimeError,ValueError,OSError,sqlite3.Error,StopIteration,TypeError,KeyError,UnicodeError) as exc:
+        if isinstance(exc,ValueError) and str(exc).startswith('SHARD_'):
+            raise
+        raise ValueError('SHARD_PACKAGE_INVALID') from exc
+
 def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__)
@@ -212,26 +505,75 @@ def main():
     p=sub.add_parser('sql');p.add_argument('query')
     p=sub.add_parser('install-service');p.add_argument('--interval',type=int,default=120);p.add_argument('--account');p.add_argument('--nxapi-data')
     p=sub.add_parser('tag');p.add_argument('tag_action',choices=('add','remove','list'));p.add_argument('--account');p.add_argument('--match-key');p.add_argument('--tag');p.add_argument('--note')
+    p=sub.add_parser('slice-export');p.add_argument('destination',type=Path)
+    sub.add_parser('slice-list')
+    sub.add_parser('published-xlsx')
+    p=sub.add_parser('shard-list');p.add_argument('--root',type=Path,required=True);p.add_argument('--generation');p.add_argument('--delta-dir',dest='delta_dirs',type=Path,action='append',default=[])
+    p=sub.add_parser('shard-read');p.add_argument('--root',type=Path,required=True);p.add_argument('--table',required=True);p.add_argument('--mode');p.add_argument('--rule',dest='rule_token');p.add_argument('--limit',type=int);p.add_argument('--generation');p.add_argument('--delta-dir',dest='delta_dirs',type=Path,action='append',default=[])
     p_rec=sub.add_parser('records')
     rec_sub=p_rec.add_subparsers(dest='subaction',required=True)
     p_list=rec_sub.add_parser('list')
     p_list.add_argument('--account',required=True)
     p_list.add_argument('--kind',choices=('vs','coop'),default=None)
+    p_list.add_argument('--analysis-set',dest='analysis_set')
+    p_list.add_argument('--rule',dest='rule_raw')
+    p_list.add_argument('--played-from',dest='played_from')
+    p_list.add_argument('--played-to',dest='played_to')
+    p_list.add_argument('--weapon')
+    p_list.add_argument('--tag')
+    p_list.add_argument('--q',dest='query')
     p_list.add_argument('--limit',type=int,default=50)
     p_list.add_argument('--offset',type=int,default=0)
+    p_facets=rec_sub.add_parser('facets')
+    p_facets.add_argument('--account',required=True)
+    p_summary=rec_sub.add_parser('tag-summary')
+    p_summary.add_argument('--account',required=True)
+    p_results=rec_sub.add_parser('rule-results')
+    p_results.add_argument('--account',required=True)
+    p_rates=rec_sub.add_parser('rate-summary')
+    p_rates.add_argument('--account',required=True)
     p_get=rec_sub.add_parser('get')
     p_get.add_argument('--account',required=True)
     p_get.add_argument('--kind',choices=('vs','coop'),required=True)
     p_get.add_argument('--match-key',required=True)
+    p_target=rec_sub.add_parser('tag-target')
+    p_target.add_argument('--account',required=True)
+    p_target.add_argument('--match-key',required=True)
     sub.add_parser('login')
     p=sub.add_parser('watch');p.add_argument('--interval',type=int,default=120)
-    args=parser.parse_args();args.db=args.db.resolve()
+    args=parser.parse_args()
+    if args.command in {'shard-list','shard-read'}:
+        return _run_shard_cli(args)
+    args.db=args.db.resolve()
+    if args.command=='export-xlsx':
+        from ikarchive.xlsx_export import LEGACY_ANALYSIS_XLSX_RETIRED
+        print(LEGACY_ANALYSIS_XLSX_RETIRED+'; use scripts/export_full_xlsx.py for full-data export', file=sys.stderr)
+        return 4
     if args.command=='login':
         # Interactive nxapi login runs in the user's terminal, never passes tokens as argv.
         binary=ROOT/'src/node/login.mjs'
         return subprocess.call([os.environ.get('NODE','node'),str(binary)])
     if args.db==DEFAULT.resolve() and nas_storage_marker() is not None:
         raise ValueError('NAS_STORAGE_ACTIVE: use scripts/nas_archive.py; local default database access is disabled')
+    if args.command=='slice-export':
+        from ikarchive.slices import export_slices
+        print(json.dumps(export_slices(args.db,args.destination),ensure_ascii=False,indent=2))
+        return 0
+    if args.command=='slice-list':
+        # manifest だけを読む。正本の SQLite は開かない。
+        from ikarchive.slices import list_datasets
+        print(json.dumps(list_datasets(args.db),ensure_ascii=False))
+        return 0
+    if args.command=='published-xlsx':
+        # 旧分析表は不完全なため、readerはファイルやDBへ触れず退役categoryを返す。
+        from ikarchive.xlsx_export import read_published_xlsx, PublishedXlsxRetired
+        try:
+            payload=read_published_xlsx(args.db)
+        except PublishedXlsxRetired as exc:
+            print(exc.category, file=sys.stderr)
+            return 4
+        sys.stdout.buffer.write(payload)
+        return 0
     if args.command=='records':
         if not args.account:
             raise ValueError('account must be a non-empty string')
@@ -240,10 +582,29 @@ def main():
                 result=reader.list_matches(
                     account=args.account,
                     kind=args.kind,
+                    analysis_set=args.analysis_set,
+                    rule_raw=args.rule_raw,
+                    played_from=args.played_from,
+                    played_to=args.played_to,
+                    weapon=args.weapon,
+                    tag=args.tag,
+                    query=args.query,
                     limit=args.limit,
                     offset=args.offset,
                 )
                 print(json.dumps(result,ensure_ascii=False,indent=2))
+                return 0
+            if args.subaction=='facets':
+                print(json.dumps(reader.list_facets(account=args.account),ensure_ascii=False,indent=2))
+                return 0
+            if args.subaction=='tag-summary':
+                print(json.dumps(reader.tag_summary(account=args.account),ensure_ascii=False,indent=2))
+                return 0
+            if args.subaction=='rule-results':
+                print(json.dumps(reader.rule_results(account=args.account),ensure_ascii=False,indent=2))
+                return 0
+            if args.subaction=='rate-summary':
+                print(json.dumps(reader.rate_summary(account=args.account),ensure_ascii=False,indent=2))
                 return 0
             if args.subaction=='get':
                 if not args.match_key:
@@ -264,13 +625,19 @@ def main():
                     item['source']=src
                 print(json.dumps(item,ensure_ascii=False,indent=2))
                 return 0
+            if args.subaction=='tag-target':
+                if not args.match_key:
+                    raise ValueError('match_key must be a non-empty string')
+                item=reader.tag_target(account=args.account,match_key=args.match_key)
+                print('null' if item is None else json.dumps(item,ensure_ascii=False,indent=2))
+                return 0
     if args.command=='watch':
         import time
         if args.interval<60:raise ValueError('interval must be >=60')
         while True:
             subprocess.run([sys.executable,str(ROOT/'archive.py'),'--db',str(args.db),'sync'])
             time.sleep(args.interval)
-    readonly_commands={'status','audit','verify','sql','backup','export','export-xlsx','gui'}
+    readonly_commands={'status','audit','verify','sql','backup','export','gui'}
     is_readonly=(args.command in readonly_commands) or (args.command=='tag' and getattr(args,'tag_action',None)=='list')
     if is_readonly:
         if not args.db.is_file():
@@ -284,6 +651,8 @@ def main():
             except sqlite3.Error:pass
             store.close()
 
+    if database_is_slice(args.db):
+        raise ValueError('SLICE_READONLY')
     args.db.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     with open(str(args.db)+'.lock','a') as lock:
         try:acquire(lock)

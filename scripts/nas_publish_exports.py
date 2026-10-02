@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-NAS Export Artifacts Publisher (One-cycle CLI).
+NAS GUI Publisher (One-cycle CLI).
 
-Directly publishes generated export artifacts (gui/index.html and 分析.xlsx)
-from NAS exports directory to pre-authorized Google Drive remote via rclone.
+Publishes only ``gui/index.html`` from the NAS exports directory to a
+pre-authorized Google Drive remote via rclone. The legacy ``分析.xlsx`` is not
+read or communicated. If an old state file records both artifacts, its exact
+bytes are retained locally before the GUI-only state replaces it.
 
 Design Decision:
 - One-cycle push only. Not a bi-directional generic sync.
-- HTML and XLSX are generated derivative outputs from the database; edits are never fed back to DB.
+- Only the HTML GUI is in scope; this receipt never represents database synchronization.
 - No collector, SQLite DB, or authentication handling is added here.
 - Strict single-cycle execution with non-blocking flock.
-- Both source files are snapshotted before any transfer. A later failure can leave
-  one remote file updated; state is committed only after both files verify.
+- The GUI source is snapshotted before transfer. State is committed only after
+  its remote readback verifies.
 
 Pre-upload Cloud Verification Notice:
 The pre-upload state verification (re-checking stat and cat immediately before transfer)
@@ -36,8 +38,11 @@ import tempfile
 import uuid
 
 
-PERMITTED_FILES = ("gui/index.html", "分析.xlsx")
+PERMITTED_FILES = ("gui/index.html",)
+LEGACY_STATE_FILES = frozenset(("gui/index.html", "分析.xlsx"))
+LEGACY_STATE_HISTORY_DIR = "history"
 MAX_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB (67,108,864 bytes)
+MAX_STATE_BYTES = 1024 * 1024
 STATE_FILE_NAME = ".nas-publish-state.json"
 LOCK_FILE_NAME = ".nas-publish.lock"
 STATE_SCHEMA_VERSION = 1
@@ -167,9 +172,8 @@ class PublishLock:
 
 def snapshot_source_files(exports_dir: Path) -> dict:
     """
-    Reads and in-memory snapshots all permitted export files.
-    Both files must exist, be regular files, not be symlinks, and not exceed 64MiB.
-    If either is missing or invalid, rejects immediately to prevent partial publish.
+    Reads and snapshots the GUI export only. It must be a regular, non-symlink
+    file and must not exceed 64MiB. Legacy XLSX artifacts are never opened.
     """
     verify_no_symlinks(exports_dir)
     snapshots = {}
@@ -209,21 +213,72 @@ def snapshot_source_files(exports_dir: Path) -> dict:
     return snapshots
 
 
-def load_state(state_dir: Path, expected_remote: str) -> dict | None:
+def _read_regular_bytes(path: Path, max_bytes: int) -> bytes:
+    """Read one bounded regular file through a no-follow descriptor."""
+    verify_no_symlinks(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PublishError(CATEGORY_STATE_ERROR, "State evidence file is missing or unreadable") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            raise PublishError(CATEGORY_STATE_ERROR, "State evidence file has an invalid type or size")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise PublishError(CATEGORY_STATE_ERROR, "State evidence file exceeds its size limit")
+        return data
+    except PublishError:
+        raise
+    except OSError as exc:
+        raise PublishError(CATEGORY_STATE_ERROR, "State evidence file is unreadable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _validate_retained_legacy_state(state_dir: Path, value: object) -> dict:
+    if not isinstance(value, dict) or set(value) != {"file", "bytes", "sha256"}:
+        raise PublishError(CATEGORY_STATE_ERROR, "Invalid retained legacy state pointer")
+    relative = value.get("file")
+    size = value.get("bytes")
+    digest = value.get("sha256")
+    match = re.fullmatch(r"history/legacy-analysis-state-([0-9a-f]{64})\.json", relative or "")
+    if (
+        match is None
+        or type(size) is not int
+        or size < 0
+        or not isinstance(digest, str)
+        or not SHA256_RE.fullmatch(digest)
+        or match.group(1) != digest
+    ):
+        raise PublishError(CATEGORY_STATE_ERROR, "Invalid retained legacy state pointer")
+    retained_path = verify_safe_path(state_dir, relative)
+    retained_bytes = _read_regular_bytes(retained_path, MAX_STATE_BYTES)
+    if len(retained_bytes) != size or hashlib.sha256(retained_bytes).hexdigest() != digest:
+        raise PublishError(CATEGORY_STATE_ERROR, "Retained legacy state does not match its pointer")
+    return {"file": relative, "bytes": size, "sha256": digest}
+
+
+def _load_state_with_bytes(state_dir: Path, expected_remote: str) -> tuple[dict | None, bytes | None]:
     """
-    Loads state JSON from state_dir.
-    Returns None if state file does not exist (initial run).
-    Fail-closed on any validation or format error or remote mismatch.
+    Loads and validates state while retaining its exact original bytes for a
+    possible non-destructive legacy-state archive before state replacement.
     """
     state_file = state_dir / STATE_FILE_NAME
     verify_no_symlinks(state_file)
     if not state_file.exists():
-        return None
+        return None, None
 
     try:
-        content = state_file.read_text(encoding="utf-8")
-        data = json.loads(content)
+        content_bytes = _read_regular_bytes(state_file, MAX_STATE_BYTES)
+        data = json.loads(content_bytes.decode("utf-8"))
     except Exception as exc:
+        if isinstance(exc, PublishError):
+            raise
         raise PublishError(CATEGORY_STATE_ERROR, "State file is corrupt or unreadable") from exc
 
     if not isinstance(data, dict):
@@ -238,13 +293,92 @@ def load_state(state_dir: Path, expected_remote: str) -> dict | None:
         raise PublishError(CATEGORY_STATE_ERROR, "State files field must be a dict")
 
     for k, v in files.items():
-        if k not in PERMITTED_FILES or not isinstance(v, str) or not SHA256_RE.fullmatch(v):
+        if k not in LEGACY_STATE_FILES or not isinstance(v, str) or not SHA256_RE.fullmatch(v):
             raise PublishError(CATEGORY_STATE_ERROR, f"Invalid state files entry: {k}={v}")
+    if "gui/index.html" not in files:
+        raise PublishError(CATEGORY_STATE_ERROR, "State does not contain the permitted GUI hash")
 
-    return data
+    if "scope" in data and data["scope"] != "gui_only":
+        raise PublishError(CATEGORY_STATE_ERROR, "State scope is not gui_only")
+    if "full_database_synchronized" in data and data["full_database_synchronized"] is not False:
+        raise PublishError(CATEGORY_STATE_ERROR, "State cannot claim full database synchronization")
+
+    retained = None
+    if "retained_legacy_state" in data:
+        retained = _validate_retained_legacy_state(state_dir, data["retained_legacy_state"])
+        if (
+            "分析.xlsx" in files
+            and hashlib.sha256(content_bytes).hexdigest() != retained["sha256"]
+        ):
+            raise PublishError(CATEGORY_STATE_ERROR, "Legacy state differs from retained state bytes")
+        data["retained_legacy_state"] = retained
+
+    return data, content_bytes
 
 
-def save_state(state_dir: Path, remote: str, files_hash: dict) -> None:
+def load_state(state_dir: Path, expected_remote: str) -> dict | None:
+    """Load a publisher state, accepting only the GUI state and known legacy XLSX hash."""
+    return _load_state_with_bytes(state_dir, expected_remote)[0]
+
+
+def _preserve_legacy_state(state_dir: Path, content: bytes) -> dict:
+    """Write the exact old two-file state once and verify the durable readback."""
+    digest = hashlib.sha256(content).hexdigest()
+    relative = f"{LEGACY_STATE_HISTORY_DIR}/legacy-analysis-state-{digest}.json"
+    history_dir = verify_safe_path(state_dir, LEGACY_STATE_HISTORY_DIR)
+    if history_dir.exists():
+        if not history_dir.is_dir():
+            raise PublishError(CATEGORY_PATH_SAFETY_ERROR, "Legacy state history is not a directory")
+    else:
+        history_dir.mkdir(mode=0o700)
+    verify_no_symlinks(history_dir)
+    target = verify_safe_path(state_dir, relative)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags, 0o600)
+    except FileExistsError:
+        existing = _read_regular_bytes(target, MAX_STATE_BYTES)
+        if len(existing) != len(content) or hashlib.sha256(existing).hexdigest() != digest or existing != content:
+            raise PublishError(CATEGORY_STATE_ERROR, "Existing legacy state archive differs from source bytes")
+    except OSError as exc:
+        raise PublishError(CATEGORY_STATE_ERROR, "Cannot create legacy state archive") from exc
+    else:
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                view = memoryview(content)
+                while view:
+                    written = stream.write(view)
+                    if written is None or written <= 0:
+                        raise OSError("short write")
+                    view = view[written:]
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception as exc:
+            raise PublishError(CATEGORY_STATE_ERROR, "Cannot write legacy state archive") from exc
+
+        try:
+            dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            dir_fd = os.open(history_dir, dir_flags)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            raise PublishError(CATEGORY_STATE_ERROR, "Cannot sync legacy state archive directory") from exc
+
+    archived = _read_regular_bytes(target, MAX_STATE_BYTES)
+    if len(archived) != len(content) or hashlib.sha256(archived).hexdigest() != digest or archived != content:
+        raise PublishError(CATEGORY_STATE_ERROR, "Legacy state archive readback mismatch")
+    return {"file": relative, "bytes": len(content), "sha256": digest}
+
+
+def save_state(
+    state_dir: Path,
+    remote: str,
+    files_hash: dict,
+    *,
+    retained_legacy_state: dict | None = None,
+) -> None:
     """
     Atomically writes state JSON via 0600 temp file + fsync + os.replace.
     """
@@ -255,7 +389,11 @@ def save_state(state_dir: Path, remote: str, files_hash: dict) -> None:
         "version": STATE_SCHEMA_VERSION,
         "remote": remote,
         "files": files_hash,
+        "scope": "gui_only",
+        "full_database_synchronized": False,
     }
+    if retained_legacy_state is not None:
+        payload["retained_legacy_state"] = retained_legacy_state
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
     fd, temp_path_str = tempfile.mkstemp(prefix=".tmp_publish_state_", dir=state_dir)
@@ -546,7 +684,7 @@ def upload_file_with_precheck(
 
 
 def publish_cycle(exports_dir: Path, state_dir: Path, remote_prefix: str, rclone_bin: str) -> dict:
-    """Executes a complete single publish cycle with non-blocking locking."""
+    """Publish and verify the GUI artifact, then commit a GUI-only receipt/state."""
     join_remote(remote_prefix, PERMITTED_FILES[0])
     verify_state_dir(state_dir)
 
@@ -555,10 +693,10 @@ def publish_cycle(exports_dir: Path, state_dir: Path, remote_prefix: str, rclone
         snapshots = snapshot_source_files(exports_dir)
 
         # 2. Load existing state
-        old_state = load_state(state_dir, remote_prefix)
+        old_state, old_state_bytes = _load_state_with_bytes(state_dir, remote_prefix)
         old_files = old_state.get("files", {}) if old_state else {}
 
-        # 3. Inspect remote status for both files
+        # 3. Inspect remote status for the GUI only
         file_plans = {}
         for rel_path, snap in snapshots.items():
             remote_path = join_remote(remote_prefix, rel_path)
@@ -627,9 +765,28 @@ def publish_cycle(exports_dir: Path, state_dir: Path, remote_prefix: str, rclone
                     initial_sha=plan["initial_sha"],
                 )
 
-        # 6. Both files succeeded: atomically commit state
+        # 6. Preserve an old two-file state exactly before replacing it with the
+        # new GUI-only state. The legacy XLSX hash is validated as state metadata
+        # only; no XLSX source or remote path has been opened.
+        retained_legacy_state = old_state.get("retained_legacy_state") if old_state else None
+        if old_state is not None and "分析.xlsx" in old_files:
+            if old_state_bytes is None:
+                raise PublishError(CATEGORY_STATE_ERROR, "Legacy state bytes are unavailable")
+            legacy_digest = hashlib.sha256(old_state_bytes).hexdigest()
+            if retained_legacy_state is not None:
+                if retained_legacy_state["sha256"] != legacy_digest or retained_legacy_state["bytes"] != len(old_state_bytes):
+                    raise PublishError(CATEGORY_STATE_ERROR, "Retained legacy state pointer does not match source state")
+            else:
+                retained_legacy_state = _preserve_legacy_state(state_dir, old_state_bytes)
+
+        # GUI verification succeeded: atomically commit the scoped state.
         new_files_hash = {rel_path: snapshots[rel_path]["sha256"] for rel_path in PERMITTED_FILES}
-        save_state(state_dir, remote_prefix, new_files_hash)
+        save_state(
+            state_dir,
+            remote_prefix,
+            new_files_hash,
+            retained_legacy_state=retained_legacy_state,
+        )
 
         # Build safe JSON receipt
         receipt_files = {}
@@ -656,6 +813,8 @@ def publish_cycle(exports_dir: Path, state_dir: Path, remote_prefix: str, rclone
 
         return {
             "status": "success",
+            "scope": "gui_only",
+            "full_database_synchronized": False,
             "files": receipt_files,
             "counts": {
                 "total": len(PERMITTED_FILES),
@@ -668,7 +827,7 @@ def publish_cycle(exports_dir: Path, state_dir: Path, remote_prefix: str, rclone
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
-        description="Publish NAS export artifacts (gui/index.html, 分析.xlsx) to Google Drive via rclone."
+        description="Publish only the NAS GUI export (gui/index.html) to Google Drive via rclone."
     )
     parser.add_argument("--exports-dir", required=True, type=Path, help="Path to exports directory")
     parser.add_argument("--state-dir", required=True, type=Path, help="Path to state directory")

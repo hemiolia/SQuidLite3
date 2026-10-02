@@ -2,6 +2,7 @@
 """
 Google Drive (マイドライブ/イカリング3アーカイブ) とローカルのイカリング3アーカイブを双方向同期するスクリプト。
 database/、secrets/、認証データ、rclone設定(rclone.conf/rclone-*.conf)、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
+旧部分ブックの ``exports/分析.xlsx`` と ``exports/analysis.xlsx`` も、その正確な相対パスだけ除外されます。
 """
 
 import argparse
@@ -30,10 +31,19 @@ IGNORE_DIR_NAMES = {
     'database', 'secrets', 'nxapi-nodejs',
     'runtime', 'spool', '.history', '.git', 'backups', '.sync-conflicts'
 }
+RETIRED_LEGACY_EXPORT_PATHS = {'exports/分析.xlsx', 'exports/analysis.xlsx'}
 
 MAX_FILE_BYTES = 1024 * 1024 * 1024  # 1GiB
 
+def is_retired_legacy_export_path(rel_path: str) -> bool:
+    return tuple(Path(rel_path).parts) in {
+        ('exports', '分析.xlsx'),
+        ('exports', 'analysis.xlsx'),
+    }
+
 def should_ignore(rel_path: str) -> bool:
+    if is_retired_legacy_export_path(rel_path):
+        return True
     parts = Path(rel_path).parts
     if parts == ('config', 'storage-location.json'):
         return True
@@ -126,6 +136,14 @@ def copy_file(src: Path, dst: Path, root_dir: Path = None, rel_path: str = None,
     """
     if root_dir is None:
         root_dir = dst.parent
+    candidate_rel_path = rel_path
+    if candidate_rel_path is None:
+        try:
+            candidate_rel_path = str(dst.relative_to(root_dir))
+        except ValueError:
+            candidate_rel_path = dst.name
+    if is_retired_legacy_export_path(candidate_rel_path):
+        raise ValueError(f'Legacy analysis workbook sync is retired: {candidate_rel_path}')
     if rel_path is None:
         rel_path = dst.name
     if src_root is None:
@@ -190,6 +208,8 @@ def plan_sync(local_files: dict, gdrive_files: dict, mode: str = 'both', baselin
     to_pull = []
 
     for k in all_keys:
+        if is_retired_legacy_export_path(k):
+            continue
         in_local = k in local_files
         in_gdrive = k in gdrive_files
 

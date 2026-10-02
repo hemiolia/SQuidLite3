@@ -76,7 +76,7 @@ class ClientDataRootTests(unittest.TestCase):
         self.assertFalse((self.client / 'database').exists())
         self.assertFalse((self.home / 'Documents' / 'イカリング3アーカイブ').exists())
 
-    def test_gui_download_uses_cache_and_does_not_create_client_exports(self):
+    def test_gui_download_uses_cache_and_retired_xlsx_preserves_existing_files(self):
         self.put_marker()
 
         def fake_run(command, **kwargs):
@@ -88,14 +88,33 @@ class ClientDataRootTests(unittest.TestCase):
             self.assertEqual(nas_archive.main(['gui', '--no-open']), 0)
         cached = self.home / 'Library/Caches/ikaring-archive/exports/gui/index.html'
         self.assertEqual(cached.read_bytes(), b'<html>artificial</html>')
-        self.assertFalse((self.client / 'exports').exists())
         self.assertFalse((self.home / 'Documents' / 'イカリング3アーカイブ').exists())
 
-        with patch.object(nas_archive.subprocess, 'run', side_effect=fake_run):
-            self.assertEqual(nas_archive.main(['export-xlsx']), 0)
-        self.assertEqual((self.home / 'Library/Caches/ikaring-archive/exports/分析.xlsx').read_bytes(),
-                         b'<html>artificial</html>')
-        self.assertFalse((self.client / 'exports').exists())
+        cached_xlsx = self.home / 'Library/Caches/ikaring-archive/exports/分析.xlsx'
+        client_xlsx = self.client / 'exports/分析.xlsx'
+        cached_xlsx.parent.mkdir(parents=True, exist_ok=True)
+        client_xlsx.parent.mkdir(parents=True, exist_ok=True)
+        cached_xlsx.write_bytes(b'old cache workbook bytes')
+        client_xlsx.write_bytes(b'old client export bytes')
+        for path in (cached_xlsx, client_xlsx):
+            path.chmod(0o640)
+        before = {
+            path: (path.read_bytes(), path.stat().st_mode & 0o777, path.stat().st_mtime_ns)
+            for path in (cached_xlsx, client_xlsx)
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(nas_archive.subprocess, 'run') as run, \
+             patch('sys.stdout', stdout), patch('sys.stderr', stderr):
+            code = nas_archive.main(['export-xlsx'])
+            run.assert_not_called()
+        self.assertEqual(code, 4)
+        self.assertEqual(stdout.getvalue(), '')
+        self.assertIn('LEGACY_ANALYSIS_XLSX_RETIRED', stderr.getvalue())
+        after = {
+            path: (path.read_bytes(), path.stat().st_mode & 0o777, path.stat().st_mtime_ns)
+            for path in (cached_xlsx, client_xlsx)
+        }
+        self.assertEqual(after, before)
 
     def test_normal_start_and_archive_default_never_create_documents_root(self):
         self.put_marker()

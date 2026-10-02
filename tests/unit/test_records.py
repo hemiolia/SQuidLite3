@@ -697,6 +697,352 @@ class TestRecordReader(unittest.TestCase):
             self.assertEqual(match_canon["source"]["response_id"], 601)
             self.assertEqual(match_canon["source"]["body_bytes"], raw_body)
 
+    def test_list_filters_keep_unfiltered_population_and_use_played_time_only(self):
+        """絞り込み無しは全件。期間は playedTime だけ。分類なしは分類行が無い試合。"""
+        acc = "filter-account"
+        other = "other-account"
+        wakaba = (
+            '{"playedTime":"2026-09-01T00:10:00Z","vsStage":{"name":"ユノハナ大渓谷"},'
+            '"myTeam":{"players":[{"isMyself":true,"weapon":{"name":"わかばシューター"}}]},'
+            '"otherTeams":[{"players":[{"isMyself":false,"weapon":{"name":"リッター4K"}}]}]}'
+        )
+        later = '{"playedTime":"2026-09-01T00:20:00Z","coopStage":{"name":"アラマキ砦"}}'
+        self._insert_match(acc, "vs", "open-area", first_seen="2026-08-01T00:00:00Z")
+        self._insert_canonical_detail(
+            acc, "vs", "open-area", 701, wakaba.encode(), wakaba,
+            genre="bankara_open", rule_raw="AREA",
+        )
+        self._insert_match(acc, "coop", "salmon-1", first_seen="2026-09-02T00:00:00Z")
+        self._insert_canonical_detail(
+            acc, "coop", "salmon-1", 702, later.encode(), later,
+            genre="salmon_regular", rule_raw="REGULAR",
+            operation="CoopHistoryDetailQuery",
+        )
+        self._insert_match(acc, "vs", "pending-old", first_seen="2026-07-01T00:00:00Z")
+        self._insert_job(acc, "VsHistoryDetailQuery", "pending-old", "pending", "vs")
+        self._insert_match(other, "vs", "open-area")
+        self._insert_canonical_detail(
+            other, "vs", "open-area", 703, wakaba.encode(), wakaba,
+            genre="bankara_open", rule_raw="AREA",
+        )
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO match_tags(account, match_key, tag, note, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (acc, "open-area", "下げラン", None, "2026-09-01T02:00:00Z", "2026-09-01T02:00:00Z"),
+        )
+        conn.commit()
+        conn.close()
+
+        with RecordReader(self.db_path) as reader:
+            everything = reader.list_matches(acc, limit=100)
+            self.assertEqual(everything["total"], 3)
+            self.assertEqual(
+                [item["match_key"] for item in everything["items"]],
+                ["salmon-1", "open-area", "pending-old"],
+            )
+
+            by_rule = reader.list_matches(acc, rule_raw="AREA", limit=100)
+            self.assertEqual([item["match_key"] for item in by_rule["items"]], ["open-area"])
+
+            by_mode = reader.list_matches(acc, analysis_set="salmon_regular", limit=100)
+            self.assertEqual([item["match_key"] for item in by_mode["items"]], ["salmon-1"])
+
+            unclassified = reader.list_matches(acc, analysis_set="unclassified", limit=100)
+            self.assertEqual([item["match_key"] for item in unclassified["items"]], ["pending-old"])
+            self.assertIsNone(unclassified["items"][0]["played_time"])
+            self.assertEqual(unclassified["items"][0]["first_seen"], "2026-07-01T00:00:00Z")
+
+            period = reader.list_matches(
+                acc, played_from="2026-09-01T00:15:00Z", played_to="2026-09-01T00:30:00Z", limit=100,
+            )
+            self.assertEqual([item["match_key"] for item in period["items"]], ["salmon-1"])
+
+            weapon = reader.list_matches(acc, weapon="わかばシューター", limit=100)
+            self.assertEqual([item["match_key"] for item in weapon["items"]], ["open-area"])
+            self.assertEqual(reader.list_matches(acc, weapon="リッター4K", limit=100)["total"], 0)
+
+            tagged = reader.list_matches(acc, tag="下げラン", limit=100)
+            self.assertEqual([item["match_key"] for item in tagged["items"]], ["open-area"])
+
+            found = reader.list_matches(acc, query="ユノハナ", limit=100)
+            self.assertEqual([item["match_key"] for item in found["items"]], ["open-area"])
+            self.assertEqual(reader.list_matches(acc, query="2026-07-01", limit=100)["total"], 0)
+
+            facets = reader.list_facets(acc)
+            self.assertIn("bankara_open", facets["analysis_sets"])
+            self.assertIn("unclassified", facets["analysis_sets"])
+            self.assertEqual(facets["rules"], ["AREA", "REGULAR"])
+            self.assertEqual(facets["weapons"], ["わかばシューター"])
+            self.assertEqual(facets["tags"], ["下げラン"])
+            self.assertEqual(reader.list_facets(other)["tags"], [])
+
+            def authorizer(action, arg1, arg2, dbname, source):
+                if action == sqlite3.SQLITE_READ and arg1 == "bodies":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            reader._store.db.set_authorizer(authorizer)
+            filtered = reader.list_matches(acc, query="わかば", weapon="わかばシューター", limit=100)
+            self.assertEqual(filtered["total"], 1)
+
+            for kwargs in (
+                {"analysis_set": "not a mode"},
+                {"rule_raw": "ガチエリア"},
+                {"played_from": "2026-09-01"},
+                {"played_from": "2026-09-01T00:30:00Z", "played_to": "2026-09-01T00:10:00Z"},
+                {"weapon": "わかば\nシューター"},
+                {"query": ""},
+            ):
+                with self.assertRaises(ValueError):
+                    reader.list_matches(acc, **kwargs)
+
+    def test_tag_summary_keeps_open_and_private_populations_separate(self):
+        """タグ件数はオープンとプラベの人数区分だけ。合計も他区分も混ぜない。"""
+        from ikarchive.records import TAG_SUMMARY_SETS
+        acc = "summary-account"
+        other = "summary-other"
+        doc = '{"playedTime":"2026-09-01T00:10:00Z"}'
+        self._insert_match(acc, "vs", "open-tagged")
+        self._insert_canonical_detail(
+            acc, "vs", "open-tagged", 801, doc.encode(), doc,
+            genre="bankara_open", analysis_set="bankara_open", rule_raw="AREA",
+        )
+        self._insert_match(acc, "vs", "open-plain")
+        self._insert_canonical_detail(
+            acc, "vs", "open-plain", 802, doc.encode(), doc,
+            genre="bankara_open", analysis_set="bankara_open", rule_raw="AREA",
+        )
+        self._insert_match(acc, "vs", "private-two")
+        self._insert_canonical_detail(
+            acc, "vs", "private-two", 803, doc.encode(), doc,
+            genre="private", analysis_set="private_two_vs_two", rule_raw="AREA",
+        )
+        self._insert_match(acc, "vs", "x-tagged")
+        self._insert_canonical_detail(
+            acc, "vs", "x-tagged", 804, doc.encode(), doc,
+            genre="xmatch", analysis_set="xmatch", rule_raw="AREA",
+        )
+        self._insert_match(other, "vs", "open-other")
+        self._insert_canonical_detail(
+            other, "vs", "open-other", 805, doc.encode(), doc,
+            genre="bankara_open", analysis_set="bankara_open", rule_raw="AREA",
+        )
+        conn = sqlite3.connect(self.db_path)
+        conn.executemany(
+            "INSERT INTO match_tags(account, match_key, tag, note, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                (acc, "open-tagged", "下げラン", None, "2026-09-01T02:00:00Z", "2026-09-01T02:00:00Z"),
+                (acc, "open-tagged", "ガチ", None, "2026-09-01T02:00:00Z", "2026-09-01T02:00:00Z"),
+                (acc, "private-two", "エンジョイ", None, "2026-09-01T02:00:00Z", "2026-09-01T02:00:00Z"),
+                (acc, "x-tagged", "対象外", None, "2026-09-01T02:00:00Z", "2026-09-01T02:00:00Z"),
+                (other, "open-other", "下げラン", None, "2026-09-01T02:00:00Z", "2026-09-01T02:00:00Z"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        with RecordReader(self.db_path) as reader:
+            summary = reader.tag_summary(acc)
+            self.assertEqual(set(summary), {"sets"})
+            self.assertEqual(
+                [item["analysis_set"] for item in summary["sets"]],
+                list(TAG_SUMMARY_SETS),
+            )
+            by_set = {item["analysis_set"]: item for item in summary["sets"]}
+            self.assertEqual(by_set["bankara_open"]["matches"], 2)
+            self.assertEqual(by_set["bankara_open"]["untagged"], 1)
+            self.assertEqual(
+                by_set["bankara_open"]["tags"],
+                [{"tag": "ガチ", "matches": 1}, {"tag": "下げラン", "matches": 1}],
+            )
+            self.assertEqual(by_set["private_two_vs_two"]["matches"], 1)
+            self.assertEqual(by_set["private_two_vs_two"]["untagged"], 0)
+            self.assertEqual(by_set["private_two_vs_two"]["tags"], [{"tag": "エンジョイ", "matches": 1}])
+            self.assertEqual(by_set["private_four_vs_four"]["matches"], 0)
+            self.assertEqual(by_set["private_four_vs_four"]["untagged"], 0)
+            self.assertEqual(by_set["private_four_vs_four"]["tags"], [])
+            shown = [tag["tag"] for item in summary["sets"] for tag in item["tags"]]
+            self.assertNotIn("対象外", shown)
+            self.assertNotIn("イカップル", shown)
+            other_summary = reader.tag_summary(other)
+            other_open = next(item for item in other_summary["sets"] if item["analysis_set"] == "bankara_open")
+            self.assertEqual(other_open["matches"], 1)
+            self.assertEqual(other_open["tags"], [{"tag": "下げラン", "matches": 1}])
+
+            def authorizer(action, arg1, arg2, dbname, source):
+                if action == sqlite3.SQLITE_READ and arg1 == "bodies":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            reader._store.db.set_authorizer(authorizer)
+            self.assertEqual(reader.tag_summary(acc)["sets"][0]["matches"], 2)
+            with self.assertRaises(ValueError):
+                reader.tag_summary("")
+
+    def test_rule_results_and_rates_stay_inside_one_population(self):
+        """勝敗とレートは区分とルールをまたいで足さない。"""
+        from ikarchive.records import JUDGEMENT_SETS
+        acc = "results-account"
+        other = "results-other"
+        rows = [
+            (acc, "open-win", 901, "bankara_open", "bankara_open", "AREA", "WIN"),
+            (acc, "open-lose", 902, "bankara_open", "bankara_open", "AREA", "LOSE"),
+            (acc, "open-exempt", 903, "bankara_open", "bankara_open", "AREA", "EXEMPTED_LOSE"),
+            (acc, "open-draw", 904, "bankara_open", "bankara_open", "LOFT", "DRAW"),
+            (acc, "turf-win", 905, "nawabari", "nawabari", "TURF_WAR", "WIN"),
+            (acc, "x-win", 906, "xmatch", "xmatch", "AREA", "WIN"),
+            (acc, "pair-win", 907, "private", "private_two_vs_two", "AREA", "WIN"),
+            (other, "open-other", 908, "bankara_open", "bankara_open", "AREA", "WIN"),
+        ]
+        for account, key, response_id, genre, analysis_set, rule_raw, judgement in rows:
+            doc = '{"playedTime":"2026-09-01T00:10:00Z","judgement":"%s"}' % judgement
+            self._insert_match(account, "vs", key)
+            self._insert_canonical_detail(
+                account, "vs", key, response_id, doc.encode(), doc,
+                genre=genre, analysis_set=analysis_set, rule_raw=rule_raw,
+            )
+        salmon = '{"playedTime":"2026-09-01T00:10:00Z","dangerRate":0.2}'
+        self._insert_match(acc, "coop", "salmon-one")
+        self._insert_canonical_detail(
+            acc, "coop", "salmon-one", 909, salmon.encode(), salmon,
+            genre="salmon_regular", analysis_set="salmon_regular", rule_raw="REGULAR",
+            operation="CoopHistoryDetailQuery",
+        )
+        conn = sqlite3.connect(self.db_path)
+        conn.executemany(
+            """INSERT INTO rate_points(
+                   account, series_id, label, genre, rule_raw, match_key,
+                   played_time, value, source, priority
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (acc, "bankara_open|AREA|bankaraPower", "バンカラパワー", "bankara_open", "AREA",
+                 "open-late", "2026-09-02T00:00:00Z", 2100, "api", "primary"),
+                (acc, "bankara_open|AREA|bankaraPower", "バンカラパワー", "bankara_open", "AREA",
+                 "open-early", "2026-09-01T00:00:00Z", 2000, "api", "primary"),
+                (acc, "bankara_open|LOFT|bankaraPower", "バンカラパワー", "bankara_open", "LOFT",
+                 "open-loft", "2026-09-01T00:00:00Z", 1500, "api", "primary"),
+                (acc, "salmon_regular|REGULAR|dangerRate", "キケン度", "salmon_regular", "REGULAR",
+                 "salmon-early", "2026-09-01T00:00:00Z", 0.2, "api", "secondary"),
+                (acc, "salmon_regular|REGULAR|dangerRate", "キケン度", "salmon_regular", "REGULAR",
+                 "salmon-late", "2026-09-02T00:00:00Z", 0.25, "api", "secondary"),
+                (acc, "nawabari|TURF_WAR|vibes", "チョーシ", "nawabari", "TURF_WAR",
+                 "fetch:vibes", "2026-09-03T00:00:00Z", 4, "api_snapshot", "primary"),
+                (acc, "nawabari|TURF_WAR|streak", "連勝", "nawabari", "TURF_WAR",
+                 "streak-1", "2026-09-01T00:00:00Z", 3, "derived_judgement", "primary"),
+                (acc, "bankara_open|AREA|earnedUdemaePoint", "ウデマエポイント", "bankara_open", "AREA",
+                 "udemae-1", "2026-09-01T00:00:00Z", 8, "api", "primary"),
+                (acc, "bankara_open|AREA|pointDelta", "ウデマエポイント増減", "bankara_open", "AREA",
+                 "delta-1", "2026-09-01T00:00:00Z", 8, "api", "primary"),
+                (acc, "bankara_open|AREA|bankaraPower", "バンカラパワー", "bankara_open", "AREA",
+                 "open-blank", "2026-09-03T00:00:00Z", None, "api", "primary"),
+                (other, "bankara_open|AREA|bankaraPower", "バンカラパワー", "bankara_open", "AREA",
+                 "other-power", "2026-09-02T00:00:00Z", 9999, "api", "primary"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        with RecordReader(self.db_path) as reader:
+            results = reader.rule_results(acc)
+            self.assertEqual(set(results), {"sets"})
+            self.assertEqual(
+                [item["analysis_set"] for item in results["sets"]],
+                list(JUDGEMENT_SETS),
+            )
+            self.assertNotIn("salmon_regular", [item["analysis_set"] for item in results["sets"]])
+            self.assertNotIn("hold", [item["analysis_set"] for item in results["sets"]])
+            by_set = {item["analysis_set"]: item for item in results["sets"]}
+            open_rules = {item["rule_raw"]: item for item in by_set["bankara_open"]["rules"]}
+            self.assertEqual(list(open_rules), ["AREA", "LOFT"])
+            self.assertEqual(open_rules["AREA"]["matches"], 3)
+            self.assertEqual(open_rules["AREA"]["wins"], 1)
+            self.assertEqual(open_rules["AREA"]["losses"], 1)
+            self.assertEqual(open_rules["AREA"]["draws"], 0)
+            self.assertEqual(open_rules["AREA"]["other"], 1)
+            self.assertEqual(open_rules["LOFT"]["draws"], 1)
+            self.assertEqual(open_rules["LOFT"]["matches"], 1)
+            self.assertEqual(by_set["nawabari"]["rules"][0]["wins"], 1)
+            self.assertEqual(by_set["xmatch"]["rules"][0]["wins"], 1)
+            self.assertEqual(by_set["private_two_vs_two"]["rules"][0]["rule_raw"], "AREA")
+            self.assertEqual(by_set["private_two_vs_two"]["rules"][0]["wins"], 1)
+            self.assertEqual(by_set["private_four_vs_four"]["rules"], [])
+            self.assertNotIn("イカップル", json.dumps(results, ensure_ascii=False))
+            other_results = reader.rule_results(other)
+            other_open = next(item for item in other_results["sets"] if item["analysis_set"] == "bankara_open")
+            self.assertEqual(other_open["rules"][0]["wins"], 1)
+            self.assertEqual(other_open["rules"][0]["matches"], 1)
+
+            rates = reader.rate_summary(acc)
+            self.assertEqual(set(rates), {"series"})
+            shown = [(item["label"], item["rule_raw"]) for item in rates["series"]]
+            self.assertEqual(shown, [
+                ("チョーシ", "TURF_WAR"),
+                ("バンカラパワー", "AREA"),
+                ("バンカラパワー", "LOFT"),
+                ("キケン度", "REGULAR"),
+            ])
+            by_label = {(item["label"], item["rule_raw"]): item for item in rates["series"]}
+            power = by_label[("バンカラパワー", "AREA")]
+            self.assertEqual(power["count"], 2)
+            self.assertEqual(power["latest"], 2100.0)
+            self.assertEqual(power["previous"], 2000.0)
+            self.assertEqual(power["delta"], 100.0)
+            self.assertEqual(power["minimum"], 2000.0)
+            self.assertEqual(power["maximum"], 2100.0)
+            self.assertEqual(power["unit"], "number")
+            self.assertEqual(power["source"], "api")
+            self.assertNotEqual(power["latest"], 9999.0)
+            self.assertEqual(
+                [(point["played_time"], point["value"]) for point in power["points"]],
+                [
+                    ("2026-09-01T00:00:00Z", 2000.0),
+                    ("2026-09-02T00:00:00Z", 2100.0),
+                ],
+            )
+            danger = by_label[("キケン度", "REGULAR")]
+            self.assertEqual(danger["unit"], "ratio")
+            self.assertEqual(danger["latest"], 0.25)
+            self.assertEqual(danger["previous"], 0.2)
+            self.assertAlmostEqual(danger["delta"], 0.05)
+            self.assertEqual(danger["priority"], "secondary")
+            self.assertEqual(
+                [(point["played_time"], point["value"]) for point in danger["points"]],
+                [
+                    ("2026-09-01T00:00:00Z", 0.2),
+                    ("2026-09-02T00:00:00Z", 0.25),
+                ],
+            )
+            vibe = by_label[("チョーシ", "TURF_WAR")]
+            self.assertEqual(vibe["source"], "api_snapshot")
+            self.assertEqual(vibe["count"], 1)
+            self.assertIsNone(vibe["previous"])
+            self.assertIsNone(vibe["delta"])
+            self.assertEqual(vibe["points"], [
+                {"played_time": "2026-09-03T00:00:00Z", "value": 4.0},
+            ])
+            dumped = json.dumps(rates, ensure_ascii=False)
+            self.assertNotIn("連勝", dumped)
+            self.assertNotIn("ウデマエ", dumped)
+            self.assertNotIn(other, dumped)
+            other_rates = reader.rate_summary(other)
+            self.assertEqual(len(other_rates["series"]), 1)
+            self.assertEqual(other_rates["series"][0]["latest"], 9999.0)
+
+            def authorizer(action, arg1, arg2, dbname, source):
+                if action == sqlite3.SQLITE_READ and arg1 == "bodies":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            reader._store.db.set_authorizer(authorizer)
+            self.assertEqual(reader.rule_results(acc)["sets"][3]["analysis_set"], "bankara_open")
+            self.assertEqual(reader.rate_summary(acc)["series"][1]["latest"], 2100.0)
+            with self.assertRaises(ValueError):
+                reader.rule_results("")
+            with self.assertRaises(ValueError):
+                reader.rate_summary("")
+
 
 if __name__ == "__main__":
     unittest.main()

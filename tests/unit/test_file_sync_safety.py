@@ -495,7 +495,7 @@ class TestFileSyncSafety(unittest.TestCase):
         # The existing destination file MUST remain untouched!
         self.assertEqual(dst_file.read_text(), original_content)
 
-    # 13. rclone設定除外（大文字小文字非依存・ネスト）と通常receipt JSON/exports対照保持
+    # 13. rclone設定除外（大文字小文字非依存・ネスト）、退役XLSX、通常exports対照保持
     def test_rclone_conf_exclusion_and_receipt_inclusion_all_paths(self):
         """
         Verify that:
@@ -505,8 +505,8 @@ class TestFileSyncSafety(unittest.TestCase):
           * NAS remote scan code (sync_nas.scan_remote)
           * should_ignore functions
         - Nested logs/development/rclone-write.conf is excluded across all paths
-        - Normal receipt JSON files (e.g. logs/development/upload-receipt.json) and
-          exports files (e.g. exports/report.txt, exports/analysis.xlsx) are NOT excluded
+        - Normal receipt JSON files and full-data generation artifacts remain eligible
+        - Only the two exact retired legacy workbook paths are excluded
         - Existing exclusions (database, secrets, auth, tokens, credentials, .history, etc.) remain intact
         """
         setup_dirs = [
@@ -541,23 +541,37 @@ class TestFileSyncSafety(unittest.TestCase):
             "logs/development/upload-receipt.json",
             "logs/backup/migration-cloud-upload.json",
             "exports/report.txt",
-            "exports/analysis.xlsx",
             "exports/gui.html",
+            "exports/full-data/generations/test-generation/index.json",
+            "exports/full-data/generations/test-generation/manifest.json",
+            "exports/full-data/generations/test-generation/xlsx/piece-000001.xlsx",
         ]
+        retired_files = ["exports/分析.xlsx", "exports/analysis.xlsx"]
         for rel in include_files:
             p = self.local_dir / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("public_or_receipt_data")
+        for rel in retired_files:
+            p = self.local_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(("legacy-local:" + rel).encode("utf-8"))
 
         for mod in (sync_gdrive, sync_nas):
             for rel in exclude_files:
                 self.assertTrue(mod.should_ignore(rel), f"Expected {rel} to be ignored by {mod.__name__}")
+            for rel in retired_files:
+                self.assertTrue(mod.should_ignore(rel), f"Expected retired path {rel} to be ignored by {mod.__name__}")
             for rel in include_files:
                 self.assertFalse(mod.should_ignore(rel), f"Expected {rel} NOT to be ignored by {mod.__name__}")
+            # Do not infer additional retired aliases from similar names or case variants.
+            for rel in ("exports/Analysis.xlsx", "exports/分析.XLSX", "exports/other.xlsx"):
+                self.assertFalse(mod.should_ignore(rel), f"Unexpected path expansion: {rel}")
 
         # Path A: GDrive scan
         gdrive_scanned = sync_gdrive.scan_dir(self.local_dir)
         for rel in exclude_files:
+            self.assertNotIn(rel, gdrive_scanned, f"Expected {rel} to be excluded from GDrive scan")
+        for rel in retired_files:
             self.assertNotIn(rel, gdrive_scanned, f"Expected {rel} to be excluded from GDrive scan")
         for rel in include_files:
             self.assertIn(rel, gdrive_scanned, f"Expected {rel} to be included in GDrive scan")
@@ -565,6 +579,8 @@ class TestFileSyncSafety(unittest.TestCase):
         # Path B: NAS local scan
         nas_scanned = sync_nas.scan_local(self.local_dir)
         for rel in exclude_files:
+            self.assertNotIn(rel, nas_scanned, f"Expected {rel} to be excluded from NAS local scan")
+        for rel in retired_files:
             self.assertNotIn(rel, nas_scanned, f"Expected {rel} to be excluded from NAS local scan")
         for rel in include_files:
             self.assertIn(rel, nas_scanned, f"Expected {rel} to be included in NAS local scan")
@@ -574,6 +590,10 @@ class TestFileSyncSafety(unittest.TestCase):
             p = self.remote_dir / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("remote_secret_or_config")
+        for rel in retired_files:
+            p = self.remote_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(("legacy-remote:" + rel).encode("utf-8"))
         for rel in include_files:
             p = self.remote_dir / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -591,8 +611,92 @@ class TestFileSyncSafety(unittest.TestCase):
 
         for rel in exclude_files:
             self.assertNotIn(rel, remote_scanned, f"Expected {rel} to be excluded from NAS remote scan")
+        for rel in retired_files:
+            self.assertNotIn(rel, remote_scanned, f"Expected {rel} to be excluded from NAS remote scan")
         for rel in include_files:
             self.assertIn(rel, remote_scanned, f"Expected {rel} to be included in NAS remote scan")
+
+    def test_retired_legacy_workbooks_are_never_planned_or_transferred(self):
+        retired = ("exports/分析.xlsx", "exports/analysis.xlsx")
+        for module in (sync_nas, sync_gdrive):
+            for mode in ("both", "push", "pull"):
+                scenarios = (
+                    ({retired[0]: {"size": 10, "mtime": 1, "sha256": "a" * 64}}, {}),
+                    ({}, {retired[1]: {"size": 11, "mtime": 1, "sha256": "b" * 64}}),
+                    (
+                        {retired[0]: {"size": 10, "mtime": 2, "sha256": "a" * 64}},
+                        {retired[0]: {"size": 12, "mtime": 1, "sha256": "b" * 64}},
+                    ),
+                )
+                for left, right in scenarios:
+                    to_push, to_pull = module.plan_sync(left, right, mode=mode)
+                    planned = [entry[0] for entry in to_push + to_pull]
+                    self.assertFalse(set(retired) & set(planned), (module.__name__, mode, planned))
+
+        local_legacy = {
+            "exports/分析.xlsx": b"preserve-local-japanese",
+            "exports/analysis.xlsx": b"preserve-local-english",
+        }
+        remote_legacy = {
+            "exports/分析.xlsx": b"preserve-remote-japanese",
+            "exports/analysis.xlsx": b"preserve-remote-english",
+        }
+        full_artifacts = {
+            "exports/full-data/generations/test-generation/index.json": b'{"verified":true}',
+            "exports/full-data/generations/test-generation/manifest.json": b'{"version":1}',
+            "exports/full-data/generations/test-generation/xlsx/piece-000001.xlsx": b"full-data-xlsx",
+        }
+        for rel, content in {**local_legacy, **full_artifacts}.items():
+            path = self.local_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        for rel, content in {**remote_legacy, **full_artifacts}.items():
+            path = self.remote_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+        before_local = {rel: (self.local_dir / rel).read_bytes() for rel in local_legacy}
+        before_remote = {rel: (self.remote_dir / rel).read_bytes() for rel in remote_legacy}
+
+        class Args:
+            mode = "both"
+            dry_run = False
+            remote_host = "mock-nas"
+            remote_dir = str(self.remote_dir)
+
+        with patch.object(sync_gdrive, "copy_file") as gdrive_copy:
+            sync_gdrive._run_sync(Args(), self.local_dir, self.remote_dir)
+            gdrive_copy.assert_not_called()
+
+        with patch.object(sync_nas, "scan_remote", return_value=sync_nas.scan_local(self.remote_dir)), \
+             patch.object(sync_nas, "push_file") as nas_push, \
+             patch.object(sync_nas, "pull_file") as nas_pull:
+            sync_nas._run_sync(Args(), self.local_dir)
+            nas_push.assert_not_called()
+            nas_pull.assert_not_called()
+
+        self.assertEqual(before_local, {rel: (self.local_dir / rel).read_bytes() for rel in local_legacy})
+        self.assertEqual(before_remote, {rel: (self.remote_dir / rel).read_bytes() for rel in remote_legacy})
+        for rel in full_artifacts:
+            self.assertEqual((self.local_dir / rel).read_bytes(), full_artifacts[rel])
+            self.assertEqual((self.remote_dir / rel).read_bytes(), full_artifacts[rel])
+
+        # Direct transfer APIs also reject these two exact paths before invoking subprocesses or writing.
+        for rel in retired:
+            with patch("subprocess.Popen") as popen, patch("subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "Legacy analysis workbook sync is retired"):
+                    sync_nas.push_file(self.local_dir / rel, rel, "mock-nas", str(self.remote_dir), local_dir=self.local_dir)
+                with self.assertRaisesRegex(ValueError, "Legacy analysis workbook sync is retired"):
+                    sync_nas.pull_file("mock-nas", str(self.remote_dir), rel, self.local_dir / rel, local_dir=self.local_dir)
+                with self.assertRaisesRegex(ValueError, "Legacy analysis workbook sync is retired"):
+                    sync_gdrive.copy_file(self.local_dir / rel, self.remote_dir / rel, root_dir=self.remote_dir, rel_path=rel)
+                with self.assertRaisesRegex(ValueError, "Legacy analysis workbook sync is retired"):
+                    sync_gdrive.copy_file(self.local_dir / rel, self.remote_dir / rel, root_dir=self.remote_dir)
+                popen.assert_not_called()
+                run.assert_not_called()
+
+        self.assertEqual(before_local, {rel: (self.local_dir / rel).read_bytes() for rel in local_legacy})
+        self.assertEqual(before_remote, {rel: (self.remote_dir / rel).read_bytes() for rel in remote_legacy})
 
 if __name__ == '__main__':
     unittest.main()

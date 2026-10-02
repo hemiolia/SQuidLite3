@@ -2,6 +2,9 @@
 set -euo pipefail
 umask 077
 
+echo "Error: 2026-09-29 rule. New backups are plaintext. This encryption path is disabled. Use verified_backup_support.py plaintext-snapshot." >&2
+exit 2
+
 if [ "$#" -ne 3 ]; then
   echo "Usage: $0 <DB_PATH> <BACKUP_DIR> <PASSPHRASE_FILE>" >&2
   exit 1

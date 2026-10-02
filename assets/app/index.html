@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>イカリング3アーカイブ</title>
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+  <div id="status-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+  <div id="no-token-container" class="notice-container hidden">
+    <div class="notice-card" role="alert">
+      <h1 class="notice-title">起動エラー</h1>
+      <p class="notice-body">起動用のリンクから開き直してください。</p>
+    </div>
+  </div>
+
+  <div id="app-container" class="app-layout hidden">
+    <header class="app-header">
+      <div class="header-inner">
+        <h1 class="header-title">イカリング3アーカイブ</h1>
+      </div>
+      <section class="card status-section" aria-labelledby="status-heading">
+        <h2 id="status-heading" class="section-title">収集状態</h2>
+        <div id="status-loading" class="loading-text" role="status">収集状態を確認中...</div>
+        <div id="status-error" class="error-box hidden" role="alert">
+          <p id="status-error-message" class="error-message"></p>
+          <button type="button" id="status-retry-button" class="btn btn-secondary">状態の再取得</button>
+        </div>
+        <div id="status-content" class="status-grid hidden">
+          <div class="status-item">
+            <span class="status-label">最新履歴取得日時</span>
+            <span id="status-last-checked" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">同期状況</span>
+            <span id="status-sync-state" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">認証状態</span>
+            <span id="status-auth-state" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">保存試合</span>
+            <span id="status-match-count" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">詳細が無い試合</span>
+            <span id="status-missing-detail" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">詳細待ち</span>
+            <span id="status-pending-details" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">取得不能の詳細</span>
+            <span id="status-unavailable-details" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">未了のジョブ</span>
+            <span id="status-open-jobs" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">監査記録</span>
+            <span id="status-issue-count" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">取得範囲の照合</span>
+            <span id="status-coverage" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">直近の認証事故</span>
+            <span id="status-auth-failure" class="status-value">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">直近の収集エラー</span>
+            <span id="status-sync-error" class="status-value">-</span>
+          </div>
+        </div>
+        <p id="status-history-paths" class="status-history-paths hidden">-</p>
+        <p class="status-disclaimer">本表示は保存済み記録の確認状態であり、任天堂サーバー上の全記録の取得完了を意味するものではありません。未了のジョブは、状態が pending、retry、awaiting_scope の件数です。取得範囲の照合が未了のときは、全記録を取り終えたことにはなりません。</p>
+      </section>
+    </header>
+
+    <main class="app-main">
+      <section class="card filter-section" aria-labelledby="filter-heading">
+        <h2 id="filter-heading" class="sr-only">記録の絞り込み</h2>
+        <form id="filter-form" class="filter-form">
+          <div class="form-group dataset-group">
+            <label for="dataset-select" class="form-label">記録ファイル</label>
+            <select id="dataset-select" class="form-select">
+              <option value="unified">統合版</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="account-select" class="form-label">アカウント</label>
+            <select id="account-select" class="form-select" disabled></select>
+          </div>
+          <div class="form-group">
+            <label for="kind-select" class="form-label">種別</label>
+            <select id="kind-select" class="form-select">
+              <option value="">すべて</option>
+              <option value="vs">対戦</option>
+              <option value="coop">バイト</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="analysis-set-select" class="form-label">ジャンル</label>
+            <select id="analysis-set-select" class="form-select">
+              <option value="">すべて</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="rule-select" class="form-label">ルール</label>
+            <select id="rule-select" class="form-select">
+              <option value="">すべて</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="played-from" class="form-label">試合日時（から）</label>
+            <input id="played-from" class="form-input" type="datetime-local" step="1">
+          </div>
+          <div class="form-group">
+            <label for="played-to" class="form-label">試合日時（まで）</label>
+            <input id="played-to" class="form-input" type="datetime-local" step="1">
+          </div>
+          <div class="form-group">
+            <label for="weapon-select" class="form-label">自分のブキ</label>
+            <select id="weapon-select" class="form-select">
+              <option value="">すべて</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="tag-filter-select" class="form-label">タグ</label>
+            <select id="tag-filter-select" class="form-select">
+              <option value="">すべて</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="record-query" class="form-label">検索</label>
+            <input id="record-query" class="form-input" type="search" maxlength="80" autocomplete="off">
+          </div>
+          <div class="form-group form-actions">
+            <button type="button" id="refresh-button" class="btn btn-primary">更新</button>
+          </div>
+        </form>
+        <p class="filter-note">期間は詳細の試合日時だけを使います。試合日時が無い記録は、期間を指定すると含まれません。ブキは対戦詳細に記録された自分のブキ名です。記録ファイルは統合版と、既にあるモード別・ルール別のファイルです。タグの追加と削除は統合版で行います。</p>
+      </section>
+
+      <section class="card" aria-labelledby="tag-summary-heading">
+        <h2 id="tag-summary-heading" class="section-title">オープンとプラベのタグ件数</h2>
+        <p class="filter-note">オープンと、プラベの人数区分ごとの件数です。区分をまたいだ合計は出していません。一つの試合に複数のタグがあると、タグごとに数えます。タグを付けてもジャンルは変わりません。</p>
+        <div id="tag-summary-loading" class="loading-text hidden" role="status">タグの件数を読み込み中...</div>
+        <div id="tag-summary-error" class="error-box hidden" role="alert">
+          <p id="tag-summary-error-message" class="error-message"></p>
+        </div>
+        <div class="table-container">
+          <table class="tag-summary-table">
+            <thead>
+              <tr>
+                <th scope="col">ジャンル</th>
+                <th scope="col">試合</th>
+                <th scope="col">タグなし</th>
+                <th scope="col">タグ</th>
+              </tr>
+            </thead>
+            <tbody id="tag-summary-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="rule-results-heading">
+        <h2 id="rule-results-heading" class="section-title">ルール別の勝敗</h2>
+        <p class="filter-note">対戦の区分とルールごとの件数です。区分やルールをまたいだ合計は出していません。勝ち、負け、引き分けは詳細の judgement が WIN、LOSE、DRAW のものだけです。それ以外はその他です。バイトの納品数はここには入れていません。2対2をイカップルにはしていません。</p>
+        <div id="rule-results-loading" class="loading-text hidden" role="status">勝敗を読み込み中...</div>
+        <div id="rule-results-error" class="error-box hidden" role="alert">
+          <p id="rule-results-error-message" class="error-message"></p>
+        </div>
+        <div class="table-container">
+          <table class="rule-results-table">
+            <thead>
+              <tr>
+                <th scope="col">ジャンル</th>
+                <th scope="col">ルール</th>
+                <th scope="col">試合</th>
+                <th scope="col">勝ち</th>
+                <th scope="col">負け</th>
+                <th scope="col">引き分け</th>
+                <th scope="col">その他</th>
+              </tr>
+            </thead>
+            <tbody id="rule-results-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="rate-summary-heading">
+        <h2 id="rate-summary-heading" class="section-title">レートの数値</h2>
+        <p class="filter-note">保存済みのレート系列ごとの最新、直前からの増減、最低、最高、点数です。区分とルールは混ぜていません。勝敗から作った系列と、ウデマエポイントの増減は出していません。キケン度は表示のときだけ百分率にします。各系列の下に、軸と目盛りのあるグラフと、同じ数値の表を置いています。</p>
+        <div id="rate-summary-loading" class="loading-text hidden" role="status">レートを読み込み中...</div>
+        <div id="rate-summary-error" class="error-box hidden" role="alert">
+          <p id="rate-summary-error-message" class="error-message"></p>
+        </div>
+        <div class="table-container">
+          <table class="rate-summary-table">
+            <thead>
+              <tr>
+                <th scope="col">ジャンル</th>
+                <th scope="col">ルール</th>
+                <th scope="col">系列</th>
+                <th scope="col">指標</th>
+                <th scope="col">出どころ</th>
+                <th scope="col">最新</th>
+                <th scope="col">直前からの増減</th>
+                <th scope="col">最低</th>
+                <th scope="col">最高</th>
+                <th scope="col">点数</th>
+              </tr>
+            </thead>
+            <tbody id="rate-summary-body"></tbody>
+          </table>
+        </div>
+        <div id="rate-charts"></div>
+      </section>
+
+      <section class="card" aria-labelledby="published-xlsx-heading">
+        <h2 id="published-xlsx-heading" class="section-title">分析表</h2>
+        <p class="filter-note">旧分析表には欠落があるため利用できません。全情報の書き出しは準備中です。</p>
+        <p id="published-xlsx-message" class="filter-note hidden" role="status"></p>
+        <div class="published-xlsx-actions">
+          <button type="button" id="published-xlsx-button" class="btn btn-secondary" disabled>旧分析表は利用できません</button>
+        </div>
+      </section>
+
+      <section class="card records-section" aria-labelledby="records-heading">
+        <div class="records-header">
+          <h2 id="records-heading" class="section-title">保存済み記録</h2>
+          <div class="records-summary">
+            <span id="records-count" class="records-count">件数: -</span>
+          </div>
+        </div>
+
+        <div class="pagination-bar">
+          <button type="button" id="prev-page-button" class="btn btn-page" disabled>前へ</button>
+          <span id="page-display" class="page-display">1 / 1</span>
+          <button type="button" id="next-page-button" class="btn btn-page" disabled>次へ</button>
+        </div>
+
+        <div id="records-loading" class="loading-text hidden" role="status">記録一覧を読み込み中...</div>
+        <div id="records-error" class="error-box hidden" role="alert">
+          <p id="records-error-message" class="error-message"></p>
+          <button type="button" id="records-retry-button" class="btn btn-secondary">一覧の再取得</button>
+        </div>
+
+        <div class="table-container">
+          <table class="records-table">
+            <thead>
+              <tr>
+                <th scope="col">日時</th>
+                <th scope="col">種別</th>
+                <th scope="col">ジャンル</th>
+                <th scope="col">ルール</th>
+                <th scope="col">詳細状態</th>
+                <th scope="col">操作</th>
+              </tr>
+            </thead>
+            <tbody id="records-table-body">
+              <tr>
+                <td colspan="6" class="empty-cell">記録がありません</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="detail-section" class="card detail-section hidden" aria-labelledby="detail-heading">
+        <h2 id="detail-heading" class="section-title" tabindex="-1">記録詳細</h2>
+        <div id="detail-loading" class="loading-text hidden" role="status">詳細を読み込み中...</div>
+        <div id="detail-error" class="error-box hidden" role="alert">
+          <p id="detail-error-message" class="error-message"></p>
+          <button type="button" id="detail-retry-button" class="btn btn-secondary">詳細の再取得</button>
+        </div>
+        <div id="detail-body" class="detail-body hidden">
+          <dl class="detail-meta-grid">
+            <div class="meta-row">
+              <dt>日時</dt>
+              <dd id="detail-played-time">-</dd>
+            </div>
+            <div class="meta-row">
+              <dt>種別</dt>
+              <dd id="detail-kind">-</dd>
+            </div>
+            <div class="meta-row">
+              <dt>ジャンル</dt>
+              <dd id="detail-genre">-</dd>
+            </div>
+            <div class="meta-row">
+              <dt>ルール</dt>
+              <dd id="detail-rule">-</dd>
+            </div>
+            <div class="meta-row">
+              <dt>詳細状態</dt>
+              <dd id="detail-state">-</dd>
+            </div>
+          </dl>
+
+          <section id="tag-section" class="tag-section hidden" aria-labelledby="tag-heading">
+            <h3 id="tag-heading" class="section-title">タグ</h3>
+            <p id="tag-scope-note" class="tag-note"></p>
+            <ul id="tag-list" class="tag-list"></ul>
+            <p id="tag-empty" class="tag-empty hidden">タグはまだありません。</p>
+            <div id="tag-suggestions" class="tag-suggestions"></div>
+            <form id="tag-form" class="tag-form">
+              <label for="tag-input" class="form-label">タグを追加</label>
+              <input id="tag-input" class="form-input" type="text" maxlength="80" autocomplete="off" spellcheck="false">
+              <button type="submit" id="tag-add-button" class="btn btn-primary">追加</button>
+            </form>
+            <p id="tag-error" class="error-message hidden" role="alert"></p>
+          </section>
+
+          <div id="source-download-area" class="source-action-area hidden">
+            <button type="button" id="download-source-button" class="btn btn-secondary">元の応答を保存</button>
+          </div>
+
+          <details id="folded-detail-json" class="folded-panel">
+            <summary class="folded-summary">保存した詳細</summary>
+            <pre id="detail-json-pre" class="folded-pre"></pre>
+          </details>
+
+          <details id="folded-source-info" class="folded-panel">
+            <summary class="folded-summary">保存情報</summary>
+            <div id="source-info-content" class="folded-content"></div>
+          </details>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run NAS export artifacts publisher container.
 # This script starts a Docker container on the NAS to publish generated exports
-# (gui/index.html and 分析.xlsx) to a pre-authorized rclone remote.
+# (gui/index.html only) to a pre-authorized rclone remote.
 set -euo pipefail
 umask 077
 

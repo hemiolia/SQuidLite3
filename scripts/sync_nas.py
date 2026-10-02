@@ -3,6 +3,7 @@
 NAS (nas:/home/Natsuki/ikaring-archive) とローカルのイカリング3アーカイブを双方向同期するスクリプト。
 UGOSのrsync制限を回避し、SSH経由でタイムスタンプ・サイズ比較により差分のみを安全かつ高速に転送します。
 database/、secrets/、認証データ、rclone設定(rclone.conf/rclone-*.conf)、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
+旧部分ブックの ``exports/分析.xlsx`` と ``exports/analysis.xlsx`` も、その正確な相対パスだけ除外されます。
 """
 
 import argparse
@@ -36,10 +37,19 @@ IGNORE_DIR_NAMES = {
     'database', 'secrets', 'nxapi-nodejs',
     'runtime', 'spool', '.history', '.git', 'backups', '.sync-conflicts'
 }
+RETIRED_LEGACY_EXPORT_PATHS = {'exports/分析.xlsx', 'exports/analysis.xlsx'}
 
 MAX_FILE_BYTES = 1024 * 1024 * 1024  # 1GiB
 
+def is_retired_legacy_export_path(rel_path: str) -> bool:
+    return tuple(Path(rel_path).parts) in {
+        ('exports', '分析.xlsx'),
+        ('exports', 'analysis.xlsx'),
+    }
+
 def should_ignore(rel_path: str) -> bool:
+    if is_retired_legacy_export_path(rel_path):
+        return True
     parts = Path(rel_path).parts
     if parts == ('config', 'storage-location.json'):
         return True
@@ -135,6 +145,7 @@ ignore_patterns = {tuple(IGNORE_PATTERNS)}
 ignore_suffixes = {tuple(IGNORE_SUFFIXES)}
 ignore_globs = {tuple(IGNORE_GLOBS)}
 ignore_dir_names = {tuple(IGNORE_DIR_NAMES)}
+retired_legacy_export_paths = {tuple(RETIRED_LEGACY_EXPORT_PATHS)}
 
 def _on_walk_error(err):
     raise err
@@ -154,6 +165,8 @@ def should_ignore_part(p):
     return False
 
 def should_ignore(rel_path):
+    if rel_path in retired_legacy_export_paths:
+        return True
     if Path(rel_path).parts == ('config', 'storage-location.json'):
         return True
     for part in Path(rel_path).parts:
@@ -191,6 +204,8 @@ print(json.dumps(result))
     return json.loads(res.stdout.strip())
 
 def push_file(local_path: Path, rel_path: str, remote_host: str, remote_dir: str, is_conflict: bool = False, local_dir: Path = None, expected_dest_sha: str = None):
+    if is_retired_legacy_export_path(rel_path):
+        raise ValueError(f'Legacy analysis workbook sync is retired: {rel_path}')
     if local_dir is None:
         parts_count = len(Path(rel_path).parts)
         local_dir = local_path.parents[parts_count - 1] if parts_count <= len(local_path.parents) else local_path.parent
@@ -382,6 +397,8 @@ print("COMMIT_OK")
         raise RuntimeError(f"Failed to commit {rel_path} on remote: {commit_res.stderr.strip()}")
 
 def pull_file(remote_host: str, remote_dir: str, rel_path: str, local_path: Path, local_dir: Path = None, is_conflict: bool = False, expected_dest_sha: str = None):
+    if is_retired_legacy_export_path(rel_path):
+        raise ValueError(f'Legacy analysis workbook sync is retired: {rel_path}')
     if local_dir is None:
         parts_count = len(Path(rel_path).parts)
         local_dir = local_path.parents[parts_count - 1] if parts_count <= len(local_path.parents) else local_path.parent
@@ -477,6 +494,8 @@ def plan_sync(local_files: dict, remote_files: dict, mode: str = 'both', baselin
     to_pull = []
 
     for k in all_keys:
+        if is_retired_legacy_export_path(k):
+            continue
         in_local = k in local_files
         in_remote = k in remote_files
 

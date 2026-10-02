@@ -1,12 +1,15 @@
-import base64, json, sqlite3, tempfile, unittest, uuid
+import base64, contextlib, io, json, sqlite3, tempfile, unittest, uuid
 from pathlib import Path
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'src/python'))
+ROOT=Path(__file__).resolve().parents[2]
+sys.path.insert(0,str(ROOT))
+from unittest.mock import patch
+import archive
 from ikarchive.store import Store, js, now
 from ikarchive.planner import Planner, identity
-from ikarchive.collector import allowed_asset
+from ikarchive.collector import allowed_asset, signed_url_expired
 
-ROOT=Path(__file__).resolve().parents[2]
 MANIFEST=json.loads((ROOT/'config/query-catalog.snapshot.json').read_text())
 
 def encoded(s):return base64.b64encode(s.encode()).decode()
@@ -21,6 +24,29 @@ class ArchiveTests(unittest.TestCase):
     def tearDown(self):self.store.close();self.tmp.cleanup()
     def ingest(self,op,body,**kwargs):
         e=response(op,body,**kwargs);i=self.store.record(e);self.store.project(i,self.p);return i
+    def test_legacy_export_cli_retires_before_store_open(self):
+        db=Path(self.tmp.name)/'readonly-source.sqlite3'
+        db.write_bytes(b'database bytes stay unchanged')
+        db.chmod(0o640)
+        before=(db.read_bytes(),db.stat().st_mode&0o777,db.stat().st_mtime_ns)
+        destination=Path(self.tmp.name)/'old-analysis.xlsx'
+        stdout,stderr=io.StringIO(),io.StringIO()
+        argv=['archive.py','--db',str(db),'export-xlsx',str(destination)]
+        with patch.object(sys,'argv',argv), patch.object(archive,'Store',side_effect=AssertionError('Store opened')), \
+             contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+            code=archive.main()
+        self.assertEqual(code,4)
+        self.assertEqual(stdout.getvalue(),'')
+        self.assertIn('LEGACY_ANALYSIS_XLSX_RETIRED',stderr.getvalue())
+        self.assertIn('scripts/export_full_xlsx.py',stderr.getvalue())
+        self.assertFalse(destination.exists())
+        after=(db.read_bytes(),db.stat().st_mode&0o777,db.stat().st_mtime_ns)
+        self.assertEqual(after,before)
+        self.assertFalse(Path(str(db)+'-wal').exists())
+        self.assertFalse(Path(str(db)+'-shm').exists())
+        args=type('Args',(),{'command':'export-xlsx'})()
+        with self.assertRaisesRegex(ValueError,'LEGACY_ANALYSIS_XLSX_RETIRED'):
+            archive.dispatch(self.store,args)
     def test_current_catalog_exhaustively_classified(self):
         self.assertEqual(len(self.p.queries),113);self.assertEqual(len(self.p.routes),103);self.assertFalse(self.p.unsupported)
         self.assertEqual(set(self.p.queries),set(self.p.routes)|set(self.p.excluded))
@@ -116,6 +142,27 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(allowed_asset('https://nintendo.net.attacker.test/a'))
         self.assertFalse(allowed_asset('http://api.lp1.av5ja.srv.nintendo.net/a'))
         self.assertTrue(allowed_asset('https://api.lp1.av5ja.srv.nintendo.net/a'))
+        bucket='ugcstore-toyohr-lp1-persistent'
+        self.assertTrue(allowed_asset(f'https://storage.googleapis.com/{bucket}/photo'))
+        self.assertTrue(allowed_asset(f'https://storage.googleapis.com/{bucket}/photo?Expires=1&GoogleAccessId=a&Signature=b'))
+        self.assertFalse(allowed_asset('https://storage.googleapis.com/other-bucket/photo'))
+        self.assertFalse(allowed_asset('https://storage.googleapis.com/'))
+        self.assertFalse(allowed_asset(f'http://storage.googleapis.com/{bucket}/photo'))
+        self.assertFalse(allowed_asset(f'https://user:pw@storage.googleapis.com/{bucket}/photo'))
+        self.assertFalse(allowed_asset(f'https://storage.googleapis.com.attacker.test/{bucket}/photo'))
+        self.assertFalse(allowed_asset(f'https://evil.storage.googleapis.com/{bucket}/photo'))
+        past=f'https://storage.googleapis.com/{bucket}/photo?Expires=1&GoogleAccessId=a&Signature=b'
+        future=f'https://storage.googleapis.com/{bucket}/photo?Expires=4102444800&GoogleAccessId=a&Signature=b'
+        self.assertTrue(signed_url_expired(past, 1_700_000_000))
+        self.assertFalse(signed_url_expired(future, 1_700_000_000))
+        self.assertFalse(signed_url_expired(f'https://storage.googleapis.com/{bucket}/photo', 1_700_000_000))
+        self.assertTrue(signed_url_expired(
+            f'https://storage.googleapis.com/{bucket}/photo?X-Goog-Date=20200101T000000Z&X-Goog-Expires=60&X-Goog-Signature=b',
+            1_700_000_000))
+        self.assertFalse(signed_url_expired(
+            f'https://storage.googleapis.com/{bucket}/photo?X-Goog-Date=20990101T000000Z&X-Goog-Expires=60&X-Goog-Signature=b',
+            1_700_000_000))
+        self.assertFalse(signed_url_expired(f'https://storage.googleapis.com/{bucket}/photo?Expires=nope', 1_700_000_000))
     def test_late_recovery_does_not_overwrite_newer_detail(self):
         remote=encoded('VsHistoryDetail-u-demo:REGULAR:20260922T010101_x')
         v={'vsResultId':remote}

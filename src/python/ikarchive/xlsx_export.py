@@ -130,6 +130,13 @@ def _rows(db,kind,view):
     if kind=='salmon':return _salmon_rows(db,view)
     return _hold_rows(db)
 
+def _zip_entry(name):
+    # エントリの時刻を固定する。中身が同じなら、作る時刻が違ってもバイト列は同じになる。
+    info=zipfile.ZipInfo(filename=name,date_time=(1980,1,1,0,0,0))
+    info.compress_type=zipfile.ZIP_DEFLATED
+    info.external_attr=0o600<<16
+    return info
+
 def export_xlsx(store,destination):
     destination=Path(destination)
     destination.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -153,19 +160,45 @@ def export_xlsx(store,destination):
     os.close(fd);tmp=Path(name)
     try:
         with zipfile.ZipFile(tmp,'w',compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr('[Content_Types].xml',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            z.writestr(_zip_entry('[Content_Types].xml'),f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="{NS_CT}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>{''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1,len(sheets)+1))}</Types>''')
-            z.writestr('_rels/.rels',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            z.writestr(_zip_entry('_rels/.rels'),f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="{NS_PKG}"><Relationship Id="rId1" Type="{NS_REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>''')
             workbook_sheets=''.join(f'<sheet name="{escape(name)}" sheetId="{i}" r:id="rId{i}"/>' for i, (name,_) in enumerate(sheets,1))
-            z.writestr('xl/workbook.xml',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            z.writestr(_zip_entry('xl/workbook.xml'),f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="{NS_MAIN}" xmlns:r="{NS_REL}"><sheets>{workbook_sheets}</sheets></workbook>''')
             rels=''.join(f'<Relationship Id="rId{i}" Type="{NS_REL}/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1,len(sheets)+1))
-            z.writestr('xl/_rels/workbook.xml.rels',f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            z.writestr(_zip_entry('xl/_rels/workbook.xml.rels'),f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="{NS_PKG}">{rels}</Relationships>''')
-            for i,(_,xml) in enumerate(sheets,1):z.writestr(f'xl/worksheets/sheet{i}.xml',xml)
+            for i,(_,xml) in enumerate(sheets,1):z.writestr(_zip_entry(f'xl/worksheets/sheet{i}.xml'),xml)
         tmp.replace(destination)
     finally:
         tmp.unlink(missing_ok=True)
     destination.chmod(0o600)
     return {'path':str(destination),'rows':counts,'canonical':'sqlite','edits_return_to_database':False}
+
+PUBLISHED_XLSX_NAME = '分析.xlsx'
+MAX_PUBLISHED_XLSX_BYTES = 5 * 1024 * 1024
+LEGACY_ANALYSIS_XLSX_RETIRED = 'LEGACY_ANALYSIS_XLSX_RETIRED'
+
+class PublishedXlsxRetired(Exception):
+    category = LEGACY_ANALYSIS_XLSX_RETIRED
+
+    def __init__(self):
+        super().__init__(self.category)
+
+class PublishedXlsxMissing(Exception):
+    pass
+
+class PublishedXlsxUnusable(Exception):
+    pass
+
+def published_xlsx_path(db_path):
+    db_path = Path(db_path)
+    parent = db_path.parent
+    root = parent.parent if parent.name == 'database' else parent
+    return root / 'exports' / PUBLISHED_XLSX_NAME
+
+def read_published_xlsx(db_path):
+    """旧分析表は不完全なため、ファイルやDBへ触れず利用を拒否する。"""
+    raise PublishedXlsxRetired()

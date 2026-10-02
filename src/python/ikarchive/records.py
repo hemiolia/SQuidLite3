@@ -6,9 +6,71 @@
 detail_json は派生 JSON 表現である。
 """
 
+import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from .display import GENRE_ORDER, genre_sort_index, rule_sort_index
+from .slices import MODE_SLICES, UNCLASSIFIED
+
+TAG_SUMMARY_SETS = tuple(
+    name for name in MODE_SLICES
+    if name == "bankara_open" or name.startswith("private_")
+)
+_JUDGEMENT_EXCLUDED = {"private", "salmon_regular", "big_run", "team_contest", "hold"}
+JUDGEMENT_SETS = tuple(
+    name for name in GENRE_ORDER
+    if name in MODE_SLICES and name not in _JUDGEMENT_EXCLUDED
+)
+_VIEW_NAME = re.compile(r"analysis_[a-z0-9_]+_by_rule\Z")
 from .store import Store
+
+_ANALYSIS_SET_RE = re.compile(r'(?:unclassified|[a-z0-9_]{1,64})\Z')
+_RULE_RE = re.compile(r'[A-Za-z0-9_]{1,64}\Z')
+_PLAYED_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z')
+
+
+def _whole_count(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("INVALID_COUNT")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        number = int(value)
+    else:
+        raise ValueError("INVALID_COUNT")
+    if number < 0:
+        raise ValueError("INVALID_COUNT")
+    return number
+
+
+def _metric_key(series_id: str) -> str:
+    if not series_id:
+        return ""
+    return series_id.split("|")[-1].split(".")[-1]
+
+
+def _rate_hidden(series_id: str, label: str, source: str) -> bool:
+    """既定のレート画面と同じく、勝敗由来とウデマエポイント増減は出さない。"""
+    if source == "derived_judgement":
+        return True
+    metric = _metric_key(series_id)
+    return metric == "earnedUdemaePoint" or label == "ウデマエポイント増減"
+
+
+def _rate_unit(series_id: str, label: str) -> str:
+    metric = _metric_key(series_id)
+    if metric == "dangerRate" or (label and "キケン度" in label):
+        return "ratio"
+    return "number"
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
 
 
 class RecordReader:
@@ -50,37 +112,31 @@ class RecordReader:
         if not self._entered or self._store is None:
             raise RuntimeError("RecordReader method called outside of active context")
 
-    def list_matches(
+    def _bounded_text(self, value: Optional[str], name: str, limit: int = 80) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(f"{name} contains a control character")
+        if not value or len(value) > limit:
+            raise ValueError(f"{name} must be 1..{limit} characters")
+        return value
+
+    def _list_constraints(
         self,
         account: str,
-        *,
-        kind: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> Dict[str, Any]:
-        """対戦・バイトの一覧を取得する。
-
-        母集合は matches であり、documents と match_classification を
-        LEFT JOIN する（documents は response_id/account/kind/match_key、
-        match_classification は account/kind/match_key 完全一致）。
-        詳細なし/未分類も残す。
-        順序は kind ASC, match_key ASC（同じ read snapshot 内で安定）。
-        件数は総 matches 数であり成績集計ではない。
-        list では body を読み込まない。
-        タグ/文字列検索/期間/ルール/ブキ filter はこの工程で追加しない。
-
-        Args:
-            account: 空でない str 必須。
-            kind: None, 'vs', 'coop' のみ。
-            limit: bool 以外の int 1..200。
-            offset: bool 以外の int >= 0。
-
-        Returns:
-            {'total': 件数, 'limit': limit, 'offset': offset, 'items': [...]}
-        """
-        self._check_active()
-
-        # パラメータ検証
+        kind: Optional[str],
+        analysis_set: Optional[str],
+        rule_raw: Optional[str],
+        played_from: Optional[str],
+        played_to: Optional[str],
+        weapon: Optional[str],
+        tag: Optional[str],
+        query: Optional[str],
+        limit: int,
+        offset: int,
+    ):
         if not isinstance(account, str) or not account:
             raise ValueError("account must be a non-empty string")
         if kind not in (None, "vs", "coop"):
@@ -89,36 +145,95 @@ class RecordReader:
             raise ValueError("limit must be an integer between 1 and 200 (bool not allowed)")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be an integer >= 0 (bool not allowed)")
-
-        db = self._store.db
-
-        # 総件数の取得（母集合 matches の件数、成績集計ではない）
-        where_clauses = ["m.account = ?"]
+        if analysis_set is not None and (
+            not isinstance(analysis_set, str) or not _ANALYSIS_SET_RE.fullmatch(analysis_set)
+        ):
+            raise ValueError("analysis_set must be unclassified or a mode name")
+        if rule_raw is not None and (not isinstance(rule_raw, str) or not _RULE_RE.fullmatch(rule_raw)):
+            raise ValueError("rule_raw must be a rule token")
+        for name, value in (("played_from", played_from), ("played_to", played_to)):
+            if value is not None and (not isinstance(value, str) or not _PLAYED_RE.fullmatch(value)):
+                raise ValueError(f"{name} must be YYYY-MM-DDTHH:MM:SSZ")
+        if played_from is not None and played_to is not None and played_from > played_to:
+            raise ValueError("played_from must be at or before played_to")
+        weapon = self._bounded_text(weapon, "weapon")
+        tag = self._bounded_text(tag, "tag")
+        query = self._bounded_text(query, "query")
+        clauses = ["m.account = ?"]
         params: List[Any] = [account]
         if kind is not None:
-            where_clauses.append("m.kind = ?")
+            clauses.append("m.kind = ?")
             params.append(kind)
+        if analysis_set == UNCLASSIFIED:
+            clauses.append("c.account IS NULL")
+        elif analysis_set is not None:
+            clauses.append("c.analysis_set = ?")
+            params.append(analysis_set)
+        if rule_raw is not None:
+            clauses.append("c.rule_raw = ?")
+            params.append(rule_raw)
+        if played_from is not None or played_to is not None:
+            clauses.append("json_extract(d.json_text, '$.playedTime') IS NOT NULL")
+        if played_from is not None:
+            clauses.append("json_extract(d.json_text, '$.playedTime') >= ?")
+            params.append(played_from)
+        if played_to is not None:
+            clauses.append("json_extract(d.json_text, '$.playedTime') <= ?")
+            params.append(played_to)
+        if weapon is not None:
+            clauses.append(
+                """EXISTS (
+                    SELECT 1 FROM battle_players bp
+                    WHERE bp.account = m.account AND bp.match_key = m.match_key
+                      AND bp.is_myself = 1 AND bp.weapon = ?
+                )"""
+            )
+            params.append(weapon)
+        if tag is not None:
+            clauses.append(
+                """EXISTS (
+                    SELECT 1 FROM match_tags tg
+                    WHERE tg.account = m.account AND tg.match_key = m.match_key AND tg.tag = ?
+                )"""
+            )
+            params.append(tag)
+        if query is not None:
+            clauses.append(
+                """(
+                    instr(ifnull(m.match_key, ''), ?) > 0
+                    OR instr(ifnull(c.rule_raw, ''), ?) > 0
+                    OR instr(ifnull(c.rule_name, ''), ?) > 0
+                    OR instr(ifnull(c.analysis_set, ''), ?) > 0
+                    OR instr(ifnull(c.genre, ''), ?) > 0
+                    OR instr(ifnull(json_extract(d.json_text, '$.vsStage.name'), ''), ?) > 0
+                    OR instr(ifnull(json_extract(d.json_text, '$.coopStage.name'), ''), ?) > 0
+                    OR instr(ifnull(json_extract(d.json_text, '$.vsRule.name'), ''), ?) > 0
+                    OR EXISTS (
+                        SELECT 1 FROM battle_players bp
+                        WHERE bp.account = m.account AND bp.match_key = m.match_key
+                          AND bp.is_myself = 1 AND instr(ifnull(bp.weapon, ''), ?) > 0
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM match_tags tg
+                        WHERE tg.account = m.account AND tg.match_key = m.match_key
+                          AND instr(tg.tag, ?) > 0
+                    )
+                )"""
+            )
+            params.extend([query] * 10)
+        return " AND ".join(clauses), params
 
-        where_sql = " AND ".join(where_clauses)
-        total_row = db.execute(f"SELECT count(*) FROM matches m WHERE {where_sql}", params).fetchone()
-        total = total_row[0] if total_row else 0
-
-        # 一覧の取得
-        # detail_state の判定:
-        # - canonical 詳細あり時のみ available
-        # - なければ既存 pending_details / unavailable_details ビューへ account/kind/match_key 完全一致で照合して pending / unavailable
-        # - それ以外 unresolved
-        # played_time は詳細 playedTime のみ、first_seen による代用禁止
-        # rule_raw / classification は LEFT JOIN 結果、未分類を unknown/hold に推論変換しない
-        query = f"""
-        SELECT
-            m.account,
-            m.kind,
-            m.match_key,
-            m.first_seen,
-            m.last_seen,
-            m.detail_response_id,
-            CASE
+    def _detail_state_sql(self) -> str:
+        """保存schemaの状態viewが揃うときだけ pending/unavailable を判定する。"""
+        names = {
+            row[0]
+            for row in self._store.db.execute(
+                """SELECT name FROM sqlite_master
+                   WHERE type='view' AND name IN ('pending_details', 'unavailable_details')"""
+            )
+        }
+        if names == {"pending_details", "unavailable_details"}:
+            return """CASE
                 WHEN d.account IS NOT NULL THEN 'available'
                 WHEN EXISTS (
                     SELECT 1 FROM pending_details p
@@ -129,22 +244,96 @@ class RecordReader:
                     WHERE u.account = m.account AND u.kind = m.kind AND u.match_key = m.match_key
                 ) THEN 'unavailable'
                 ELSE 'unresolved'
-            END AS detail_state,
-            c.genre,
-            c.analysis_set,
-            json_extract(d.json_text, '$.playedTime') AS played_time,
-            c.rule_raw
+            END"""
+        return """CASE
+                WHEN d.account IS NOT NULL THEN 'available'
+                ELSE 'unresolved'
+            END"""
+
+    def list_matches(
+        self,
+        account: str,
+        *,
+        kind: Optional[str] = None,
+        analysis_set: Optional[str] = None,
+        rule_raw: Optional[str] = None,
+        played_from: Optional[str] = None,
+        played_to: Optional[str] = None,
+        weapon: Optional[str] = None,
+        tag: Optional[str] = None,
+        query: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """対戦・バイトの一覧を取得する。
+
+        母集合は matches であり、documents と match_classification を
+        LEFT JOIN する（documents は response_id/account/kind/match_key、
+        match_classification は account/kind/match_key 完全一致）。
+        絞り込みが無いときは詳細なし/未分類も残す。
+        期間は詳細の playedTime だけで、first_seen では代用しない。
+        ブキは対戦詳細の自分の weapon.name だけを見る。
+        順序は kind ASC, match_key ASC（同じ read snapshot 内で安定）。
+        件数は絞り込み後の matches 数であり成績集計ではない。
+        list では body を読み込まない。
+
+        Args:
+            account: 空でない str 必須。
+            kind: None, 'vs', 'coop' のみ。
+            analysis_set: None、モード名、または分類行が無いことを示す unclassified。
+            rule_raw: None またはルール記号。
+            played_from, played_to: None または YYYY-MM-DDTHH:MM:SSZ。
+            weapon, tag, query: None または 1..80 文字。制御文字は拒否する。
+            limit: bool 以外の int 1..200。
+            offset: bool 以外の int >= 0。
+
+        Returns:
+            {'total': 件数, 'limit': limit, 'offset': offset, 'items': [...]}
+        """
+        self._check_active()
+        where_sql, params = self._list_constraints(
+            account, kind, analysis_set, rule_raw, played_from, played_to,
+            weapon, tag, query, limit, offset,
+        )
+        db = self._store.db
+        joined = """
         FROM matches m
         LEFT JOIN documents d
             ON d.response_id = m.detail_response_id AND d.account = m.account AND d.kind = m.kind AND d.match_key = m.match_key
         LEFT JOIN match_classification c
             ON c.account = m.account AND c.kind = m.kind AND c.match_key = m.match_key
+        """
+        total_row = db.execute(f"SELECT count(*) {joined} WHERE {where_sql}", params).fetchone()
+        total = total_row[0] if total_row else 0
+
+        # 一覧の取得
+        # detail_state の判定:
+        # - canonical 詳細あり時のみ available
+        # - jobs 由来のビューがあるときだけ pending / unavailable
+        # - 派生ファイルにはそのビューが無いので、詳細行が無ければ unresolved
+        # played_time は詳細 playedTime のみ、first_seen による代用禁止
+        # rule_raw / classification は LEFT JOIN 結果、未分類を unknown/hold に推論変換しない
+        query = f"""
+        SELECT
+            m.account,
+            m.kind,
+            m.match_key,
+            m.first_seen,
+            m.last_seen,
+            m.detail_response_id,
+            {self._detail_state_sql()} AS detail_state,
+            c.genre,
+            c.analysis_set,
+            json_extract(d.json_text, '$.playedTime') AS played_time,
+            c.rule_raw
+        {joined}
         WHERE {where_sql}
         ORDER BY m.kind ASC, m.match_key ASC
         LIMIT ? OFFSET ?
         """
         list_params = params + [limit, offset]
         rows = db.execute(query, list_params).fetchall()
+        tags = self._tags_by_match(account, [r["match_key"] for r in rows])
 
         items = []
         for r in rows:
@@ -160,6 +349,7 @@ class RecordReader:
                 "analysis_set": r["analysis_set"],
                 "played_time": r["played_time"],
                 "rule_raw": r["rule_raw"],
+                "tags": tags.get(r["match_key"], []),
             })
 
         return {
@@ -203,7 +393,7 @@ class RecordReader:
 
         db = self._store.db
 
-        query = """
+        query = f"""
         SELECT
             m.account,
             m.kind,
@@ -211,18 +401,7 @@ class RecordReader:
             m.first_seen,
             m.last_seen,
             m.detail_response_id,
-            CASE
-                WHEN d.account IS NOT NULL THEN 'available'
-                WHEN EXISTS (
-                    SELECT 1 FROM pending_details p
-                    WHERE p.account = m.account AND p.kind = m.kind AND p.match_key = m.match_key
-                ) THEN 'pending'
-                WHEN EXISTS (
-                    SELECT 1 FROM unavailable_details u
-                    WHERE u.account = m.account AND u.kind = m.kind AND u.match_key = m.match_key
-                ) THEN 'unavailable'
-                ELSE 'unresolved'
-            END AS detail_state,
+            {self._detail_state_sql()} AS detail_state,
             c.genre,
             c.analysis_set,
             json_extract(d.json_text, '$.playedTime') AS played_time,
@@ -257,46 +436,50 @@ class RecordReader:
                 )
             detail_json = canonical_doc
 
-            # source の取得: canonical detail_response_id の responses JOIN bodies から取得
-            # body_bytes は bytes で一字も再 serialize しない。
-            # ヘッダー/認証データは返さない。
-            # 未知項目/数値表記の正典は body_bytes。
-            source_query = """
-            SELECT
-                r.id AS response_id,
-                r.operation,
-                r.fetched_at,
-                r.query_id,
-                r.app_version,
-                r.http_status,
-                r.body_sha256,
-                b.body AS body_bytes
-            FROM responses r
-            LEFT JOIN bodies b ON b.sha256 = r.body_sha256
-            WHERE r.id = ?
-            """
-            source_row = db.execute(source_query, (detail_response_id,)).fetchone()
-            if not source_row:
-                raise RuntimeError(
-                    f"Corrupt record: response {detail_response_id} not found for match "
-                    f"({account}, {kind}, {match_key})"
-                )
-            if source_row["body_bytes"] is None:
-                raise RuntimeError(
-                    f"Corrupt record: body BLOB missing for response {detail_response_id} "
-                    f"(body_sha256={source_row['body_sha256']})"
-                )
+            # 応答原文は全情報archiveから返す。旧partial sliceはStore入口で拒否する。
+            # responsesがあるschemaで応答またはBLOBが欠ければ破損として扱う。
+            has_responses = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='responses'"
+            ).fetchone()
+            if not has_responses:
+                source = None
+            else:
+                source_query = """
+                SELECT
+                    r.id AS response_id,
+                    r.operation,
+                    r.fetched_at,
+                    r.query_id,
+                    r.app_version,
+                    r.http_status,
+                    r.body_sha256,
+                    b.body AS body_bytes
+                FROM responses r
+                LEFT JOIN bodies b ON b.sha256 = r.body_sha256
+                WHERE r.id = ?
+                """
+                source_row = db.execute(source_query, (detail_response_id,)).fetchone()
+                if not source_row:
+                    raise RuntimeError(
+                        f"Corrupt record: response {detail_response_id} not found for match "
+                        f"({account}, {kind}, {match_key})"
+                    )
+                if source_row["body_bytes"] is None:
+                    raise RuntimeError(
+                        f"Corrupt record: body BLOB missing for response {detail_response_id} "
+                        f"(body_sha256={source_row['body_sha256']})"
+                    )
 
-            source = {
-                "response_id": source_row["response_id"],
-                "operation": source_row["operation"],
-                "fetched_at": source_row["fetched_at"],
-                "query_id": source_row["query_id"],
-                "app_version": source_row["app_version"],
-                "http_status": source_row["http_status"],
-                "body_sha256": source_row["body_sha256"],
-                "body_bytes": source_row["body_bytes"],
-            }
+                source = {
+                    "response_id": source_row["response_id"],
+                    "operation": source_row["operation"],
+                    "fetched_at": source_row["fetched_at"],
+                    "query_id": source_row["query_id"],
+                    "app_version": source_row["app_version"],
+                    "http_status": source_row["http_status"],
+                    "body_sha256": source_row["body_sha256"],
+                    "body_bytes": source_row["body_bytes"],
+                }
 
         return {
             "account": row["account"],
@@ -312,4 +495,268 @@ class RecordReader:
             "rule_raw": row["rule_raw"],
             "detail_json": detail_json,
             "source": source,
+            "tags": self._tags_by_match(account, [match_key]).get(match_key, []),
         }
+
+    def tag_target(self, account: str, match_key: str) -> Optional[Dict[str, Any]]:
+        """タグを付けてよいか判定するための分類と、現在のタグだけを返す。
+
+        本文BLOBは読まない。試合が無ければ None。
+        """
+        self._check_active()
+        if not isinstance(account, str) or not account:
+            raise ValueError("account must be a non-empty string")
+        if not isinstance(match_key, str) or not match_key:
+            raise ValueError("match_key must be a non-empty string")
+        rows = self._store.db.execute(
+            '''SELECT m.kind, c.genre, c.analysis_set
+               FROM matches m
+               LEFT JOIN match_classification c
+                 ON c.account=m.account AND c.kind=m.kind AND c.match_key=m.match_key
+               WHERE m.account=? AND m.match_key=?
+               ORDER BY m.kind''',
+            (account, match_key)).fetchall()
+        if not rows:
+            return None
+        return {
+            "items": [
+                {"kind": row["kind"], "genre": row["genre"], "analysis_set": row["analysis_set"]}
+                for row in rows
+            ],
+            "tags": self._tags_by_match(account, [match_key]).get(match_key, []),
+        }
+
+    def list_facets(self, account: str) -> Dict[str, Any]:
+        """一覧の絞り込みに使う、そのアカウントの観測値を返す。
+
+        ジャンルは既知のモードと unclassified を固定順で出し、観測だけにある名前を後ろに足す。
+        ルール、自分のブキ名、タグは観測されたものだけを返す。他アカウントは混ぜない。
+        本文BLOBは読まない。
+        """
+        self._check_active()
+        if not isinstance(account, str) or not account:
+            raise ValueError("account must be a non-empty string")
+        db = self._store.db
+        observed = {
+            row[0] for row in db.execute(
+                """SELECT DISTINCT analysis_set FROM match_classification
+                   WHERE account=? AND analysis_set IS NOT NULL""",
+                (account,),
+            )
+        }
+        ordered = list(dict.fromkeys([*MODE_SLICES, UNCLASSIFIED]))
+        analysis_sets = [*ordered, *sorted(observed - set(ordered))]
+        rules = [
+            row[0] for row in db.execute(
+                """SELECT DISTINCT rule_raw FROM match_classification
+                   WHERE account=? AND rule_raw IS NOT NULL AND rule_raw != ''
+                   ORDER BY rule_raw""",
+                (account,),
+            )
+        ]
+        weapons = [
+            row[0] for row in db.execute(
+                """SELECT DISTINCT weapon FROM battle_players
+                   WHERE account=? AND is_myself=1 AND weapon IS NOT NULL AND weapon != ''
+                   ORDER BY weapon""",
+                (account,),
+            )
+        ]
+        tags = [
+            row[0] for row in db.execute(
+                """SELECT DISTINCT tag FROM match_tags
+                   WHERE account=? ORDER BY tag""",
+                (account,),
+            )
+        ]
+        return {
+            "analysis_sets": analysis_sets,
+            "rules": rules,
+            "weapons": weapons,
+            "tags": tags,
+        }
+
+    def tag_summary(self, account: str) -> Dict[str, Any]:
+        """オープンとプラベの人数区分ごとに、タグの付いた試合数を返す。
+
+        区分をまたいだ合計は作らない。タグが複数ある試合はタグごとに数える。
+        タグの有無で analysis_set は動かさない。本文BLOBは読まない。
+        """
+        self._check_active()
+        if not isinstance(account, str) or not account:
+            raise ValueError("account must be a non-empty string")
+        db = self._store.db
+        placeholders = ",".join("?" * len(TAG_SUMMARY_SETS))
+        params = (account, *TAG_SUMMARY_SETS)
+        match_counts = {
+            row[0]: row[1]
+            for row in db.execute(
+                f"""SELECT analysis_set, count(*)
+                    FROM match_classification
+                    WHERE account=? AND analysis_set IN ({placeholders})
+                    GROUP BY analysis_set""",
+                params,
+            )
+        }
+        untagged_counts = {
+            row[0]: row[1]
+            for row in db.execute(
+                f"""SELECT c.analysis_set, count(*)
+                    FROM match_classification c
+                    WHERE c.account=? AND c.analysis_set IN ({placeholders})
+                    AND NOT EXISTS (
+                        SELECT 1 FROM match_tags t
+                        WHERE t.account=c.account AND t.match_key=c.match_key
+                    )
+                    GROUP BY c.analysis_set""",
+                params,
+            )
+        }
+        grouped = {name: [] for name in TAG_SUMMARY_SETS}
+        for analysis_set, tag, count in db.execute(
+            f"""SELECT c.analysis_set, t.tag, count(*)
+                FROM match_classification c
+                JOIN match_tags t
+                  ON t.account=c.account AND t.match_key=c.match_key
+                WHERE c.account=? AND c.analysis_set IN ({placeholders})
+                GROUP BY c.analysis_set, t.tag
+                ORDER BY c.analysis_set, t.tag""",
+            params,
+        ):
+            grouped[analysis_set].append({"tag": tag, "matches": count})
+        return {
+            "sets": [
+                {
+                    "analysis_set": name,
+                    "matches": match_counts.get(name, 0),
+                    "untagged": untagged_counts.get(name, 0),
+                    "tags": grouped[name],
+                }
+                for name in TAG_SUMMARY_SETS
+            ]
+        }
+
+    def rule_results(self, account: str) -> Dict[str, Any]:
+        """対戦の区分ごとに、ルール別の勝敗を返す。
+
+        件数は analysis_*_by_rule のまま使う。区分とルールをまたいだ合計は作らない。
+        バイトの納品数は勝敗に入れない。本文BLOBは読まない。
+        """
+        self._check_active()
+        if not isinstance(account, str) or not account:
+            raise ValueError("account must be a non-empty string")
+        db = self._store.db
+        present = {
+            row[0]
+            for row in db.execute("SELECT name FROM sqlite_master WHERE type='view'")
+        }
+        sets = []
+        for name in JUDGEMENT_SETS:
+            view = f"analysis_{name}_by_rule"
+            if not _VIEW_NAME.fullmatch(view) or view not in present:
+                raise ValueError("MISSING_ANALYSIS_VIEW")
+            rules = []
+            for row in db.execute(
+                f"""SELECT rule_raw, rule_name, matches, wins, losses, draws, other_judgements
+                    FROM {view} WHERE account=?""",
+                (account,),
+            ):
+                rules.append({
+                    "rule_raw": row[0],
+                    "rule_name": row[1],
+                    "matches": _whole_count(row[2]),
+                    "wins": _whole_count(row[3]),
+                    "losses": _whole_count(row[4]),
+                    "draws": _whole_count(row[5]),
+                    "other": _whole_count(row[6]),
+                })
+            rules.sort(key=lambda item: (
+                rule_sort_index(item["rule_raw"] or ""),
+                item["rule_raw"] or "",
+                item["rule_name"] or "",
+            ))
+            sets.append({"analysis_set": name, "rules": rules})
+        return {"sets": sets}
+
+    def rate_summary(self, account: str) -> Dict[str, Any]:
+        """rate_points の系列ごとに、最新・増減・最低・最高・点数と、時系列の点を返す。
+
+        アカウント、区分、ルール、系列を混ぜない。勝敗から値を作らない。
+        正本の値は変えず、キケン度も比率のまま返す。点の時刻が文字列でも空でもないときは空にする。
+        本文BLOBは読まない。
+        """
+        self._check_active()
+        if not isinstance(account, str) or not account:
+            raise ValueError("account must be a non-empty string")
+        grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+        meta: Dict[tuple, Dict[str, Any]] = {}
+        rows = self._store.db.execute(
+            """SELECT series_id, label, genre, rule_raw, source, priority, played_time, value
+               FROM rate_points
+               WHERE account=?
+               ORDER BY series_id, genre, rule_raw, label, source, priority, played_time, match_key""",
+            (account,),
+        )
+        for series_id, label, genre, rule_raw, source, priority, played_time, value in rows:
+            if _rate_hidden(series_id, label, source):
+                continue
+            number = _finite_number(value)
+            if number is None:
+                continue
+            if isinstance(played_time, str) or played_time is None:
+                played = played_time
+            else:
+                played = None
+            key = (series_id, label, genre, rule_raw, source, priority)
+            grouped.setdefault(key, []).append({"played_time": played, "value": number})
+            meta.setdefault(key, {
+                "series_id": series_id,
+                "label": label,
+                "genre": genre,
+                "rule_raw": rule_raw,
+                "source": source,
+                "priority": priority,
+            })
+        series = []
+        for key, points in grouped.items():
+            item = dict(meta[key])
+            values = [point["value"] for point in points]
+            latest = values[-1]
+            previous = values[-2] if len(values) >= 2 else None
+            item.update({
+                "unit": _rate_unit(item["series_id"], item["label"]),
+                "count": len(values),
+                "latest": latest,
+                "previous": previous,
+                "delta": None if previous is None else latest - previous,
+                "minimum": min(values),
+                "maximum": max(values),
+                "points": points,
+            })
+            series.append(item)
+        series.sort(key=lambda item: (
+            genre_sort_index(item["genre"] or ""),
+            rule_sort_index(item["rule_raw"] or ""),
+            item["label"] or "",
+            item["series_id"] or "",
+        ))
+        return {"series": series}
+
+    def _tags_by_match(self, account: str, match_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {key: [] for key in match_keys}
+        if not match_keys:
+            return grouped
+        placeholders = ",".join("?" * len(match_keys))
+        rows = self._store.db.execute(
+            f'''SELECT match_key, tag, note, created_at, updated_at
+                FROM match_tags WHERE account=? AND match_key IN ({placeholders})
+                ORDER BY match_key, tag''',
+            [account, *match_keys]).fetchall()
+        for row in rows:
+            grouped.setdefault(row["match_key"], []).append({
+                "tag": row["tag"],
+                "note": row["note"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            })
+        return grouped

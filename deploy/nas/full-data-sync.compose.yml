@@ -1,0 +1,73 @@
+services:
+  full-data-sync:
+    image: "${IKARING_FULL_SYNC_IMAGE:?Set an existing collector image reference}"
+    pull_policy: never
+    container_name: ikaring-archive-full-data-sync
+    user: "${IKARING_FULL_SYNC_UID:-1000}:${IKARING_FULL_SYNC_GID:-10}"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 300s
+    entrypoint: ["python3"]
+    command:
+      - -u
+      - "${IKARING_FULL_SYNC_CODE_DIR:?Set an absolute code directory}/scripts/full_data_delta_worker.py"
+      - --db
+      - "${IKARING_FULL_SYNC_DATABASE_DIR:?Set an absolute database directory}/archive.sqlite3"
+      - --baseline
+      - "${IKARING_FULL_SYNC_BASELINE_FILE:?Set the existing immutable baseline file}"
+      - --baseline-manifest
+      - "${IKARING_FULL_SYNC_BASELINE_MANIFEST:?Set the existing baseline manifest}"
+      - --baseline-generation-id
+      - "${IKARING_FULL_SYNC_BASELINE_GENERATION_ID:?Set the verified baseline generation ID}"
+      - --work-dir
+      - "${IKARING_FULL_SYNC_DELTA_DIR:?Set an absolute delta work directory}"
+      - --state-dir
+      - "${IKARING_FULL_SYNC_STATE_DIR:?Set an absolute private state directory}"
+      - --remote
+      - ikaring_exports:database
+      - --rclone-bin
+      - "${IKARING_FULL_SYNC_CODE_DIR:?Set an absolute code directory}/bin/rclone"
+      - --initial-generation-id
+      - "${IKARING_FULL_SYNC_INITIAL_GENERATION_ID:?Set the existing initial reconciliation generation ID}"
+      - --watch
+      - --interval
+      - "${IKARING_FULL_SYNC_INTERVAL:-30}"
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      IKARING_ARCHIVE_DRIVE_FOLDER_CACHE: "1"
+      TZ: Asia/Tokyo
+      RCLONE_CONFIG: "${IKARING_FULL_SYNC_RCLONE_CONFIG_DIR:?Set an absolute rclone config directory}/rclone.conf"
+    volumes:
+      - type: bind
+        source: "${IKARING_FULL_SYNC_CODE_DIR:?Set an absolute code directory}"
+        target: "${IKARING_FULL_SYNC_CODE_DIR:?Set an absolute code directory}"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${IKARING_FULL_SYNC_DATABASE_DIR:?Set an absolute database directory}"
+        target: "${IKARING_FULL_SYNC_DATABASE_DIR:?Set an absolute database directory}"
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${IKARING_FULL_SYNC_SNAPSHOT_DIR:?Set an absolute baseline snapshot directory}"
+        target: "${IKARING_FULL_SYNC_SNAPSHOT_DIR:?Set an absolute baseline snapshot directory}"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${IKARING_FULL_SYNC_DELTA_DIR:?Set an absolute delta work directory}"
+        target: "${IKARING_FULL_SYNC_DELTA_DIR:?Set an absolute delta work directory}"
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${IKARING_FULL_SYNC_STATE_DIR:?Set an absolute private state directory}"
+        target: "${IKARING_FULL_SYNC_STATE_DIR:?Set an absolute private state directory}"
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${IKARING_FULL_SYNC_RCLONE_CONFIG_DIR:?Set an absolute rclone config directory}"
+        target: "${IKARING_FULL_SYNC_RCLONE_CONFIG_DIR:?Set an absolute rclone config directory}"
+        bind:
+          create_host_path: false

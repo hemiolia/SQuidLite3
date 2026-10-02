@@ -15,10 +15,12 @@ else:
     from data_root import client_mode, data_root, marker_path
 
 REMOTE_DB='/data/database/archive.sqlite3'
-REMOTE_EXPORTS={'gui':'/data/exports/gui/index.html','export-xlsx':'/data/exports/分析.xlsx'}
-LOCAL_EXPORTS={'gui':Path('gui/index.html'),'export-xlsx':Path('分析.xlsx')}
-FORWARDED={'status','audit','verify','sql','tag','sync','records'}
+REMOTE_EXPORTS={'gui':'/data/exports/gui/index.html'}
+LOCAL_EXPORTS={'gui':Path('gui/index.html')}
+FORWARDED={'status','audit','verify','sql','tag','sync','records','slice-export','slice-list'}
 BLOCKED={'backup','import','export','install-service','login','watch'}
+SLICE_DESTINATION='/data/database/slices'
+DATASET_RE=re.compile(r'(?:unified|mode:[a-z0-9_]{1,64}|rule:[a-z0-9_]{1,64}:[A-Za-z0-9_]{1,64})\Z')
 
 def read_marker():
     path=marker_path(data_root())
@@ -40,8 +42,26 @@ def ssh_command(marker, container_args):
     remote=shlex.join(['docker','exec','-i',marker['container'],*container_args])
     return ['ssh','-o','BatchMode=yes',marker['ssh_host'],remote]
 
-def archive_command(marker, command, args):
-    return ssh_command(marker,['python3','/app/archive.py','--db',marker['database'],command,*args])
+def dataset_database(root_database, token='unified'):
+    """固定の名前から、正本か既知の派生ファイルのパスを組み立てる。token はパスではない。"""
+    if not isinstance(root_database, str) or not isinstance(token, str) or not DATASET_RE.fullmatch(token):
+        raise ValueError('DATASET_TOKEN_INVALID')
+    if token=='unified':
+        return root_database
+    parent, sep, name=root_database.rpartition('/')
+    if not sep or not parent or not name or name in ('.','..') or parent.startswith('/') and '/../' in f'/{parent}/':
+        raise ValueError('DATASET_TOKEN_INVALID')
+    kind, _, rest=token.partition(':')
+    if kind=='mode':
+        return f'{parent}/slices/by-mode/{rest}.sqlite3'
+    mode, _, rule=rest.partition(':')
+    return f'{parent}/slices/by-rule/{mode}__{rule}.sqlite3'
+
+def archive_command(marker, command, args, dataset='unified'):
+    if marker.get('database')!=REMOTE_DB:
+        raise ValueError('NAS_STORAGE_MARKER_MISSING_OR_INVALID')
+    database=dataset_database(marker['database'], dataset)
+    return ssh_command(marker,['python3','/app/archive.py','--db',database,command,*args])
 
 def copy_remote_export(marker, remote_path, destination):
     destination.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -68,11 +88,21 @@ def main(argv=None):
     command=parsed.command
     args=list(parsed.args)
     no_open=parsed.no_open
+    if command=='export-xlsx':
+        print('LEGACY_ANALYSIS_XLSX_RETIRED; use the full-data export workflow', file=sys.stderr)
+        return 4
     if command=='gui' and '--no-open' in args:
         args.remove('--no-open')
         no_open=True
     if command in BLOCKED:
         parser.error(command+' requires a separate NAS path or daemon procedure and is not supported here')
+    if command=='slice-export':
+        if args:
+            parser.error('slice-export writes only to the NAS database/slices directory and accepts no path')
+        args=[SLICE_DESTINATION]
+    if command=='slice-list':
+        if args:
+            parser.error('slice-list accepts no path')
     if command not in FORWARDED|set(REMOTE_EXPORTS):parser.error('unsupported command: '+command)
     if command in REMOTE_EXPORTS and args:parser.error(command+' accepts no destination or other arguments')
     if command!='gui' and no_open:parser.error('--no-open applies only to gui')

@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -101,6 +103,54 @@ class NasRoutingTests(unittest.TestCase):
             self.assertEqual(nas_archive.main(['gui','--no-open']),23)
         self.assertEqual(dest.read_bytes(),b'<html>new</html>')
         self.assertFalse(list(dest.parent.glob('.*.tmp')))
+
+    def test_retired_xlsx_route_never_starts_ssh_or_changes_local_file(self):
+        destination=self.root/'分析.xlsx'
+        destination.write_bytes(b'legacy workbook bytes remain untouched')
+        destination.chmod(0o640)
+        before=(destination.read_bytes(),destination.stat().st_mode&0o777,destination.stat().st_mtime_ns)
+        old_cwd=Path.cwd()
+        stdout,stderr=io.StringIO(),io.StringIO()
+        try:
+            os.chdir(self.root)
+            with patch.object(nas_archive.subprocess,'run') as run, \
+                 contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+                code=nas_archive.main(['export-xlsx'])
+            run.assert_not_called()
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(code,4)
+        self.assertEqual(stdout.getvalue(),'')
+        self.assertIn('LEGACY_ANALYSIS_XLSX_RETIRED',stderr.getvalue())
+        self.assertEqual((destination.read_bytes(),destination.stat().st_mode&0o777,destination.stat().st_mtime_ns),before)
+
+    def test_slice_export_uses_only_the_nas_slices_directory(self):
+        calls=[]
+        def run(command,**kwargs):
+            calls.append(command)
+            return type('Result',(),{'returncode':0})()
+        with patch.object(nas_archive.subprocess,'run',side_effect=run):
+            self.assertEqual(nas_archive.main(['slice-export']),0)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(shlex.split(calls[0][4])[-2:],['slice-export','/data/database/slices'])
+        with patch.object(nas_archive.subprocess,'run') as run:
+            with self.assertRaises(SystemExit):
+                nas_archive.main(['slice-export','/tmp/elsewhere'])
+            run.assert_not_called()
+
+    def test_slice_list_accepts_no_path(self):
+        calls=[]
+        def run(command,**kwargs):
+            calls.append(command)
+            return type('Result',(),{'returncode':0})()
+        with patch.object(nas_archive.subprocess,'run',side_effect=run):
+            self.assertEqual(nas_archive.main(['slice-list']),0)
+        remote=shlex.split(calls[0][4])
+        self.assertEqual(remote[-3:],['--db','/data/database/archive.sqlite3','slice-list'])
+        with patch.object(nas_archive.subprocess,'run') as run:
+            with self.assertRaises(SystemExit):
+                nas_archive.main(['slice-list','/tmp/elsewhere'])
+            run.assert_not_called()
 
     def test_blocked_path_commands_never_start_ssh(self):
         with patch.object(nas_archive.subprocess,'run') as run:

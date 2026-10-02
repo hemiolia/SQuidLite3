@@ -31,7 +31,7 @@ docker run \
   --user 1000:10 \
   --cap-drop ALL \
   --security-opt no-new-privileges \
-  -v "${ROOT_DIR}/database:/database:ro" \
+  -v "${ROOT_DIR}/database:/database:rw" \
   -v "${BACKUP_DIR}:/backups:rw" \
   -v "${ROOT_DIR}/secrets/backup:/secrets:rw" \
   -e RCLONE_CONFIG=/secrets/rclone-write.conf \

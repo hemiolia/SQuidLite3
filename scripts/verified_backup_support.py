@@ -2,6 +2,7 @@
 """Standard library support utilities for verified backup and upload scripts."""
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -12,6 +13,177 @@ import sqlite3
 import sys
 import tempfile
 import urllib.parse
+import uuid
+
+
+def cmd_plaintext_snapshot(args: argparse.Namespace) -> int:
+    """Create a full plaintext SQLite snapshot and a manifest. Does not encrypt."""
+    db_path = pathlib.Path(args.db_path).resolve()
+    backup_dir = pathlib.Path(args.backup_dir).resolve()
+    if not db_path.is_file():
+        sys.stderr.write(f"Error: Database file does not exist: {db_path}\n")
+        return 1
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    uri = f"file:{urllib.parse.quote(str(db_path))}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        page_count = int(conn.execute("PRAGMA page_count;").fetchone()[0] or 0)
+        page_size = int(conn.execute("PRAGMA page_size;").fetchone()[0] or 0)
+        conn.close()
+    except Exception as e:
+        sys.stderr.write(f"Error: Failed to query source database PRAGMA ({db_path}): {e}\n")
+        return 1
+
+    db_bytes = page_count * page_size
+    required = db_bytes + (1024 * 1024 * 1024)
+    free_bytes = shutil.disk_usage(backup_dir).free
+    if free_bytes < required:
+        sys.stderr.write(
+            f"Error: Insufficient free space in {backup_dir}: "
+            f"required {required} bytes ({db_bytes} + 1GiB), available {free_bytes} bytes\n"
+        )
+        return 1
+
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    raw_name = f"archive_{stamp}_{uuid.uuid4().hex}.sqlite3"
+    partial = backup_dir / f".{raw_name}.partial"
+    final = backup_dir / raw_name
+    manifest_final = backup_dir / f"{raw_name}.manifest.json"
+    manifest_partial = backup_dir / f".{raw_name}.manifest.json.partial"
+    if final.exists() or manifest_final.exists():
+        sys.stderr.write(f"Error: Destination already exists: {raw_name}\n")
+        return 1
+
+    src = None
+    dst = None
+    try:
+        src = sqlite3.connect(uri, uri=True)
+        src.execute("PRAGMA busy_timeout=60000;")
+        # Pin a read transaction before copying. In WAL mode this keeps the
+        # snapshot stable while allowing the collector to commit newer rows;
+        # backup steps do not restart against those newer commits. A writer
+        # reservation would block collection for the entire large DB copy.
+        src.execute("BEGIN;")
+        capture_started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # A read-only URI does not load the pager until a statement runs.
+        # Without this, backup() reports total=0 and would write an empty file.
+        seen_pages = int(src.execute("PRAGMA page_count;").fetchone()[0] or 0)
+        if seen_pages <= 0:
+            raise RuntimeError(
+                f"Source database page_count is {seen_pages}; refusing an empty snapshot"
+            )
+        captured_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        sys.stderr.write(f"snapshot_source_pages {seen_pages}\n")
+        sys.stderr.flush()
+        dst = sqlite3.connect(str(partial))
+        steps = {"n": 0}
+
+        def _progress(status, remaining, total):
+            del status
+            if total <= 0:
+                raise RuntimeError(f"SQLite backup reported no pages (total={total})")
+            steps["n"] += 1
+            if remaining == 0 or steps["n"] % 16 == 0:
+                sys.stderr.write(
+                    f"snapshot_progress remaining={remaining} total={total}\n"
+                )
+                sys.stderr.flush()
+
+        sys.stderr.write("snapshot_phase copy\n")
+        sys.stderr.flush()
+        src.backup(dst, pages=-1, progress=_progress, sleep=0)
+        dst.close()
+        dst = None
+        src.rollback()
+        src.close()
+        src = None
+        sys.stderr.write("snapshot_phase copy_done\n")
+        sys.stderr.flush()
+
+        sync_fd = os.open(partial, os.O_RDONLY)
+        try:
+            os.fsync(sync_fd)
+        finally:
+            os.close(sync_fd)
+
+        sys.stderr.write("snapshot_phase quick_check\n")
+        sys.stderr.flush()
+        chk = sqlite3.connect(f"file:{urllib.parse.quote(str(partial))}?mode=ro", uri=True)
+        chk.execute("PRAGMA cache_size=-65536;")
+        res = chk.execute("PRAGMA quick_check;").fetchall()
+        chk.close()
+        if len(res) != 1 or res[0][0] != "ok":
+            sys.stderr.write(f"Error: SQLite quick_check returned unexpected result: {res}\n")
+            return 1
+
+        with open(partial, "rb") as handle:
+            header = handle.read(16)
+        if header != b"SQLite format 3\x00":
+            sys.stderr.write("Error: Snapshot header is not SQLite format 3\n")
+            return 1
+
+        sys.stderr.write("snapshot_phase sha256\n")
+        sys.stderr.flush()
+        digest = hashlib.sha256()
+        size = 0
+        with open(partial, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1048576), b""):
+                digest.update(chunk)
+                size += len(chunk)
+        os.replace(partial, final)
+        manifest = {
+            "capture_started_at": capture_started,
+            "captured_at": captured_at,
+            "captured_at_kind": "pinned_read_transaction",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "storage": "plaintext",
+            "encryption": None,
+            "raw_snapshot": {
+                "basename": final.name,
+                "bytes": size,
+                "sha256": digest.hexdigest(),
+                "quick_check": "ok",
+            },
+            "verification": {
+                "sha256_match": True,
+                "quick_check": "ok",
+                "plaintext": True,
+            },
+        }
+        manifest_partial.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        os.replace(manifest_partial, manifest_final)
+    except Exception as e:
+        sys.stderr.write(f"Error: Plaintext snapshot failed: {e}\n")
+        return 1
+    finally:
+        if dst is not None:
+            try:
+                dst.close()
+            except Exception:
+                pass
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                pass
+        if partial.exists():
+            try:
+                partial.unlink()
+            except Exception:
+                pass
+        if manifest_partial.exists():
+            try:
+                manifest_partial.unlink()
+            except Exception:
+                pass
+
+    sys.stdout.write(json.dumps({
+        "status": "ok",
+        "raw_path": str(final),
+        "manifest_path": str(manifest_final),
+    }) + "\n")
+    return 0
 
 
 def cmd_check_space(args: argparse.Namespace) -> int:
@@ -312,6 +484,11 @@ def cmd_json_output(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verified backup support helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_plain = subparsers.add_parser("plaintext-snapshot")
+    p_plain.add_argument("db_path")
+    p_plain.add_argument("backup_dir")
+    p_plain.set_defaults(func=cmd_plaintext_snapshot)
 
     # check-space
     p_space = subparsers.add_parser("check-space")

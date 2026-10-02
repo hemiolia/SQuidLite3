@@ -1,4 +1,5 @@
 import argparse
+from contextlib import closing
 import importlib.util
 import io
 import json
@@ -29,6 +30,17 @@ class ResilienceTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_authoritative_writer_records_replace_implicit_deletions(self):
+        from ikarchive.change_feed import install_change_feed
+        self.store.db.execute('CREATE TABLE replace_source(value TEXT UNIQUE)')
+        self.store.db.execute("INSERT INTO replace_source(rowid,value) VALUES(-8,'original')")
+        self.store.db.commit()
+        install_change_feed(self.store.db)
+        self.store.db.execute("INSERT OR REPLACE INTO replace_source(rowid,value) VALUES(12,'original')")
+        operations = [tuple(row) for row in self.store.db.execute(
+            "SELECT operation,old_rowid,new_rowid FROM archive_change_feed WHERE table_name='replace_source' ORDER BY event_id")]
+        self.assertEqual(operations, [('DELETE', -8, None), ('INSERT', None, 12)])
+
     def test_storage_critical_blocks_sync_without_initializing_bridge(self):
         """1. storage_healthをcriticalへモックするとsyncがSTORAGE_CRITICALで失敗し、
         Bridgeは初期化されずrun blocked/error記録、auth.reauth_requiredはfalse、last_sync_errorがSTORAGE_CRITICAL。"""
@@ -46,6 +58,7 @@ class ResilienceTests(unittest.TestCase):
         auth = self.store.auth_status()
         self.assertFalse(auth['reauth_required'])
         self.assertEqual(auth['last_sync_error'], 'STORAGE_CRITICAL')
+        self.assertRegex(auth['last_sync_error_at'], r'^\d{4}-\d{2}-\d{2}T')
 
     def test_storage_low_defers_non_history_queries_and_resumes_when_normal(self):
         """2. lowへモック、manifest RegularBattleHistoriesQueryとHistoryRecordQueryの2つ（test_autosync.py参照）。
@@ -204,6 +217,54 @@ class ResilienceTests(unittest.TestCase):
             pending_count = self.store.db.execute("SELECT count(*) FROM assets WHERE state='pending'").fetchone()[0]
             self.assertEqual(pending_count, 3)
 
+    def test_expired_signed_url_is_not_requested(self):
+        bucket = 'ugcstore-toyohr-lp1-persistent'
+        clock = 1_700_000_000
+        expired = f'https://storage.googleapis.com/{bucket}/old?Expires=1&GoogleAccessId=a&Signature=b'
+        fresh = f'https://storage.googleapis.com/{bucket}/new?Expires=4102444800&GoogleAccessId=a&Signature=b'
+        blocked = 'https://storage.googleapis.com/other-bucket/photo?Expires=1'
+        class FakeResponse:
+            def __init__(self):
+                self.headers = {'content-type': 'image/png'}
+            def read(self):
+                return b'png'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        class FakeOpener:
+            def __init__(self):
+                self.opened = []
+            def open(self, url, timeout=45):
+                self.opened.append(url)
+                return FakeResponse()
+        opener = FakeOpener()
+        with self.store.db:
+            for url in (expired, fresh, blocked):
+                self.store.db.execute("INSERT INTO assets(url, state, next_attempt) VALUES(?, 'pending', 0)", (url,))
+        with patch('ikarchive.collector.urllib.request.build_opener', return_value=opener), \
+             patch('ikarchive.collector.storage_health', return_value={'state': 'normal'}), \
+             patch('ikarchive.collector.time.time', return_value=clock):
+            started = time.monotonic()
+            attempted = fetch_assets(self.store, budget=10, delay=0)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(attempted, 3)
+        self.assertEqual(opener.opened, [fresh])
+        rows = {
+            row['url']: row
+            for row in self.store.db.execute('SELECT url, state, attempts, next_attempt, last_error FROM assets')
+        }
+        self.assertEqual(rows[expired]['state'], 'retry')
+        self.assertEqual(rows[expired]['last_error'], 'AssetUrlExpired')
+        self.assertEqual(rows[expired]['attempts'], 1)
+        self.assertEqual(rows[expired]['next_attempt'], clock + 86400)
+        self.assertEqual(rows[fresh]['state'], 'done')
+        self.assertIsNone(rows[fresh]['last_error'])
+        self.assertEqual(rows[blocked]['state'], 'retry')
+        self.assertEqual(rows[blocked]['last_error'], 'ValueError')
+        self.assertEqual(rows[blocked]['next_attempt'], clock + 3600)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM assets WHERE state!='done'").fetchone()[0], 2)
+
     def test_auth_expired_sets_reauth_required_and_remember_auth_recovers(self):
         """5. AUTH_EXPIRED記録後はreauth_required trueとなりremember_auth成功でfalseへ戻る。"""
         # 初期状態
@@ -255,7 +316,7 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(output['backup'], str(backup_dest.resolve()))
         self.assertTrue(backup_dest.is_file())
 
-        with sqlite3.connect(backup_dest) as bconn:
+        with closing(sqlite3.connect(backup_dest)) as bconn, bconn:
             bconn.row_factory = sqlite3.Row
             integrity = bconn.execute('PRAGMA integrity_check').fetchone()[0]
             self.assertEqual(integrity, 'ok')

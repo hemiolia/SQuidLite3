@@ -5,6 +5,7 @@
 !scripts/nas_create_verified_backup.sh
 !scripts/verified_backup_support.py
 !scripts/nas_backup_cycle.py
+!scripts/nas_backup_scheduler.py
 !deploy/
 !deploy/nas/
 !deploy/nas/Backup.Dockerfile

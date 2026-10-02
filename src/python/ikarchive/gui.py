@@ -28,6 +28,15 @@ LINK = '#5b3bb0'
 GRID = '#7a6a8a'
 BUNDLED_FONT = Path(__file__).resolve().parents[3] / 'assets' / 'fonts' / 'Splatoon2-Unified.otf'
 CONFIG_DIR = Path(__file__).resolve().parents[3] / 'config'
+HISTORY_PATHS = (
+    ('LatestBattleHistoriesQuery', '最新の履歴'),
+    ('RegularBattleHistoriesQuery', 'レギュラーマッチ'),
+    ('BankaraBattleHistoriesQuery', 'バンカラマッチ'),
+    ('XBattleHistoriesQuery', 'Xマッチ'),
+    ('EventBattleHistoriesQuery', 'イベントマッチ'),
+    ('PrivateBattleHistoriesQuery', 'プライベートマッチ'),
+    ('CoopHistoryQuery', 'バイト'),
+)
 FONT_UNICODE_RANGES_FILE = CONFIG_DIR / 'font-unicode-ranges.json'
 FALLBACK_FONTS = 'system-ui, "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif'
 
@@ -444,16 +453,24 @@ def render(store, font_path=None):
         )
 
     health=store.sync_health()
+    by_operation={h['operation']: h for h in health['histories']}
     observed=[h['last_success_at'] for h in health['histories'] if h['last_success_at']]
     latest_observed=max(observed) if observed else None
+    history_rows=[]
+    history_lines=[]
+    for operation, label in HISTORY_PATHS:
+        row=by_operation.get(operation) or {}
+        at=row.get('last_success_at') if isinstance(row.get('last_success_at'), str) else None
+        stale=True if at is None else bool(row.get('stale'))
+        history_rows.append({'label': label, 'at': at, 'stale': stale})
+        history_lines.append(label + (' 遅延 ' if stale else ' 確認済み ') + (at or '未確認'))
     if health['state']=='current':
         sync_notice='最新履歴を定期確認しています。'
     else:
         sync_notice='一部の履歴の確認が遅れています。未保存の試合がないか収集状態を確認してください。'
-    if latest_observed:
-        sync_notice+=' 履歴の確認日時: '+html.escape(latest_observed)
-    times=html.escape(json.dumps([h['last_success_at'] for h in health['histories']]),quote=True)
-    freshness=f'<p class="notice" id="sync-freshness" role="status" data-history-times="{times}" data-last-sync="{html.escape(latest_observed or "")}">{sync_notice}</p>'
+    sync_notice+='\n'+'\n'.join(history_lines)
+    times=html.escape(json.dumps(history_rows), quote=True)
+    freshness=f'<p class="notice" id="sync-freshness" role="status" data-history-times="{times}" data-last-sync="{html.escape(latest_observed or "")}">{html.escape(sync_notice)}</p>'
     space=health.get('storage_health')
     if space and space['state']!='normal':
         message=('空き容量が不足し、取得を一時停止しています。' if space['state']=='critical' else '空き容量が少ないため、最新の対戦・バイトの取得を優先しています。ランキングや画像は容量回復後に再開します。')
@@ -513,6 +530,7 @@ main {{
   font-size: 14px;
   color: {INK};
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }}
 section {{
   margin: 0 0 40px;
@@ -612,14 +630,23 @@ th, td {{
    const at=Date.parse(el.dateTime||el.dataset.time);
    if(Number.isFinite(at))el.textContent=(el.tagName.toLowerCase()==='time'?full:short).format(at);
  }}
- const check=()=>{{
-   const times=JSON.parse(notice.dataset.historyTimes).map(x=>Date.parse(x));
-   const stale=times.length!==7||times.some(x=>!Number.isFinite(x)||Date.now()-x>600000);
-   const valid=times.filter(Number.isFinite), oldest=valid.length?Math.min(...valid):null;
-   notice.textContent=stale?'履歴の確認が遅れています。画面を再読み込みし、収集状態を確認してください。':'最新履歴を定期確認しています。';
-   if(oldest!==null)notice.textContent+=' 各履歴の確認日時（最も古いもの）: '+full.format(oldest);
+ const rows=JSON.parse(notice.dataset.historyTimes);
+ const draw=()=>{{
+   const late=(row)=>{{
+     const at=Date.parse(row&&row.at);
+     return !Number.isFinite(at)||Date.now()-at>600000;
+   }};
+   const stale=!Array.isArray(rows)||rows.length!==7||rows.some(late);
+   const lines=[stale?'履歴の確認が遅れています。画面を再読み込みし、収集状態を確認してください。':'最新履歴を定期確認しています。'];
+   if(Array.isArray(rows)){{
+     for(const row of rows){{
+       const at=Date.parse(row&&row.at);
+       lines.push((row&&row.label?row.label:'未確認')+' '+(late(row)?'遅延':'確認済み')+' '+(Number.isFinite(at)?full.format(at):'未確認'));
+     }}
+   }}
+   notice.textContent=lines.join('\\n');
  }};
- check();setInterval(check,60000);
+ draw();setInterval(draw,60000);
 }})();
 </script></body></html>'''
 

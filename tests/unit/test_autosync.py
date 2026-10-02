@@ -13,6 +13,11 @@ class AutomaticSyncTests(unittest.TestCase):
     def test_long_crawl_refreshes_live_history_without_looping_identical_body(self):
         manifest={**MANIFEST,'queries':{k:MANIFEST['queries'][k] for k in ('RegularBattleHistoriesQuery','HistoryRecordQuery')},'expected':2}
         seen=[];store=self.store
+        legacy_book=store.output_root/'exports/分析.xlsx'
+        legacy_book.parent.mkdir(parents=True,exist_ok=True)
+        legacy_book.write_bytes(b'legacy bytes stay unchanged during sync')
+        legacy_book.chmod(0o640)
+        legacy_state=(legacy_book.read_bytes(),legacy_book.stat().st_mode&0o777,legacy_book.stat().st_mtime_ns)
         class Bridge:
             def call(self,command,**kw):
                 if command=='init':return {'account':'account-a'}
@@ -25,12 +30,20 @@ class AutomaticSyncTests(unittest.TestCase):
         self.assertEqual(seen,['RegularBattleHistoriesQuery','HistoryRecordQuery','RegularBattleHistoriesQuery'])
         self.assertEqual(result['requests'],3)
         self.assertEqual(store.db.execute('SELECT count(*) FROM responses').fetchone()[0],2)
-    def test_outputs_are_regenerated_and_export_failure_is_visible(self):
-        result=publish_outputs(self.store)
-        self.assertNotIn('error',result)
+        self.assertTrue((store.output_root/'exports/gui/index.html').is_file())
+        self.assertEqual((legacy_book.read_bytes(),legacy_book.stat().st_mode&0o777,legacy_book.stat().st_mtime_ns),legacy_state)
+    def test_gui_only_publish_preserves_existing_legacy_workbook(self):
         page=self.store.output_root/'exports/gui/index.html'
         book=self.store.output_root/'exports/分析.xlsx'
-        self.assertTrue(page.is_file());self.assertTrue(book.is_file())
+        book.parent.mkdir(parents=True,exist_ok=True)
+        book.write_bytes(b'legacy workbook bytes must not change')
+        book.chmod(0o640)
+        old_book=(book.read_bytes(),book.stat().st_mode&0o777,book.stat().st_mtime_ns)
+        result=publish_outputs(self.store)
+        self.assertEqual(result['scope'],'gui_only')
+        self.assertNotIn('xlsx',result)
+        self.assertTrue(page.is_file())
+        self.assertEqual((book.read_bytes(),book.stat().st_mode&0o777,book.stat().st_mtime_ns),old_book)
         old=page.read_bytes()
         self.assertIsNotNone(self.store._control('exports_updated_at'))
         with patch('ikarchive.publish.write_gui',side_effect=OSError('test')):
@@ -38,8 +51,17 @@ class AutomaticSyncTests(unittest.TestCase):
         self.assertEqual(failed,{'error':'OSError'})
         self.assertEqual(self.store.sync_health()['export_error'],'OSError')
         self.assertEqual(page.read_bytes(),old)
-        publish_outputs(self.store)
+        recovered=publish_outputs(self.store)
+        self.assertEqual(recovered['scope'],'gui_only')
+        self.assertEqual((book.read_bytes(),book.stat().st_mode&0o777,book.stat().st_mtime_ns),old_book)
         self.assertIsNone(self.store._control('export_error'))
+    def test_gui_only_publish_does_not_create_legacy_workbook(self):
+        book=self.store.output_root/'exports/分析.xlsx'
+        result=publish_outputs(self.store)
+        self.assertEqual(result['scope'],'gui_only')
+        self.assertNotIn('xlsx',result)
+        self.assertTrue((self.store.output_root/'exports/gui/index.html').is_file())
+        self.assertFalse(book.exists())
     def test_missing_history_is_never_reported_current(self):
         health=self.store.sync_health()
         self.assertEqual(health['state'],'delayed')

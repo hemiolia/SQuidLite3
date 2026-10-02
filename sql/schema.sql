@@ -218,3 +218,4 @@ CREATE VIEW analysis_private_three_vs_three_tags AS SELECT p.*,t.tag,t.note FROM
 CREATE VIEW analysis_private_two_vs_two_tags AS SELECT p.*,t.tag,t.note FROM analysis_private_two_vs_two p LEFT JOIN match_tags t ON t.account=p.account AND t.match_key=p.match_key;
 CREATE VIEW analysis_private_one_vs_one_tags AS SELECT p.*,t.tag,t.note FROM analysis_private_one_vs_one p LEFT JOIN match_tags t ON t.account=p.account AND t.match_key=p.match_key;
 CREATE VIEW analysis_private_other_tags AS SELECT p.*,t.tag,t.note FROM analysis_private_other p LEFT JOIN match_tags t ON t.account=p.account AND t.match_key=p.match_key;
+CREATE VIEW analysis_bankara_open_tags AS SELECT p.*,t.tag,t.note FROM analysis_bankara_open p LEFT JOIN match_tags t ON t.account=p.account AND t.match_key=p.match_key;

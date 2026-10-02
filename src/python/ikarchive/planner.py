@@ -139,3 +139,50 @@ class Planner:
                     missing.append(path+('__unhandled_selection__'+k,))
         check(self.queries[name]['operation']['selections'],data)
         return missing
+
+    def invalid_shapes(self,name,data,variables):
+        """Check that selected linked fields have Relay's singular/plural shape."""
+        if not isinstance(data,dict):return []
+        invalid=[]
+        def check(selections,obj,path=(),hint=None):
+            if not isinstance(obj,dict):return
+            typ=obj.get('__typename') or hint
+            if not typ and obj.get('id'):typ=decoded_id(obj['id']).split('-')[0]
+            for s in selections:
+                kind=s['kind']
+                if kind=='Condition':
+                    if bool(variables.get(s['condition']))==s['passingValue']:
+                        check(s['selections'],obj,path,typ)
+                elif kind=='InlineFragment':
+                    if s.get('abstractKey') or s['type']==typ:
+                        check(s['selections'],obj,path,typ)
+                elif kind=='LinkedField':
+                    key=s.get('alias') or s['name']
+                    if key not in obj:
+                        # Missing keys belong to missing_fields, avoiding duplicate issues.
+                        continue
+                    value=obj[key]
+                    field_path=path+(key,)
+                    if value is None:
+                        continue
+                    if s.get('plural') is True:
+                        if not isinstance(value,list):
+                            invalid.append(field_path)
+                            continue
+                        for index,item in enumerate(value):
+                            item_path=field_path+(index,)
+                            if item is None:
+                                continue
+                            if not isinstance(item,dict):
+                                invalid.append(item_path)
+                                continue
+                            check(s.get('selections',[]),item,item_path,s.get('concreteType'))
+                    else:
+                        if not isinstance(value,dict):
+                            invalid.append(field_path)
+                            continue
+                        check(s.get('selections',[]),value,field_path,s.get('concreteType'))
+                elif kind in ('ScalarField','TypeDiscriminator','LinkedHandle','ScalarHandle','ClientExtension'):
+                    continue
+        check(self.queries[name]['operation']['selections'],data)
+        return invalid

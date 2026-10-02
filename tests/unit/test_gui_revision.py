@@ -1,6 +1,7 @@
 """GUI改修（正式名称・順序・アカウント分離・目盛り・キケン度・非表示制御・フォント）の検証テスト。"""
 import base64
 import hashlib
+import html
 import json
 from pathlib import Path
 import re
@@ -258,6 +259,22 @@ class GuiRevisionTests(unittest.TestCase):
         html_no_font = render(self.store, font_path=Path(self.tmp.name) / 'nonexistent.otf')
         self.assertNotIn('@font-face', html_no_font)
         self.assertIn(FALLBACK_FONTS, html_no_font)
+
+    def test_each_history_path_is_named_in_the_freshness_notice(self):
+        page = render(self.store)
+        self.assertIn('white-space: pre-wrap', page)
+        match = re.search(r'data-history-times="([^"]*)"', page)
+        self.assertIsNotNone(match)
+        rows = json.loads(html.unescape(match.group(1)))
+        self.assertEqual([row['label'] for row in rows], [
+            '最新の履歴', 'レギュラーマッチ', 'バンカラマッチ', 'Xマッチ',
+            'イベントマッチ', 'プライベートマッチ', 'バイト',
+        ])
+        self.assertEqual(len(rows), 7)
+        self.assertTrue(all(row['at'] is None and row['stale'] is True for row in rows))
+        self.assertIn('レギュラーマッチ 遅延 未確認', page)
+        self.assertIn('バイト 遅延 未確認', page)
+        self.assertIn("lines.join('\\n')", page)
 
     def test_mobile_layout_wraps_long_text_and_uses_nonshrinking_grid(self):
         self.store.insert_point(

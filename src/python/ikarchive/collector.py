@@ -1,6 +1,7 @@
 import base64, json, os, queue, threading, subprocess, time, uuid, urllib.request, urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from .store import now, js, digest
 from .planner import Planner
 from .storage import storage_health
@@ -97,6 +98,7 @@ def sync(store,account=None,data_path=None,budget=250,delay=1.5):
             if space['state']=='critical':raise RuntimeError('STORAGE_CRITICAL')
             if time.monotonic()>=next_history_refresh:
                 from .publish import publish_outputs
+                # Keep the GUI current; the incomplete legacy workbook is not generated.
                 publish_outputs(store)
                 # Long initial crawls must keep observing the short live history window.
                 # Only successful jobs are refreshed; retry deadlines remain intact.
@@ -157,7 +159,34 @@ def sync(store,account=None,data_path=None,budget=250,delay=1.5):
 
 def allowed_asset(url):
     u=urlparse(url)
-    return u.scheme=='https' and not u.username and not u.password and u.port in (None,443) and any((u.hostname or '').endswith('.'+h) or u.hostname==h for h in ('nintendo.net','nintendo.com','nintendo.co.jp'))
+    if u.scheme!='https' or u.username or u.password or u.port not in (None,443):
+        return False
+    host=u.hostname or ''
+    if any(host==h or host.endswith('.'+h) for h in ('nintendo.net','nintendo.com','nintendo.co.jp')):
+        return True
+    # 写真アルバムは、このバケットの署名付きURLだけを返す。ほかのGCSバケットは拒む。
+    parts=[p for p in u.path.split('/') if p]
+    return host=='storage.googleapis.com' and len(parts)>=1 and parts[0]=='ugcstore-toyohr-lp1-persistent'
+
+# 期限の過ぎた署名は、待ち直しても成功しない。通信せず、未取得のまま残す。
+ASSET_EXPIRED_RETRY_SECONDS=86400
+
+class AssetUrlExpired(Exception):
+    pass
+
+def signed_url_expired(url, now):
+    query=parse_qs(urlparse(url).query)
+    if 'Expires' in query:
+        try:return int(query['Expires'][0])<=now
+        except (TypeError, ValueError):return False
+    issued=query.get('X-Goog-Date')
+    span=query.get('X-Goog-Expires')
+    if not issued or not span:return False
+    try:
+        moment=datetime.strptime(issued[0],'%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+        return moment.timestamp()+int(span[0])<=now
+    except (TypeError, ValueError):
+        return False
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,req,fp,code,msg,headers,newurl):
@@ -174,6 +203,7 @@ def fetch_assets(store,budget,delay):
         url=r['url']
         try:
             if not allowed_asset(url):raise ValueError('ASSET_HOST_UNREVIEWED')
+            if signed_url_expired(url,time.time()):raise AssetUrlExpired()
             with opener.open(url,timeout=45) as response:
                 raw=response.read();ct=response.headers.get('content-type','')
             sha=digest(raw)
@@ -181,6 +211,7 @@ def fetch_assets(store,budget,delay):
                 store.db.execute('INSERT OR IGNORE INTO bodies VALUES(?,?,?)',(sha,raw,len(raw)))
                 store.db.execute("UPDATE assets SET state='done',body_sha256=?,content_type=?,attempts=attempts+1,last_error=NULL WHERE url=?",(sha,ct,url))
         except Exception as exc:
-            with store.db:store.db.execute("UPDATE assets SET state='retry',attempts=attempts+1,next_attempt=?,last_error=? WHERE url=?",(time.time()+3600,type(exc).__name__,url))
+            retry_after=ASSET_EXPIRED_RETRY_SECONDS if isinstance(exc,AssetUrlExpired) else 3600
+            with store.db:store.db.execute("UPDATE assets SET state='retry',attempts=attempts+1,next_attempt=?,last_error=? WHERE url=?",(time.time()+retry_after,type(exc).__name__,url))
         if delay:time.sleep(delay)
     return attempted

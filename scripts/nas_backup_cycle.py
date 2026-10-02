@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """NAS Backup Cycle Coordinator.
 
-Executes a verified local SQLite backup inside a container, verifies the
-generated artifacts, and coordinates the immutable upload to Google Drive
-via rclone with roundtrip SHA256 integrity check and atomic cloud receipts.
+Executes a verified plaintext SQLite snapshot, verifies that the file matches
+its manifest byte-for-byte, and uploads that plaintext file to Google Drive.
+Encryption is not performed. Success requires the remote byte size, MD5, and
+a full read-back SHA-256 to match the local snapshot.
 """
 
 import argparse
@@ -74,79 +75,91 @@ def rclone_join(remote_dir: str, name: str) -> str:
     return f"{remote_dir.rstrip('/')}/{name}"
 
 
-def locate_backup_script() -> pathlib.Path:
-    """Locates the nas_create_verified_backup.sh helper script."""
+def locate_support_script() -> pathlib.Path:
+    """Locates verified_backup_support.py."""
     self_dir = pathlib.Path(__file__).resolve().parent
-    local_script = self_dir / "nas_create_verified_backup.sh"
+    local_script = self_dir / "verified_backup_support.py"
     if local_script.is_file():
         return local_script
 
-    system_script = pathlib.Path("/app/scripts/nas_create_verified_backup.sh")
+    system_script = pathlib.Path("/app/scripts/verified_backup_support.py")
     if system_script.is_file():
         return system_script
 
-    raise FileNotFoundError("nas_create_verified_backup.sh not found in script dir or /app/scripts")
+    raise FileNotFoundError("verified_backup_support.py not found in script dir or /app/scripts")
 
 
-def run_create_backup(
-    db_path: pathlib.Path, backup_dir: pathlib.Path, passphrase_file: pathlib.Path
-) -> Dict[str, str]:
-    """Executes nas_create_verified_backup.sh and parses its final JSON result."""
-    script_path = locate_backup_script()
+def run_create_backup(db_path: pathlib.Path, backup_dir: pathlib.Path) -> Dict[str, str]:
+    """Creates a plaintext snapshot. Does not encrypt."""
+    script_path = locate_support_script()
     cmd = [
+        sys.executable,
         str(script_path),
+        "plaintext-snapshot",
         str(db_path.resolve()),
         str(backup_dir.resolve()),
-        str(passphrase_file.resolve()),
     ]
 
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"Backup creation script failed with exit code {proc.returncode}")
+        raise RuntimeError(f"Plaintext snapshot failed with exit code {proc.returncode}")
 
     lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if not lines:
-        raise RuntimeError("Backup creation script produced empty stdout")
+        raise RuntimeError("Plaintext snapshot produced empty stdout")
 
     last_line = lines[-1]
     try:
         data = json.loads(last_line)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Failed to parse JSON output from backup script: {e}; raw line: {last_line}")
+        raise RuntimeError(f"Failed to parse JSON output from plaintext snapshot: {e}; raw line: {last_line}")
 
     if not isinstance(data, dict) or data.get("status") != "ok":
-        raise RuntimeError(f"Backup creation script returned non-ok status: {data}")
+        raise RuntimeError(f"Plaintext snapshot returned non-ok status: {data}")
 
-    for key in ("raw_path", "encrypted_path", "manifest_path"):
+    for key in ("raw_path", "manifest_path"):
         if key not in data or not data[key]:
-            raise RuntimeError(f"Backup creation result missing key '{key}': {data}")
+            raise RuntimeError(f"Plaintext snapshot result missing key '{key}': {data}")
+    if str(data["raw_path"]).endswith(".gpg") or str(data["raw_path"]).endswith(".zst"):
+        raise RuntimeError(f"Plaintext snapshot path is not a plaintext database: {data['raw_path']}")
 
     return data
 
 
 def verify_backup_artifacts(
     backup_data: Dict[str, str]
-) -> Tuple[pathlib.Path, pathlib.Path, pathlib.Path, Dict[str, any], Dict[str, any]]:
-    """Verifies that backup artifacts exist, match the manifest, and hashes agree."""
+) -> Tuple[pathlib.Path, pathlib.Path, Dict[str, any], Dict[str, any]]:
+    """Verifies the plaintext snapshot matches its manifest, including SHA-256."""
     raw_path = pathlib.Path(backup_data["raw_path"]).resolve()
-    enc_path = pathlib.Path(backup_data["encrypted_path"]).resolve()
     manifest_path = pathlib.Path(backup_data["manifest_path"]).resolve()
 
     if not raw_path.is_file():
-        raise FileNotFoundError(f"Raw snapshot not found: {raw_path}")
-    if not enc_path.is_file():
-        raise FileNotFoundError(f"Encrypted snapshot not found: {enc_path}")
+        raise FileNotFoundError(f"Plaintext snapshot not found: {raw_path}")
+    if raw_path.name.endswith(".gpg") or raw_path.name.endswith(".zst"):
+        raise ValueError(f"Refusing to treat a ciphertext file as the backup: {raw_path.name}")
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    with open(raw_path, "rb") as handle:
+        header = handle.read(16)
+    if header != b"SQLite format 3\x00":
+        raise ValueError(f"Plaintext snapshot header is not SQLite format 3: {raw_path}")
 
     try:
         manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as e:
         raise ValueError(f"Manifest is not valid JSON: {e}")
 
+    if manifest_data.get("encryption") not in (None,):
+        raise ValueError("Manifest encryption must be null. New backups are plaintext.")
+    if manifest_data.get("storage") != "plaintext":
+        raise ValueError(f"Manifest storage is not plaintext: {manifest_data.get('storage')}")
+
     verification = manifest_data.get("verification")
     if not isinstance(verification, dict):
         raise ValueError("Manifest missing valid 'verification' section")
+    if verification.get("plaintext") is not True:
+        raise ValueError("Manifest verification.plaintext is not true")
     if verification.get("sha256_match") is not True:
         raise ValueError("Manifest verification.sha256_match is not true")
     if verification.get("quick_check") != "ok":
@@ -155,50 +168,40 @@ def verify_backup_artifacts(
     raw_snap = manifest_data.get("raw_snapshot")
     if not isinstance(raw_snap, dict) or raw_snap.get("quick_check") != "ok":
         raise ValueError(f"Manifest raw_snapshot quick_check is not 'ok': {raw_snap}")
-
-    enc_snap = manifest_data.get("encrypted_snapshot")
-    if not isinstance(enc_snap, dict):
-        raise ValueError("Manifest missing valid 'encrypted_snapshot' section")
-
-    if enc_snap.get("basename") != enc_path.name:
+    if raw_snap.get("basename") != raw_path.name:
         raise ValueError(
-            f"Encrypted basename mismatch: manifest '{enc_snap.get('basename')}' vs actual '{enc_path.name}'"
+            f"Plaintext basename mismatch: manifest '{raw_snap.get('basename')}' vs actual '{raw_path.name}'"
         )
 
-    expected_bytes = int(enc_snap.get("bytes", -1))
-    expected_sha256 = enc_snap.get("sha256")
-
-    enc_bytes, enc_sha256, enc_md5 = compute_file_hashes(enc_path)
-    if enc_bytes != expected_bytes:
-        raise ValueError(
-            f"Encrypted file size mismatch: manifest {expected_bytes} vs actual {enc_bytes}"
-        )
-    if enc_sha256 != expected_sha256:
-        raise ValueError(
-            f"Encrypted file sha256 mismatch: manifest '{expected_sha256}' vs actual '{enc_sha256}'"
-        )
+    expected_bytes = int(raw_snap.get("bytes", -1))
+    expected_sha256 = raw_snap.get("sha256")
+    raw_bytes, raw_sha256, raw_md5 = compute_file_hashes(raw_path)
+    if raw_bytes != expected_bytes:
+        raise ValueError(f"Plaintext file size mismatch: manifest {expected_bytes} vs actual {raw_bytes}")
+    if raw_sha256 != expected_sha256:
+        raise ValueError(f"Plaintext file sha256 mismatch: manifest '{expected_sha256}' vs actual '{raw_sha256}'")
 
     man_bytes, man_sha256, man_md5 = compute_file_hashes(manifest_path)
-
-    enc_hashes = {"bytes": enc_bytes, "sha256": enc_sha256, "md5": enc_md5}
+    plain_hashes = {"bytes": raw_bytes, "sha256": raw_sha256, "md5": raw_md5}
     manifest_hashes = {"bytes": man_bytes, "sha256": man_sha256, "md5": man_md5}
+    return raw_path, manifest_path, plain_hashes, manifest_hashes
 
-    return raw_path, enc_path, manifest_path, enc_hashes, manifest_hashes
 
-
-def check_remote_listing(remote_dir: str, enc_name: str, manifest_name: str) -> None:
+def check_remote_listing(remote_dir: str, plain_name: str, manifest_name: str) -> None:
     """Inspects remote directory listing and rejects existing destinations.
 
     Fails the cycle immediately if listing fails, rather than treating failure
     as non-existence.
     """
+    if plain_name.endswith(".gpg") or plain_name.endswith(".zst"):
+        raise ValueError(f"Refusing to upload a ciphertext backup name: {plain_name}")
     proc = subprocess.run(["rclone", "lsf", remote_dir], stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"Failed to list remote directory: {remote_dir} (exit code {proc.returncode})")
 
     existing_files: Set[str] = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-    if enc_name in existing_files:
-        raise FileExistsError(f"Remote encrypted target already exists: {rclone_join(remote_dir, enc_name)}")
+    if plain_name in existing_files:
+        raise FileExistsError(f"Remote plaintext target already exists: {rclone_join(remote_dir, plain_name)}")
     if manifest_name in existing_files:
         raise FileExistsError(f"Remote manifest target already exists: {rclone_join(remote_dir, manifest_name)}")
 
@@ -238,54 +241,56 @@ def get_remote_file_md5(remote_path: str) -> str:
 
 def upload_and_verify_objects(
     remote_dir: str,
-    enc_path: pathlib.Path,
+    plain_path: pathlib.Path,
     manifest_path: pathlib.Path,
-    enc_hashes: Dict[str, any],
+    plain_hashes: Dict[str, any],
     manifest_hashes: Dict[str, any],
 ) -> Tuple[str, str]:
-    """Uploads encrypted archive and manifest with interim verification.
+    """Uploads the plaintext snapshot and manifest with full-content verification.
 
-    - Uploads encrypted object to unique temporary .uploading-<UUID> destination
+    - Uploads the plaintext file to a unique temporary .uploading-<UUID> destination
     - Verifies size and MD5
-    - Streams back content via rclone cat and compares SHA256 roundtrip
-    - Promotes encrypted object using rclone moveto --immutable
-    - Uploads manifest to temporary destination, verifies size and MD5, and promotes
-    - Automatically cleans up only temporary uploading objects on failure, preserving
-      any existing objects or raw backup files.
+    - Streams the whole remote object back and compares SHA-256
+    - Promotes it with rclone moveto --immutable
+    - Uploads the manifest the same way
+    - On failure, deletes only this invocation's temporary objects
     """
+    if plain_path.name.endswith(".gpg") or plain_path.name.endswith(".zst"):
+        raise ValueError(f"Refusing to upload ciphertext as the backup: {plain_path.name}")
     upload_uuid = uuid.uuid4().hex
-    enc_uploading_remote = rclone_join(remote_dir, f"{enc_path.name}.uploading-{upload_uuid}")
-    enc_final_remote = rclone_join(remote_dir, enc_path.name)
+    plain_uploading_remote = rclone_join(remote_dir, f"{plain_path.name}.uploading-{upload_uuid}")
+    plain_final_remote = rclone_join(remote_dir, plain_path.name)
     manifest_uploading_remote = rclone_join(remote_dir, f"{manifest_path.name}.uploading-{upload_uuid}")
     manifest_final_remote = rclone_join(remote_dir, manifest_path.name)
 
     created_remotes: List[str] = []
 
     try:
-        # 1. Upload encrypted file to temporary uploading destination
         subprocess.run(
-            ["rclone", "copyto", str(enc_path), enc_uploading_remote, "--immutable"],
+            [
+                "rclone", "copyto", str(plain_path), plain_uploading_remote,
+                "--immutable", "--retries", "10", "--low-level-retries", "20",
+                "--drive-chunk-size", "64M",
+            ],
             check=True,
             stderr=sys.stderr,
         )
-        created_remotes.append(enc_uploading_remote)
+        created_remotes.append(plain_uploading_remote)
 
-        # 2. Verify temporary encrypted object size and MD5
-        remote_enc_size = get_remote_file_size(enc_uploading_remote)
-        if remote_enc_size != enc_hashes["bytes"]:
+        remote_plain_size = get_remote_file_size(plain_uploading_remote)
+        if remote_plain_size != plain_hashes["bytes"]:
             raise ValueError(
-                f"Remote uploading encrypted size mismatch: remote {remote_enc_size} vs local {enc_hashes['bytes']}"
+                f"Remote uploading plaintext size mismatch: remote {remote_plain_size} vs local {plain_hashes['bytes']}"
             )
 
-        remote_enc_md5 = get_remote_file_md5(enc_uploading_remote)
-        if remote_enc_md5 != enc_hashes["md5"]:
+        remote_plain_md5 = get_remote_file_md5(plain_uploading_remote)
+        if remote_plain_md5 != plain_hashes["md5"]:
             raise ValueError(
-                f"Remote uploading encrypted MD5 mismatch: remote {remote_enc_md5} vs local {enc_hashes['md5']}"
+                f"Remote uploading plaintext MD5 mismatch: remote {remote_plain_md5} vs local {plain_hashes['md5']}"
             )
 
-        # 3. Read back full content via rclone cat and perform roundtrip SHA256 comparison
         cat_proc = subprocess.Popen(
-            ["rclone", "cat", enc_uploading_remote],
+            ["rclone", "cat", plain_uploading_remote, "--retries", "1"],
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
         )
@@ -294,22 +299,24 @@ def upload_and_verify_objects(
         if cat_rc != 0:
             raise RuntimeError(f"rclone cat failed with exit code {cat_rc}")
 
-        if roundtrip_sha256 != enc_hashes["sha256"]:
+        if roundtrip_sha256 != plain_hashes["sha256"]:
             raise ValueError(
-                f"Remote roundtrip SHA256 mismatch: read {roundtrip_sha256} vs source {enc_hashes['sha256']}"
+                f"Remote roundtrip SHA256 mismatch: read {roundtrip_sha256} vs source {plain_hashes['sha256']}"
             )
 
-        # 4. Finalize encrypted file with immutable move
         subprocess.run(
-            ["rclone", "moveto", "--immutable", enc_uploading_remote, enc_final_remote],
+            ["rclone", "moveto", "--immutable", plain_uploading_remote, plain_final_remote],
             check=True,
             stderr=sys.stderr,
         )
-        created_remotes.remove(enc_uploading_remote)
+        created_remotes.remove(plain_uploading_remote)
 
         # 5. Upload manifest file to temporary uploading destination
         subprocess.run(
-            ["rclone", "copyto", str(manifest_path), manifest_uploading_remote, "--immutable"],
+            [
+                "rclone", "copyto", str(manifest_path), manifest_uploading_remote,
+                "--immutable", "--retries", "10", "--low-level-retries", "20",
+            ],
             check=True,
             stderr=sys.stderr,
         )
@@ -328,6 +335,21 @@ def upload_and_verify_objects(
                 f"Remote uploading manifest MD5 mismatch: remote {remote_man_md5} vs local {manifest_hashes['md5']}"
             )
 
+        manifest_cat = subprocess.Popen(
+            ["rclone", "cat", manifest_uploading_remote, "--retries", "1"],
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+        )
+        manifest_roundtrip_sha256 = compute_stream_sha256(manifest_cat.stdout)
+        manifest_cat_rc = manifest_cat.wait()
+        if manifest_cat_rc != 0:
+            raise RuntimeError(f"rclone manifest cat failed with exit code {manifest_cat_rc}")
+        if manifest_roundtrip_sha256 != manifest_hashes["sha256"]:
+            raise ValueError(
+                "Remote manifest roundtrip SHA256 mismatch: "
+                f"read {manifest_roundtrip_sha256} vs source {manifest_hashes['sha256']}"
+            )
+
         # 7. Finalize manifest file with immutable move
         subprocess.run(
             ["rclone", "moveto", "--immutable", manifest_uploading_remote, manifest_final_remote],
@@ -336,7 +358,7 @@ def upload_and_verify_objects(
         )
         created_remotes.remove(manifest_uploading_remote)
 
-        return enc_final_remote, manifest_final_remote
+        return plain_final_remote, manifest_final_remote
 
     except Exception:
         # Failure cleanup: only clean up uploading objects from this invocation.
@@ -352,11 +374,10 @@ def upload_and_verify_objects(
 def write_cloud_receipt(
     backup_dir: pathlib.Path,
     raw_path: pathlib.Path,
-    enc_path: pathlib.Path,
     manifest_path: pathlib.Path,
-    enc_final_remote: str,
+    plain_final_remote: str,
     manifest_final_remote: str,
-    enc_hashes: Dict[str, any],
+    plain_hashes: Dict[str, any],
     manifest_hashes: Dict[str, any],
 ) -> pathlib.Path:
     """Writes a verified completion receipt using fsync and atomic rename.
@@ -373,15 +394,12 @@ def write_cloud_receipt(
     receipt_data = {
         "status": "ok",
         "completed_at": datetime.now(timezone.utc).isoformat(),
-        "raw_snapshot": {
+        "plaintext_snapshot": {
             "basename": raw_path.name,
-        },
-        "encrypted_snapshot": {
-            "basename": enc_path.name,
-            "bytes": enc_hashes["bytes"],
-            "sha256": enc_hashes["sha256"],
-            "md5": enc_hashes["md5"],
-            "remote": enc_final_remote,
+            "bytes": plain_hashes["bytes"],
+            "sha256": plain_hashes["sha256"],
+            "md5": plain_hashes["md5"],
+            "remote": plain_final_remote,
         },
         "manifest": {
             "basename": manifest_path.name,
@@ -395,6 +413,7 @@ def write_cloud_receipt(
             "upload_size_verified": True,
             "upload_md5_verified": True,
             "roundtrip_sha256_verified": True,
+            "manifest_roundtrip_sha256_verified": True,
         },
     }
 
@@ -429,22 +448,21 @@ def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(description="NAS Backup Cycle Coordinator")
     parser.add_argument("--db", required=True, help="Path to SQLite database file")
     parser.add_argument("--backup-dir", required=True, help="Local backup target directory")
-    parser.add_argument("--passphrase-file", required=True, help="Path to passphrase file")
+    parser.add_argument(
+        "--passphrase-file",
+        default=None,
+        help="Accepted for older invocations. Ignored. This cycle does not encrypt.",
+    )
     parser.add_argument("--remote", required=True, help="Rclone remote directory (e.g. gdrive:ikaring-backups)")
 
     args = parser.parse_args(argv)
 
     db_path = pathlib.Path(args.db).resolve()
     backup_dir = pathlib.Path(args.backup_dir).resolve()
-    passphrase_file = pathlib.Path(args.passphrase_file).resolve()
     remote_dir = args.remote.strip()
 
     if not db_path.is_file():
         sys.stderr.write(f"Error: Database file does not exist: {db_path}\n")
-        return 1
-
-    if not passphrase_file.is_file():
-        sys.stderr.write(f"Error: Passphrase file does not exist: {passphrase_file}\n")
         return 1
 
     if not remote_dir:
@@ -462,38 +480,33 @@ def main(argv: List[str] = None) -> int:
 
     try:
         # Step 1: Create verified backup snapshot
-        backup_result = run_create_backup(db_path, backup_dir, passphrase_file)
+        backup_result = run_create_backup(db_path, backup_dir)
 
-        # Step 2: Verify local artifacts and manifest consistency
-        raw_path, enc_path, manifest_path, enc_hashes, manifest_hashes = verify_backup_artifacts(backup_result)
+        raw_path, manifest_path, plain_hashes, manifest_hashes = verify_backup_artifacts(backup_result)
 
-        # Step 3: Remote listing check to ensure remote directory is reachable and destination does not exist
-        check_remote_listing(remote_dir, enc_path.name, manifest_path.name)
+        check_remote_listing(remote_dir, raw_path.name, manifest_path.name)
 
-        # Step 4 & 5: Upload encrypted file and manifest with verification and roundtrip check
-        enc_remote, manifest_remote = upload_and_verify_objects(
-            remote_dir, enc_path, manifest_path, enc_hashes, manifest_hashes
+        plain_remote, manifest_remote = upload_and_verify_objects(
+            remote_dir, raw_path, manifest_path, plain_hashes, manifest_hashes
         )
 
-        # Step 6: Atomic receipt generation
         receipt_path = write_cloud_receipt(
             backup_dir,
             raw_path,
-            enc_path,
             manifest_path,
-            enc_remote,
+            plain_remote,
             manifest_remote,
-            enc_hashes,
+            plain_hashes,
             manifest_hashes,
         )
 
         result_summary = {
             "status": "ok",
             "receipt": str(receipt_path),
-            "remote_encrypted": enc_remote,
+            "remote_plaintext": plain_remote,
             "remote_manifest": manifest_remote,
-            "bytes": enc_hashes["bytes"],
-            "sha256": enc_hashes["sha256"],
+            "bytes": plain_hashes["bytes"],
+            "sha256": plain_hashes["sha256"],
         }
         sys.stdout.write(json.dumps(result_summary, indent=2) + "\n")
         return 0

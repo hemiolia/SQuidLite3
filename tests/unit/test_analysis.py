@@ -54,7 +54,8 @@ def response(op, body, account='account-a'):
 class AnalysisTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / 'a.sqlite')
+        self.temp_root = Path(self.tmp.name).resolve()
+        self.store = Store(self.temp_root / 'a.sqlite')
         self.planner = Planner(MANIFEST)
 
     def tearDown(self):
@@ -143,7 +144,7 @@ class AnalysisTests(unittest.TestCase):
         self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': vs_detail('BANKARA', 'openxlsx', (4, 4), bankara='OPEN', rule='AREA')}})
         self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': vs_detail('X_MATCH', 'xxlsx', (4, 4), rule='GOAL')}})
         self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': vs_detail('PRIVATE', 'pairxlsx', (2, 2), rule='LOFT')}})
-        path = Path(self.tmp.name) / '分析.xlsx'
+        path = self.temp_root / '分析.xlsx'
         result = export_xlsx(self.store, path)
         self.assertFalse(result['edits_return_to_database'])
         self.assertEqual(result['canonical'], 'sqlite')
@@ -165,6 +166,18 @@ class AnalysisTests(unittest.TestCase):
             self.assertNotIn('json_text', xml)
             for text in re.findall(r'<t xml:space="preserve">(.*?)</t>', xml):
                 self.assertLess(len(text), 32767)
+
+    def test_xlsx_bytes_stay_the_same_when_the_tables_do(self):
+        from ikarchive.xlsx_export import export_xlsx
+        self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': vs_detail('BANKARA', 'stablexlsx', (4, 4), bankara='OPEN', rule='AREA')}})
+        first = self.temp_root / 'first.xlsx'
+        second = self.temp_root / 'second.xlsx'
+        export_xlsx(self.store, first)
+        export_xlsx(self.store, second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        with zipfile.ZipFile(first) as book:
+            for info in book.infolist():
+                self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
 
     def test_session_failure_is_visible_and_cleared_by_later_success(self):
         later = (datetime.now(timezone.utc) + timedelta(days=700)).timestamp() * 1000
@@ -214,7 +227,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT priority FROM rate_points WHERE label='評価レート'").fetchone()[0], 'secondary')
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM rate_points WHERE source='derived_judgement'").fetchone()[0], 0)
         from ikarchive.gui import write_gui
-        page = Path(self.tmp.name) / 'index.html'
+        page = self.temp_root / 'index.html'
         write_gui(self.store, page)
         text = page.read_text(encoding='utf-8')
         self.assertIn('ブキチャレパワー', text)
@@ -228,7 +241,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(BUNDLED_FONT.is_file())
 
         # 0. リポジトリ同梱フォントが既定で完全埋め込みされる。
-        page_default = Path(self.tmp.name) / 'default_font.html'
+        page_default = self.temp_root / 'default_font.html'
         write_gui(self.store, page_default)
         html_default = page_default.read_text(encoding='utf-8')
         default_match = re.search(r"url\('data:font/otf;base64,([A-Za-z0-9+/=]+)'\)", html_default)
@@ -237,10 +250,10 @@ class AnalysisTests(unittest.TestCase):
 
         # 1. フォント完全埋め込みの検査: 一時ファイルに任意のバイト列を書き、data URLデコード一致を検査
         dummy_font_bytes = b'\x00\x01\x00\x00arbitrary-splatoon2-unified-otf-data\xfe\xff'
-        dummy_font_path = Path(self.tmp.name) / 'Splatoon2-Unified.otf'
+        dummy_font_path = self.temp_root / 'Splatoon2-Unified.otf'
         dummy_font_path.write_bytes(dummy_font_bytes)
 
-        page_with_font = Path(self.tmp.name) / 'with_font.html'
+        page_with_font = self.temp_root / 'with_font.html'
         write_gui(self.store, page_with_font, font_path=dummy_font_path)
         html_with_font = page_with_font.read_text(encoding='utf-8')
 
@@ -253,8 +266,8 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(re.search(r'(?<!sans-)serif\b', html_with_font), 'Standalone serif found in HTML')
 
         # 2. フォント無し時の sans-serif フォールバック検査
-        page_no_font = Path(self.tmp.name) / 'no_font.html'
-        write_gui(self.store, page_no_font, font_path=Path(self.tmp.name) / 'nonexistent.otf')
+        page_no_font = self.temp_root / 'no_font.html'
+        write_gui(self.store, page_no_font, font_path=self.temp_root / 'nonexistent.otf')
         html_no_font = page_no_font.read_text(encoding='utf-8')
 
         self.assertNotIn('@font-face', html_no_font)
@@ -282,7 +295,7 @@ class AnalysisTests(unittest.TestCase):
         bad_time['playedTime'] = 'not-a-valid-iso-time'
         self.ingest('VsHistoryDetailQuery', {'data': {'vsHistoryDetail': bad_time}})
 
-        page = Path(self.tmp.name) / 'graph_test.html'
+        page = self.temp_root / 'graph_test.html'
         write_gui(self.store, page)
         html_text = page.read_text(encoding='utf-8')
 

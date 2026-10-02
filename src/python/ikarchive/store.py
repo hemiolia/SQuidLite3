@@ -5,10 +5,26 @@ from urllib.parse import urlparse
 from .planner import walk, identity, decoded_id
 from .classify import classify_detail, classify_coop
 from .rates import observations, weapon_snapshots
+from .catalog_binding import resolve_response_planner
 
 def now():return datetime.now(timezone.utc).isoformat()
 def js(value):return json.dumps(value,ensure_ascii=False,separators=(',',':'),sort_keys=True)
 def digest(body):return hashlib.sha256(body).hexdigest()
+
+def _immutable_uri(path):
+    return f'{Path(path).resolve().as_uri()}?mode=ro&immutable=1'
+
+def database_is_slice(path):
+    """slice_meta がある派生ファイルなら真。無いファイルは偽。wal は作らない。"""
+    path=Path(path)
+    if not path.is_file():
+        return False
+    connection=sqlite3.connect(_immutable_uri(path),uri=True,timeout=30)
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None
+    finally:
+        connection.close()
 
 DETAIL_ROOTS={
     'VsHistoryDetailQuery':'vsHistoryDetail',
@@ -28,21 +44,87 @@ class Store:
         self.readonly=readonly
         if readonly:
             if not self.path.is_file():raise FileNotFoundError(f'Database not found: {self.path}')
+            probe=sqlite3.connect(_immutable_uri(self.path),uri=True,timeout=30)
+            probe.row_factory=sqlite3.Row
+            probe.execute('PRAGMA query_only=ON')
+            is_slice=probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None
+            if is_slice:
+                role=probe.execute("SELECT value FROM slice_meta WHERE key='role'").fetchone()
+                probe.close()
+                if role is not None and role[0]=='lossless_slice_selector':
+                    raise ValueError('LOSSLESS_SELECTOR_REQUIRES_SHARD_READER')
+                raise ValueError('INCOMPLETE_LEGACY_SLICE')
+            probe.close()
             self.db=sqlite3.connect(f'{self.path.resolve().as_uri()}?mode=ro',uri=True,timeout=30)
             self.db.row_factory=sqlite3.Row
             self.db.execute('PRAGMA query_only=ON')
             return
+        if database_is_slice(self.path):
+            raise ValueError('SLICE_READONLY')
         self.path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-        self.db=sqlite3.connect(path,timeout=30);self.db.row_factory=sqlite3.Row
-        self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
-        self.db.executescript((Path(__file__).resolve().parents[3]/'sql/schema.sql').read_text());self.db.commit()
-        if 'empty_retries' not in {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}:
-            self.db.execute('ALTER TABLE jobs ADD COLUMN empty_retries INTEGER NOT NULL DEFAULT 0')
-            self.db.commit()
-        self._reclassify();self.path.chmod(0o600)
+        self.db=None
+        try:
+            self.db=sqlite3.connect(self.path,timeout=30);self.db.row_factory=sqlite3.Row
+            # SQLite's implicit deletes during REPLACE must reach the change feed.
+            # Set this on every authoritative writer, before any schema/data work.
+            self.db.execute('PRAGMA recursive_triggers=ON')
+            self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
+            self.db.executescript((Path(__file__).resolve().parents[3]/'sql/schema.sql').read_text());self.db.commit()
+            if 'empty_retries' not in {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}:
+                self.db.execute('ALTER TABLE jobs ADD COLUMN empty_retries INTEGER NOT NULL DEFAULT 0')
+                self.db.commit()
+            self._install_existing_change_feed()
+            self._reclassify();self.path.chmod(0o600)
+        except BaseException:
+            connection=self.db
+            if connection is not None:
+                try:
+                    if connection.in_transaction:
+                        connection.rollback()
+                except sqlite3.Error:
+                    pass
+                finally:
+                    connection.close()
+                    self.db=None
+            raise
+    def _install_existing_change_feed(self):
+        """Repair feed coverage only for databases whose baseline already opted in.
+
+        New databases deliberately start without a feed; their first full
+        reconciliation installs it at the pinned baseline boundary. For an
+        existing feed, both installers run inside this method's savepoint so
+        an identity conflict cannot leave only part of the writer contract.
+        """
+        from .change_feed import CHANGE_TABLE, install_change_feed
+        from .writer_guards import install_writer_guards
+
+        feed = self.db.execute(
+            "SELECT type,name FROM sqlite_master WHERE name=? COLLATE NOCASE",
+            (CHANGE_TABLE,),
+        ).fetchone()
+        if feed is None:
+            return
+        if feed['type'] != 'table' or feed['name'] != CHANGE_TABLE:
+            raise ValueError('CHANGE_FEED_SCHEMA_INVALID')
+        self.db.execute('SAVEPOINT ia_store_install_change_contract')
+        try:
+            install_change_feed(self.db)
+            install_writer_guards(self.db)
+            self.db.execute('RELEASE SAVEPOINT ia_store_install_change_contract')
+        except BaseException:
+            self.db.execute('ROLLBACK TO SAVEPOINT ia_store_install_change_contract')
+            self.db.execute('RELEASE SAVEPOINT ia_store_install_change_contract')
+            raise
     def close(self):self.db.close()
     def issue(self,code,context,response=None,run=None):
         self.db.execute('INSERT INTO issues(run_id,response_id,code,context,created_at) VALUES(?,?,?,?,?)',(run,response,code,js(context),now()))
+    def issue_once(self,code,context,response=None,run=None):
+        serialized=js(context)
+        if self.db.execute('SELECT 1 FROM issues WHERE response_id IS ? AND code=? AND context=? LIMIT 1',
+                           (response,code,serialized)).fetchone():
+            return
+        self.db.execute('INSERT INTO issues(run_id,response_id,code,context,created_at) VALUES(?,?,?,?,?)',
+                         (run,response,code,serialized,now()))
     def queue(self,account,operation,variables,kind=None,key=None):
         self.db.execute('INSERT OR IGNORE INTO jobs(account,operation,variables_json,kind,match_key) VALUES(?,?,?,?,?)',(account,operation,js(variables),kind,key))
     def record(self,e,run=None):
@@ -62,6 +144,33 @@ class Store:
             self.db.execute('INSERT OR IGNORE INTO response_fetches(event_id,response_id,run_id,fetched_at,headers_json) VALUES(?,?,?,?,?)',
                 (e['event_id'],rid,run,e['fetched_at'],js(e.get('headers',{}))))
         return rid
+    def _response_catalog_validation(self,r,planner,obj,data,variables):
+        binding=resolve_response_planner(self.db,r,planner)
+        status=binding.status
+        current_eligible=status in ('known_current','legacy_unchecked')
+        schema_planner=binding.planner if status in ('known_current','known_saved') else None
+        checked=bool(r['query_id'] and isinstance(data,dict) and schema_planner is not None
+            and r['operation'] in schema_planner.routes)
+        omissions=schema_planner.missing_fields(r['operation'],data,variables) if checked else []
+        shape_errors=schema_planner.invalid_shapes(r['operation'],data,variables) if checked else []
+        outcome=self._response_outcome(r,obj,data,omissions+shape_errors)
+        if not current_eligible:
+            outcome='retry'
+        related_empty=(current_eligible and self._is_related_empty(
+            r,obj,data,omissions+shape_errors,
+        ))
+        return binding,omissions,shape_errors,outcome,related_empty
+    def _record_response_catalog_issue(self,binding,r,run=None):
+        if binding.status=='known_saved':
+            code='RESPONSE_CATALOG_MISMATCH'
+        elif binding.status in ('known_current','legacy_unchecked'):
+            return
+        else:
+            code='RESPONSE_CATALOG_UNRESOLVED'
+        self.issue_once(code,{
+            'binding_status':binding.status,
+            'operation':r['operation'],
+        },r['id'],run)
     def project(self,rid,planner,country='JP'):
         r=self.db.execute('SELECT * FROM responses WHERE id=?',(rid,)).fetchone()
         if r['projected']:
@@ -69,13 +178,16 @@ class Store:
             return
         obj=json.loads(r['json_text']) if r['json_text'] else {}
         op=r['operation'];account=r['account'];variables=json.loads(r['variables_json']);data=obj.get('data') if isinstance(obj,dict) else None
-        omissions=planner.missing_fields(op,data,variables) if r['query_id'] and isinstance(data,dict) and op in planner.routes else []
-        outcome=self._response_outcome(r,obj,data,omissions)
+        binding,omissions,shape_errors,outcome,related_empty=self._response_catalog_validation(
+            r,planner,obj,data,variables,
+        )
         okay=outcome=='done'
         with self.db:
-            for path in omissions:self.issue('SELECTED_FIELD_MISSING',{'operation':op,'path':path},rid)
-            if outcome=='retry' and not self._is_related_empty(r,obj,data,omissions):
-                self.issue('INCOMPLETE_RESPONSE',{'operation':op,'status':r['http_status'],'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False},rid)
+            self._record_response_catalog_issue(binding,r)
+            for path in omissions:self.issue_once('SELECTED_FIELD_MISSING',{'operation':op,'path':path},rid)
+            for path in shape_errors:self.issue_once('SELECTED_FIELD_SHAPE_INVALID',{'operation':op,'path':path},rid)
+            if outcome=='retry' and not related_empty:
+                self.issue_once('INCOMPLETE_RESPONSE',{'operation':op,'status':r['http_status'],'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False},rid)
             elif outcome=='unavailable':
                 self.issue('DETAIL_UNAVAILABLE',{'operation':op,'reason':'SERVER_RETURNED_NULL'},rid)
             if isinstance(data,dict):
@@ -87,7 +199,7 @@ class Store:
                         after={x[0] for x in self.db.execute('SELECT match_key FROM sightings WHERE response_id=?',(rid,))}
                         if before and after and before.isdisjoint(after):self.issue('POSSIBLE_HISTORY_GAP',{'operation':op,'previous_response':previous[0],'previous_count':len(before),'current_count':len(after)},rid)
                 self._assets(r,data)
-                if op in planner.routes:
+                if binding.status in ('known_current','legacy_unchecked') and op in planner.routes:
                     for event,a,b,p in planner.visit(op,data,variables):
                         if event=='entity':
                             if isinstance(a,str) and (a=='Image' or a.endswith('Image')):
@@ -103,17 +215,19 @@ class Store:
                         elif event in ('next','page'):
                             if event=='page':
                                 field,child=p
-                                binding={k:v for k,v in variables.items() if not k.startswith('page') and k!='cursor'}
+                                page_binding={k:v for k,v in variables.items() if not k.startswith('page') and k!='cursor'}
                                 fingerprint=digest(js(child).encode())
-                                try:self.db.execute('INSERT INTO page_fingerprints VALUES(?,?,?,?,?)',(account,op,js(binding),js(field),fingerprint))
+                                try:self.db.execute('INSERT INTO page_fingerprints VALUES(?,?,?,?,?)',(account,op,js(page_binding),js(field),fingerprint))
                                 except sqlite3.IntegrityError:
                                     self.issue('PAGINATION_REPEATED_PAGE',{'operation':op,'field':field},rid);continue
                             self.queue(account,a,b)
                         elif event=='issue':self.issue(a,b,rid)
-                else:self.issue('UNKNOWN_OPERATION',op,rid)
+                elif op not in planner.routes:self.issue('UNKNOWN_OPERATION',op,rid)
             if okay:self._advance_endpoint_head(r,r['fetched_at'])
             self.db.execute('UPDATE responses SET projected=1 WHERE id=?',(rid,))
-            self._acknowledge_fetches(r,planner)
+            self._acknowledge_fetches(
+                r,planner,(binding,omissions,shape_errors,outcome,related_empty),
+            )
     def _response_outcome(self,r,obj,data,omissions=()):
         if r['http_status']!=200 or not isinstance(data,dict) or obj.get('errors') or omissions:
             return 'retry'
@@ -146,17 +260,28 @@ class Store:
         if replace:
             self.db.execute('INSERT INTO endpoint_heads VALUES(?,?,?) ON CONFLICT(account,operation) DO UPDATE SET response_id=excluded.response_id',
                 (r['account'],r['operation'],r['id']))
-    def _acknowledge_fetches(self,r,planner):
+    def _acknowledge_fetches(self,r,planner,validation=None):
         """本文の投影と、再取得の完了処理を分離する。スプール再生は冪等。"""
         obj=json.loads(r['json_text']) if r['json_text'] else {}
         data=obj.get('data') if isinstance(obj,dict) else None
-        omissions=planner.missing_fields(r['operation'],data,json.loads(r['variables_json'])) if r['query_id'] and isinstance(data,dict) and r['operation'] in planner.routes else []
-        outcome=self._response_outcome(r,obj,data,omissions)
-        related_empty=self._is_related_empty(r,obj,data,omissions)
+        variables=json.loads(r['variables_json'])
+        if validation is None:
+            validation=self._response_catalog_validation(r,planner,obj,data,variables)
+        binding,omissions,shape_errors,outcome,related_empty=validation
         okay=outcome=='done'
         with self.db:
+            self._record_response_catalog_issue(binding,r)
             fetches=self.db.execute('SELECT * FROM response_fetches WHERE response_id=? AND acknowledged=0 ORDER BY julianday(fetched_at),event_id',(r['id'],)).fetchall()
             for fetched in fetches:
+                for path in omissions:
+                    self.issue_once('SELECTED_FIELD_MISSING',{'operation':r['operation'],'path':path},r['id'],fetched['run_id'])
+                for path in shape_errors:
+                    self.issue_once('SELECTED_FIELD_SHAPE_INVALID',{'operation':r['operation'],'path':path},r['id'],fetched['run_id'])
+                if outcome=='retry' and not related_empty:
+                    self.issue_once('INCOMPLETE_RESPONSE',{
+                        'operation':r['operation'],'status':r['http_status'],
+                        'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False,
+                    },r['id'],fetched['run_id'])
                 if okay and r['operation'] in ('WeaponQuery','WeaponCollectionRefetchQuery'):
                     self._write_weapon_snapshots(r,data,fetched['fetched_at'],fetched['event_id'])
                 # A delayed spool receipt must not undo a more recent success/failure.
@@ -222,7 +347,37 @@ class Store:
         for f in sorted(Path(spool).glob('*.json')):
             e=json.loads(f.read_text());rid=self.record(e,run);self.project(rid,planner);f.unlink()
         for r in self.db.execute('SELECT id FROM responses WHERE projected=0').fetchall():self.project(r[0],planner)
+    def _unknown_auth(self):
+        # last_failure を null にすると画面は「記録なし」になる。派生には監査が無いので、文字列でない値で未確認にする。
+        return {
+            'session_expires_at':None,'bullet_expires_at':None,'last_ok_at':None,
+            'last_failure':False,'last_failure_at':None,'last_sync_error':False,'last_sync_error_at':None,
+            'reauth_required':False,'session_expires_soon':False,'backfill_armed':False,
+        }
+    def _slice_sync_health(self):
+        from .collector import HISTORIES
+        from .storage import storage_health
+        clocks=[{'operation':operation,'last_success_at':None,'age_seconds':None,'stale':True} for operation in sorted(HISTORIES)]
+        return {'state':'absent','stale_after_seconds':600,'histories':clocks,
+            'storage_health':storage_health(self.path),'auth':self._unknown_auth(),
+            'retry_after':None,'exports_updated_at':None,'export_error':None}
+    def _slice_status(self):
+        health=self._slice_sync_health()
+        return {
+            'responses':None,
+            'matches':self.db.execute('SELECT count(*) FROM matches').fetchone()[0],
+            'documents':self.db.execute('SELECT count(*) FROM documents').fetchone()[0],
+            'pending_details':None,'unavailable_details':None,'issues':None,'entities':None,'assets':None,
+            'matches_without_detail':self.db.execute('SELECT count(*) FROM matches WHERE detail_response_id IS NULL').fetchone()[0],
+            'jobs':None,'assets_by_state':None,'last_run':None,
+            'analysis':[dict(r) for r in self.db.execute('SELECT kind,genre,roster_class,analysis_set,count(*) count FROM match_classification GROUP BY 1,2,3,4 ORDER BY 1,2,3')],
+            'tags':[dict(r) for r in self.db.execute('SELECT tag,count(*) count FROM match_tags GROUP BY tag ORDER BY tag')],
+            'all_server_records_verified':False,'auth':health['auth'],'sync_health':health,
+            'storage_health':health['storage_health'],'slice':True,
+        }
     def status(self):
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None:
+            return self._slice_status()
         counts={t:self.db.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('responses','matches','documents','pending_details','unavailable_details','issues','entities','assets')}
         counts['matches_without_detail']=self.db.execute('SELECT count(*) FROM matches WHERE detail_response_id IS NULL').fetchone()[0]
         counts['jobs']=[dict(r) for r in self.db.execute('SELECT state,count(*) count FROM jobs GROUP BY state')]
@@ -244,7 +399,9 @@ class Store:
             source='response_fetches f JOIN responses r ON r.id=f.response_id' if receipts else 'responses r'
             stamp='f.fetched_at' if receipts else 'r.fetched_at'
             row=self.db.execute(f'''SELECT {stamp} FROM {source} WHERE r.operation=? AND r.http_status=200 AND r.projected=1
-                AND NOT EXISTS(SELECT 1 FROM issues i WHERE i.response_id=r.id AND i.code IN ('INCOMPLETE_RESPONSE','SELECTED_FIELD_MISSING'))
+                AND NOT EXISTS(SELECT 1 FROM issues i WHERE i.response_id=r.id AND i.code IN (
+                    'INCOMPLETE_RESPONSE','SELECTED_FIELD_MISSING','SELECTED_FIELD_SHAPE_INVALID',
+                    'RESPONSE_CATALOG_MISMATCH','RESPONSE_CATALOG_UNRESOLVED'))
                 ORDER BY julianday({stamp}) DESC LIMIT 1''',(operation,)).fetchone()
             at=row[0] if row else None
             age=None
@@ -304,6 +461,7 @@ class Store:
             'last_failure':failure,
             'last_failure_at':self._control('auth_last_failure_at'),
             'last_sync_error':self._control('last_sync_error'),
+            'last_sync_error_at':self._control('last_sync_error_at'),
             'reauth_required':failure in ('AUTH_REQUIRED','AUTH_EXPIRED','SESSION_EXPIRED') and (not ok or (self._control('auth_last_failure_at') or '')>=(ok or '')),
             'session_expires_soon':remaining is not None and remaining<14*86400,
             'backfill_armed':self._control('backfill_armed')=='1',
@@ -390,18 +548,24 @@ class Store:
                 except Exception:
                     variables = {}
 
-                if planner is None:
-                    if r['query_id']:
-                        continue
-                    omissions = ()
-                else:
-                    omissions = (
-                        planner.missing_fields(op, data, variables)
-                        if r['query_id'] and isinstance(data, dict) and op in planner.routes
-                        else []
-                    )
+                binding,omissions,shape_errors,outcome,related_empty=self._response_catalog_validation(
+                    r,planner,obj,data,variables,
+                )
+                self._record_response_catalog_issue(binding,r)
+                if planner is None and r['query_id'] and binding.status=='unresolved':
+                    # Preserve the historical no-catalog skip, while refusing to
+                    # promote this identified response to a successful outcome.
+                    continue
 
-                outcome = self._response_outcome(r, obj, data, omissions)
+                for path in omissions:
+                    self.issue_once('SELECTED_FIELD_MISSING',{'operation':op,'path':path},rid)
+                for path in shape_errors:
+                    self.issue_once('SELECTED_FIELD_SHAPE_INVALID',{'operation':op,'path':path},rid)
+                if outcome=='retry' and not related_empty:
+                    self.issue_once('INCOMPLETE_RESPONSE',{
+                        'operation':op,'status':r['http_status'],
+                        'graphql_errors':bool(obj.get('errors')) if isinstance(obj,dict) else False,
+                    },rid)
 
                 if job['state'] != outcome:
                     next_attempt = time.time() + (86400 if outcome in ('done', 'unavailable') else 300)
@@ -410,6 +574,10 @@ class Store:
                         (outcome, next_attempt, job['account'], job['operation'], job['variables_json'])
                     )
 
+                if binding.status not in ('known_current','legacy_unchecked'):
+                    # Keep earlier issue rows intact; the catalog issue records why
+                    # this repair cannot treat the old response as current success.
+                    continue
                 if outcome == 'unavailable':
                     self.db.execute(
                         "UPDATE issues SET code='DETAIL_UNAVAILABLE' WHERE code='INCOMPLETE_RESPONSE' AND response_id=?",

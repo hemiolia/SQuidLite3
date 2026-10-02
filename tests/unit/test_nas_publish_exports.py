@@ -50,6 +50,11 @@ args = sys.argv[1:]
 if not args:
     sys.exit(1)
 
+rclone_log = os.environ.get("FAKE_RCLONE_LOG")
+if rclone_log:
+    with open(rclone_log, "a", encoding="utf-8") as output:
+        output.write(json.dumps(args, ensure_ascii=False) + "\\n")
+
 subcmd = args[0]
 
 if subcmd == "lsjson":
@@ -127,7 +132,7 @@ elif subcmd == "copyto":
     if len(positional) != 2:
         sys.exit(1)
     src_arg, dst_arg = positional
-    if os.environ.get("FAKE_RCLONE_FAIL_COPY_XLSX") and "分析.xlsx" in dst_arg:
+    if os.environ.get("FAKE_RCLONE_FAIL_COPY_GUI") and "gui/index.html" in dst_arg:
         sys.exit(1)
     src_path = resolve_target(src_arg)
     dst_path = resolve_target(dst_arg)
@@ -186,6 +191,7 @@ class TestNasPublishExports(unittest.TestCase):
     ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env["FAKE_REMOTE_ROOT"] = str(self.fake_remote_dir)
+        env["FAKE_RCLONE_LOG"] = str(self.root / "rclone-calls.jsonl")
         if env_extra:
             env.update(env_extra)
 
@@ -209,27 +215,43 @@ class TestNasPublishExports(unittest.TestCase):
             env=env,
         )
 
+    def rclone_calls(self):
+        log = self.root / "rclone-calls.jsonl"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+    def assert_no_xlsx_rclone_calls(self):
+        self.assertFalse(
+            any("分析.xlsx" in argument for call in self.rclone_calls() for argument in call),
+            self.rclone_calls(),
+        )
+
     def test_initial_upload_success_and_receipt(self):
-        """Initial run with nonexistent remote uploads both files and writes state."""
+        """Initial run uploads only the GUI and identifies the limited scope."""
         proc = self.run_publish()
         self.assertEqual(proc.returncode, 0, f"Failed with stderr: {proc.stderr}")
 
         receipt = json.loads(proc.stdout)
         self.assertEqual(receipt["status"], "success")
-        self.assertEqual(receipt["counts"]["uploaded"], 2)
+        self.assertEqual(receipt["scope"], "gui_only")
+        self.assertIs(receipt["full_database_synchronized"], False)
+        self.assertEqual(receipt["counts"]["total"], 1)
+        self.assertEqual(receipt["counts"]["uploaded"], 1)
         self.assertEqual(receipt["counts"]["skipped"], 0)
         self.assertEqual(receipt["counts"]["conflicts"], 0)
         self.assertEqual(receipt["files"]["gui/index.html"]["status"], "uploaded")
-        self.assertEqual(receipt["files"]["分析.xlsx"]["status"], "uploaded")
+        self.assertEqual(set(receipt["files"]), {"gui/index.html"})
         self.assertNotIn(self.remote_prefix, proc.stdout)
 
-        # Verify remote artifacts
+        # Only the GUI is published; the local legacy XLSX remains untouched.
         remote_html = self.fake_remote_dir / "ikaring-exports" / "gui" / "index.html"
         remote_xlsx = self.fake_remote_dir / "ikaring-exports" / "分析.xlsx"
         self.assertTrue(remote_html.exists())
-        self.assertTrue(remote_xlsx.exists())
+        self.assertFalse(remote_xlsx.exists())
         self.assertEqual(remote_html.read_bytes(), self.initial_html_bytes)
-        self.assertEqual(remote_xlsx.read_bytes(), self.initial_xlsx_bytes)
+        self.assertEqual(self.xlsx_file.read_bytes(), self.initial_xlsx_bytes)
+        self.assert_no_xlsx_rclone_calls()
 
         # Verify state file
         state_file = self.state_dir / ".nas-publish-state.json"
@@ -237,14 +259,14 @@ class TestNasPublishExports(unittest.TestCase):
         state = json.loads(state_file.read_text(encoding="utf-8"))
         self.assertEqual(state["version"], 1)
         self.assertEqual(state["remote"], self.remote_prefix)
+        self.assertEqual(state["scope"], "gui_only")
+        self.assertIs(state["full_database_synchronized"], False)
         self.assertEqual(
             state["files"]["gui/index.html"],
             hashlib.sha256(self.initial_html_bytes).hexdigest(),
         )
-        self.assertEqual(
-            state["files"]["分析.xlsx"],
-            hashlib.sha256(self.initial_xlsx_bytes).hexdigest(),
-        )
+        self.assertEqual(set(state["files"]), {"gui/index.html"})
+        self.assertNotIn("retained_legacy_state", state)
 
     def test_second_publish_skips_when_identical(self):
         """Second run with identical content skips transfers and preserves state."""
@@ -255,11 +277,13 @@ class TestNasPublishExports(unittest.TestCase):
         self.assertEqual(proc2.returncode, 0)
         receipt = json.loads(proc2.stdout)
         self.assertEqual(receipt["status"], "success")
+        self.assertEqual(receipt["scope"], "gui_only")
+        self.assertIs(receipt["full_database_synchronized"], False)
         self.assertEqual(receipt["counts"]["uploaded"], 0)
-        self.assertEqual(receipt["counts"]["skipped"], 2)
+        self.assertEqual(receipt["counts"]["skipped"], 1)
         self.assertEqual(receipt["counts"]["conflicts"], 0)
         self.assertEqual(receipt["files"]["gui/index.html"]["status"], "skipped")
-        self.assertEqual(receipt["files"]["分析.xlsx"]["status"], "skipped")
+        self.assertEqual(set(receipt["files"]), {"gui/index.html"})
 
     def test_source_only_normal_update_without_conflict(self):
         """Updating only source updates remote without generating conflict artifacts."""
@@ -274,10 +298,10 @@ class TestNasPublishExports(unittest.TestCase):
         self.assertEqual(proc2.returncode, 0)
         receipt = json.loads(proc2.stdout)
         self.assertEqual(receipt["counts"]["uploaded"], 1)
-        self.assertEqual(receipt["counts"]["skipped"], 1)
+        self.assertEqual(receipt["counts"]["skipped"], 0)
         self.assertEqual(receipt["counts"]["conflicts"], 0)
         self.assertEqual(receipt["files"]["gui/index.html"]["status"], "uploaded")
-        self.assertEqual(receipt["files"]["分析.xlsx"]["status"], "skipped")
+        self.assertEqual(set(receipt["files"]), {"gui/index.html"})
 
         # Ensure no conflict directory was created
         conflicts_dir = self.state_dir / "conflicts"
@@ -289,6 +313,99 @@ class TestNasPublishExports(unittest.TestCase):
         # Verify remote received updated content
         remote_html = self.fake_remote_dir / "ikaring-exports" / "gui" / "index.html"
         self.assertEqual(remote_html.read_bytes(), updated_html)
+        self.assert_no_xlsx_rclone_calls()
+
+    def test_analysis_xlsx_presence_absence_and_update_never_reach_rclone(self):
+        remote_root = self.fake_remote_dir / "ikaring-exports"
+        remote_xlsx = remote_root / "分析.xlsx"
+        remote_xlsx.parent.mkdir(parents=True, exist_ok=True)
+        preserved_remote_bytes = b"remote legacy XLSX must remain untouched"
+        remote_xlsx.write_bytes(preserved_remote_bytes)
+
+        # Present local XLSX: GUI publishes, remote XLSX bytes remain unchanged.
+        first = self.run_publish()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(remote_xlsx.read_bytes(), preserved_remote_bytes)
+        self.assertEqual(json.loads(first.stdout)["scope"], "gui_only")
+        self.assert_no_xlsx_rclone_calls()
+
+        # Missing local XLSX: the GUI publisher still succeeds and never probes it.
+        self.xlsx_file.unlink()
+        second = self.run_publish()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(remote_xlsx.read_bytes(), preserved_remote_bytes)
+        self.assertEqual(json.loads(second.stdout)["scope"], "gui_only")
+        self.assert_no_xlsx_rclone_calls()
+
+        # Updated local XLSX and absent remote XLSX: neither state causes access.
+        remote_xlsx.unlink()
+        self.xlsx_file.write_bytes(b"updated local XLSX outside publisher scope")
+        third = self.run_publish()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertFalse(remote_xlsx.exists())
+        self.assertEqual(json.loads(third.stdout)["scope"], "gui_only")
+        self.assertIs(json.loads(third.stdout)["full_database_synchronized"], False)
+        self.assert_no_xlsx_rclone_calls()
+
+    def test_legacy_two_file_state_is_archived_exactly_before_gui_only_migration(self):
+        old_xlsx_hash = hashlib.sha256(b"old state XLSX hash; source may now differ").hexdigest()
+        legacy_state = {
+            "version": 1,
+            "remote": self.remote_prefix,
+            "files": {
+                "gui/index.html": hashlib.sha256(self.initial_html_bytes).hexdigest(),
+                "分析.xlsx": old_xlsx_hash,
+            },
+        }
+        old_state_bytes = (json.dumps(legacy_state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        state_file = self.state_dir / ".nas-publish-state.json"
+        state_file.write_bytes(old_state_bytes)
+
+        remote_root = self.fake_remote_dir / "ikaring-exports"
+        remote_html = remote_root / "gui" / "index.html"
+        remote_html.parent.mkdir(parents=True, exist_ok=True)
+        remote_html.write_bytes(self.initial_html_bytes)
+        remote_xlsx = remote_root / "分析.xlsx"
+        remote_xlsx.write_bytes(b"remote XLSX is intentionally not read or changed")
+        remote_xlsx_before = remote_xlsx.read_bytes()
+        # Current source differs from the old XLSX hash and must not be opened.
+        self.xlsx_file.write_bytes(b"new local XLSX is out of scope")
+
+        proc = self.run_publish()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        receipt = json.loads(proc.stdout)
+        self.assertEqual(receipt["scope"], "gui_only")
+        self.assertIs(receipt["full_database_synchronized"], False)
+        self.assertEqual(set(receipt["files"]), {"gui/index.html"})
+        self.assertEqual(receipt["files"]["gui/index.html"]["status"], "skipped")
+
+        digest = hashlib.sha256(old_state_bytes).hexdigest()
+        retained_rel = f"history/legacy-analysis-state-{digest}.json"
+        retained_file = self.state_dir / retained_rel
+        self.assertTrue(retained_file.is_file())
+        self.assertEqual(retained_file.read_bytes(), old_state_bytes)
+        self.assertEqual(retained_file.stat().st_size, len(old_state_bytes))
+        self.assertEqual(hashlib.sha256(retained_file.read_bytes()).hexdigest(), digest)
+        self.assertEqual(stat.S_IMODE(retained_file.stat().st_mode), 0o600)
+
+        current_state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(set(current_state["files"]), {"gui/index.html"})
+        self.assertEqual(current_state["scope"], "gui_only")
+        self.assertIs(current_state["full_database_synchronized"], False)
+        self.assertEqual(
+            current_state["retained_legacy_state"],
+            {"file": retained_rel, "bytes": len(old_state_bytes), "sha256": digest},
+        )
+        self.assertEqual(remote_xlsx.read_bytes(), remote_xlsx_before)
+        self.assert_no_xlsx_rclone_calls()
+
+        # A later cycle validates and reuses the same retained object.
+        proc_retry = self.run_publish()
+        self.assertEqual(proc_retry.returncode, 0, proc_retry.stderr)
+        self.assertEqual(list((self.state_dir / "history").iterdir()), [retained_file])
+        self.assertEqual(retained_file.read_bytes(), old_state_bytes)
+        self.assertEqual(remote_xlsx.read_bytes(), remote_xlsx_before)
+        self.assert_no_xlsx_rclone_calls()
 
     def test_remote_independent_update_saves_conflict_then_publishes(self):
         """
@@ -308,7 +425,7 @@ class TestNasPublishExports(unittest.TestCase):
         receipt = json.loads(proc2.stdout)
         self.assertEqual(receipt["counts"]["conflicts"], 1)
         self.assertEqual(receipt["files"]["gui/index.html"]["status"], "conflict_uploaded")
-        self.assertEqual(receipt["files"]["分析.xlsx"]["status"], "skipped")
+        self.assertEqual(set(receipt["files"]), {"gui/index.html"})
 
         # Verify local conflict backup
         conflicts_dir = self.state_dir / "conflicts"
@@ -343,6 +460,7 @@ class TestNasPublishExports(unittest.TestCase):
         receipt = json.loads(proc.stdout)
         self.assertEqual(receipt["counts"]["conflicts"], 1)
         self.assertEqual(receipt["files"]["gui/index.html"]["status"], "conflict_uploaded")
+        self.assertEqual(set(receipt["files"]), {"gui/index.html"})
 
         # Verify conflict preserved
         conflicts_dir = self.state_dir / "conflicts"
@@ -403,23 +521,23 @@ class TestNasPublishExports(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stderr.strip(), "REMOTE_ERROR")
 
-    def test_failure_on_second_transfer_keeps_old_state_and_may_update_first(self):
-        """Remote transfers are sequential, while the baseline commits after both verify."""
+    def test_gui_transfer_failure_keeps_old_state(self):
+        """A failed GUI transfer cannot advance the state baseline."""
         self.assertEqual(self.run_publish().returncode, 0)
         state_file = self.state_dir / ".nas-publish-state.json"
         old_state = state_file.read_bytes()
         html_update = b"<html>new HTML</html>"
-        xlsx_update = b"PK new XLSX"
         self.html_file.write_bytes(html_update)
-        self.xlsx_file.write_bytes(xlsx_update)
+        self.xlsx_file.write_bytes(b"PK changed locally but outside publisher scope")
 
-        proc = self.run_publish(env_extra={"FAKE_RCLONE_FAIL_COPY_XLSX": "1"})
+        proc = self.run_publish(env_extra={"FAKE_RCLONE_FAIL_COPY_GUI": "1"})
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stderr.strip(), "REMOTE_ERROR")
         self.assertEqual(state_file.read_bytes(), old_state)
         remote_root = self.fake_remote_dir / "ikaring-exports"
-        self.assertEqual((remote_root / "gui" / "index.html").read_bytes(), html_update)
-        self.assertEqual((remote_root / "分析.xlsx").read_bytes(), self.initial_xlsx_bytes)
+        self.assertEqual((remote_root / "gui" / "index.html").read_bytes(), self.initial_html_bytes)
+        self.assertFalse((remote_root / "分析.xlsx").exists())
+        self.assert_no_xlsx_rclone_calls()
 
     def test_remote_conflict_detected_before_upload(self):
         """Detects concurrent modification in pre-upload verification and rejects."""
@@ -441,11 +559,11 @@ class TestNasPublishExports(unittest.TestCase):
     def test_rejection_symlinks_oversize_missing(self):
         """Rejects symlinks, missing files, and oversized files."""
         # 1. Missing file
-        self.xlsx_file.unlink()
+        self.html_file.unlink()
         proc_missing = self.run_publish()
         self.assertEqual(proc_missing.returncode, 1)
         self.assertIn("SOURCE_MISSING", proc_missing.stderr)
-        self.xlsx_file.write_bytes(self.initial_xlsx_bytes)
+        self.html_file.write_bytes(self.initial_html_bytes)
 
         # 2. Oversize file (> 64MiB)
         oversize_bytes = 64 * 1024 * 1024 + 1
@@ -613,6 +731,29 @@ class TestNasPublishExports(unittest.TestCase):
         proc4 = self.run_publish()
         self.assertEqual(proc4.returncode, 1)
         self.assertIn("STATE_ERROR", proc4.stderr)
+
+        # Known legacy XLSX hashes are accepted only with the expected SHA shape;
+        # unrelated file entries remain rejected rather than becoming publishable.
+        malformed_legacy_hash = {
+            "version": 1,
+            "remote": self.remote_prefix,
+            "files": {"gui/index.html": "a" * 64, "分析.xlsx": "not-a-sha256"},
+        }
+        state_file.write_text(json.dumps(malformed_legacy_hash), encoding="utf-8")
+        proc5 = self.run_publish()
+        self.assertEqual(proc5.returncode, 1)
+        self.assertEqual(proc5.stderr.strip(), "STATE_ERROR")
+
+        unknown_state_entry = {
+            "version": 1,
+            "remote": self.remote_prefix,
+            "files": {"gui/index.html": "a" * 64, "other.sqlite3": "b" * 64},
+        }
+        state_file.write_text(json.dumps(unknown_state_entry), encoding="utf-8")
+        proc6 = self.run_publish()
+        self.assertEqual(proc6.returncode, 1)
+        self.assertEqual(proc6.stderr.strip(), "STATE_ERROR")
+        self.assertEqual(self.rclone_calls(), [], "invalid state must fail before remote inspection")
 
     def test_source_snapshot_persists_even_if_source_modified_mid_cycle(self):
         """
