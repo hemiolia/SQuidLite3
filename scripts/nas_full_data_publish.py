@@ -35,6 +35,7 @@ MAX_CONTROL_BYTES = 32 * 1024 * 1024
 MAX_RCLONE_TEXT_BYTES = 64 * 1024
 RETRY_LIMIT = 5
 STATE_VERSION = 1
+UNCLASSIFIED_ANALYSIS_SET = "unclassified"
 
 
 class PublishError(Exception):
@@ -753,7 +754,12 @@ def _verify_selector_manifest(root, slices_doc, selector_verification, generatio
 
     mode_files = len(mode_paths)
     rule_files = len(rule_paths)
-    distinct_modes = sum(1 for row in modes if row["matches"] > 0)
+    # The unclassified selector is a valid entry point, but it has no
+    # match_classification rows and therefore no by-rule selector products.
+    distinct_modes = sum(
+        1 for row in modes
+        if row["matches"] > 0 and row["analysis_set"] != UNCLASSIFIED_ANALYSIS_SET
+    )
     distinct_rules = len({row.get("rule_raw") for row in rules})
     product = distinct_modes * distinct_rules
     expected = {

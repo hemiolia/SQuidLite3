@@ -76,6 +76,7 @@ def add_selector(root, local, dependencies, generation_id=GENERATION):
 
 
 def make_generation(root, *, modes=16, rules=20, populated_modes=None,
+                    unclassified_matches=None, unknown_observed_mode=None,
                     xlsx_pieces=2, generation_id=GENERATION):
     if populated_modes is None:
         populated_modes = min(modes, 3)
@@ -138,28 +139,41 @@ def make_generation(root, *, modes=16, rules=20, populated_modes=None,
 
     by_mode = []
     by_rule = []
+    mode_names = [
+        unknown_observed_mode if index == 0 and unknown_observed_mode is not None
+        else f"analysis_mode_{index}"
+        for index in range(modes)
+    ]
     for index in range(modes):
         name = f"mode_{index:02d}.sqlite3"
         local = f"slices/by-mode/{name}"
         info = add_selector(root, local, data_files, generation_id)
         row = {"file": name, "bytes": info["bytes"], "sha256": info["sha256"],
-               "analysis_set": f"analysis_mode_{index}", "matches": 1 if index < populated_modes else 0}
+               "analysis_set": mode_names[index], "matches": 1 if index < populated_modes else 0}
         by_mode.append(row)
 
+    if unclassified_matches is not None:
+        name = "unclassified.sqlite3"
+        local = f"slices/by-mode/{name}"
+        info = add_selector(root, local, data_files, generation_id)
+        by_mode.append({"file": name, "bytes": info["bytes"], "sha256": info["sha256"],
+                        "analysis_set": "unclassified", "matches": unclassified_matches})
+
+    effective_rules = rules if populated_modes else 0
     for mode_index in range(populated_modes):
-        for rule_index in range(rules):
+        for rule_index in range(effective_rules):
             name = f"mode_{mode_index:02d}__RULE_{rule_index:03d}.sqlite3"
             local = f"slices/by-rule/{name}"
             info = add_selector(root, local, data_files, generation_id)
             by_rule.append({"file": name, "bytes": info["bytes"], "sha256": info["sha256"],
-                            "analysis_set": f"analysis_mode_{mode_index}", "matches": 1,
+                            "analysis_set": mode_names[mode_index], "matches": 1,
                             "rule_raw": f"RULE_{rule_index:03d}"})
 
     distinct_modes = populated_modes
-    distinct_rules = rules
+    distinct_rules = rules if populated_modes else 0
     product = distinct_modes * distinct_rules
     counts = {
-        "mode_files": modes,
+        "mode_files": len(by_mode),
         "rule_files": product,
         "distinct_modes_with_matches": distinct_modes,
         "distinct_rules": distinct_rules,
@@ -194,7 +208,7 @@ def make_generation(root, *, modes=16, rules=20, populated_modes=None,
     selector_verification = {
         "status": "verified", "snapshot_identifier": generation_id,
         "source_sha256": source_sha, "all_shared_files_reachable": True,
-        "mode_files": modes, "rule_files": product, "rule_mode_product": product,
+        "mode_files": len(by_mode), "rule_files": product, "rule_mode_product": product,
         "distinct_modes_with_matches": distinct_modes, "distinct_rules": distinct_rules,
         "all_mode_matches": True, "all_rule_matches": True,
     }
@@ -335,10 +349,14 @@ class FullDataPublishTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def build(self, *, modes=16, rules=20, populated_modes=None, pieces=2, generation_id=GENERATION):
+    def build(self, *, modes=16, rules=20, populated_modes=None,
+              unclassified_matches=None, unknown_observed_mode=None,
+              pieces=2, generation_id=GENERATION):
         generation_dir = self.root / ("generation-" + generation_id)
         generation_dir.mkdir(mode=0o700)
         make_generation(generation_dir, modes=modes, rules=rules, populated_modes=populated_modes,
+                        unclassified_matches=unclassified_matches,
+                        unknown_observed_mode=unknown_observed_mode,
                         xlsx_pieces=pieces, generation_id=generation_id)
         return generation_dir
 
@@ -390,6 +408,148 @@ class FullDataPublishTests(unittest.TestCase):
                             copies.index(f"mock:database/xlsx-full/generations/{generation_id}/index.json"))
             self.assertLess(copies.index(f"mock:database/generations/{generation_id}/index.json"),
                             copies.index("mock:database/latest.json"))
+
+    def test_nonempty_unclassified_mode_does_not_expand_rule_cross_product(self):
+        generation_id = "20261002T120200Z-abc012ef"
+        generation_dir = self.build(
+            modes=3, rules=2, populated_modes=2, unclassified_matches=3,
+            unknown_observed_mode="future_observed_mode", pieces=1,
+            generation_id=generation_id,
+        )
+        args = ["--generation-dir", str(generation_dir), "--generation-id", generation_id,
+                "--remote", "mock:database", "--state-dir", str(self.state)]
+        with patch.object(publisher, "Rclone", return_value=self.fake), \
+                patch.object(publisher.time, "sleep"), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(publisher.main(args), 0, error.getvalue())
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["counts"]["mode_files"], 4)
+        self.assertEqual(result["counts"]["distinct_modes_with_matches"], 2)
+        self.assertEqual(result["counts"]["distinct_rules"], 2)
+        self.assertEqual(result["counts"]["rule_files"], 4)
+        self.assertEqual(result["counts"]["rule_mode_product"], 4)
+
+        manifest = json.loads((generation_dir / "slices/manifest.json").read_text())
+        unclassified = next(row for row in manifest["by_mode"]
+                            if row["analysis_set"] == "unclassified")
+        self.assertEqual(unclassified["matches"], 3)
+        self.assertEqual(len(manifest["by_mode"]), 4)
+        self.assertEqual(len(manifest["by_rule"]), 4)
+        self.assertNotIn("unclassified", {row["analysis_set"] for row in manifest["by_rule"]})
+
+        plan = json.loads((generation_dir / "generation-plan.json").read_text())
+        self.assertEqual(plan["counts"]["mode_files"], 4)
+        self.assertEqual(plan["counts"]["rule_files"], 4)
+        self.assertIn("slices/by-mode/unclassified.sqlite3",
+                      {row["local"] for row in plan["files"]})
+        self.assertEqual(sum(row["local"].startswith("slices/by-mode/")
+                             for row in plan["files"]), 4)
+        self.assertEqual(sum(row["local"].startswith("slices/by-rule/")
+                             for row in plan["files"]), 4)
+
+        generation_index = json.loads(
+            self.fake.objects[f"mock:database/generations/{generation_id}/index.json"]
+        )
+        self.assertTrue(generation_index["verification"]["full_readback"])
+        self.assertEqual(generation_index["counts"]["rule_mode_product"], 4)
+
+    def test_unclassified_only_and_no_classification_have_zero_rule_product(self):
+        cases = (
+            ("20261002T120300Z-abc012ef", 0, 5),
+            ("20261002T120301Z-abc012ef", 2, None),
+        )
+        for generation_id, modes, unclassified_matches in cases:
+            with self.subTest(generation_id=generation_id):
+                generation_dir = self.build(
+                    modes=modes, rules=3, populated_modes=0,
+                    unclassified_matches=unclassified_matches, pieces=1,
+                    generation_id=generation_id,
+                )
+                args = ["--generation-dir", str(generation_dir), "--generation-id", generation_id,
+                        "--remote", "mock:database", "--state-dir", str(self.state)]
+                with patch.object(publisher, "Rclone", return_value=self.fake), \
+                        patch.object(publisher.time, "sleep"), \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(publisher.main(args), 0, error.getvalue())
+                result = json.loads(output.getvalue())
+                for key in ("distinct_modes_with_matches", "distinct_rules",
+                            "rule_files", "rule_mode_product"):
+                    self.assertEqual(result["counts"][key], 0)
+                manifest = json.loads((generation_dir / "slices/manifest.json").read_text())
+                self.assertEqual(manifest["counts"]["rule_files"], 0)
+                self.assertEqual(manifest["counts"]["rule_mode_product"], 0)
+                self.assertEqual(manifest["by_rule"], [])
+                if unclassified_matches is not None:
+                    unclassified = next(row for row in manifest["by_mode"]
+                                        if row["analysis_set"] == "unclassified")
+                    self.assertEqual(unclassified["matches"], unclassified_matches)
+
+    def test_unknown_observed_mode_is_retained_and_counted_as_classified(self):
+        generation_id = "20261002T120400Z-abc012ef"
+        generation_dir = self.build(
+            modes=2, rules=3, populated_modes=2,
+            unknown_observed_mode="observed_future_mode", pieces=1,
+            generation_id=generation_id,
+        )
+        args = ["--generation-dir", str(generation_dir), "--generation-id", generation_id,
+                "--remote", "mock:database", "--state-dir", str(self.state)]
+        with patch.object(publisher, "Rclone", return_value=self.fake), \
+                patch.object(publisher.time, "sleep"), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(publisher.main(args), 0, error.getvalue())
+        manifest = json.loads((generation_dir / "slices/manifest.json").read_text())
+        self.assertIn("observed_future_mode", {row["analysis_set"] for row in manifest["by_mode"]})
+        self.assertIn("observed_future_mode", {row["analysis_set"] for row in manifest["by_rule"]})
+        self.assertEqual(len(manifest["by_mode"]), 2)
+        self.assertEqual(len(manifest["by_rule"]), 6)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["counts"]["distinct_modes_with_matches"], 2)
+        self.assertEqual(result["counts"]["rule_mode_product"], 6)
+
+    def test_count_corruption_remains_rejected_in_each_selector_control(self):
+        cases = (
+            ("slices/manifest.json", "SLICE_COUNTS_MISMATCH"),
+            ("slices/selectors-verification.json", "SELECTOR_COUNTS_MISMATCH"),
+            ("generation-plan.json", "PLAN_COUNTS_MISMATCH"),
+        )
+        for index, (local, category) in enumerate(cases):
+            with self.subTest(local=local):
+                generation_id = f"20261002T12050{index}Z-abc012ef"
+                generation_dir = self.build(
+                    modes=2, rules=2, populated_modes=2, unclassified_matches=1,
+                    pieces=1, generation_id=generation_id,
+                )
+                path = generation_dir / local
+                document = json.loads(path.read_text())
+                if local == "slices/selectors-verification.json":
+                    document["distinct_modes_with_matches"] = 3
+                    write_json(path, document)
+                    refresh_plan_file_entry(generation_dir, local)
+                    plan_path = generation_dir / "generation-plan.json"
+                    plan = json.loads(plan_path.read_text())
+                    plan["selector_verification"] = document
+                    write_json(plan_path, plan)
+                elif local == "generation-plan.json":
+                    document["counts"]["distinct_modes_with_matches"] = 3
+                    write_json(path, document)
+                else:
+                    document["counts"]["distinct_modes_with_matches"] = 3
+                    write_json(path, document)
+                    refresh_plan_file_entry(generation_dir, local)
+
+                args = ["--generation-dir", str(generation_dir), "--generation-id", generation_id,
+                        "--remote", "mock:database", "--state-dir", str(self.state)]
+                with patch.object(publisher, "Rclone", return_value=self.fake), \
+                        patch.object(publisher.time, "sleep"), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(publisher.main(args), 1)
+                self.assertIn(category, error.getvalue())
+                self.assertEqual(self.fake.objects, {})
 
     def test_restart_skips_matching_objects_and_does_not_duplicate_uploads(self):
         generation_dir = self.build(modes=2, rules=2, pieces=1)
