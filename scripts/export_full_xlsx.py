@@ -311,6 +311,8 @@ def _cell_from_xml(cell: ET.Element) -> str | None:
 
 def _excel_xstring_unescape(text: str) -> str:
     """ST_Xstringのエスケープを1回だけ復号する（export helperに依存しない）。"""
+    if type(text) is str and _EXCEL_ESCAPE_PREFIX not in text:
+        return text
     output: list[str] = []
     index = 0
     while index < len(text):

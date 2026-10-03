@@ -14,7 +14,9 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src/python"))
 
 from ikarchive.lossless_xlsx import (
+    CELL_LIMIT,
     CHUNK_SIZE,
+    _encode_cell_chunks,
     _write_part_with_retry,
     _excel_xstring_escape,
     _excel_xstring_unescape,
@@ -279,6 +281,90 @@ class TestLosslessXlsxRoundtrip(unittest.TestCase):
                     self.assertEqual(restored, expected)
                 finally:
                     target.close()
+        finally:
+            source.close()
+
+    def test_ascii_fast_path_cell_limit_boundaries_roundtrip(self):
+        source = sqlite3.connect(":memory:")
+        try:
+            source.execute("CREATE TABLE \"boundary \"\" table\" (label TEXT, value TEXT)")
+            value = "A" * (2 * CELL_LIMIT + 3) + "_x0041_\r\n\t\x7f"
+            source.execute(
+                'INSERT INTO "boundary "" table"(rowid,label,value) VALUES(?,?,?)',
+                (41, "ascii-boundary", value),
+            )
+            source_bytes_before = source.serialize()
+            schema_before = source.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+            ).fetchall()
+            source_rows = source.execute(
+                'SELECT rowid,label,value,typeof(value) FROM "boundary "" table" ORDER BY rowid'
+            ).fetchall()
+
+            for chunk_size in (CELL_LIMIT - 1, CELL_LIMIT):
+                with self.subTest(chunk_size=chunk_size), tempfile.TemporaryDirectory() as tmpdir:
+                    out_dir = Path(tmpdir) / "xlsx"
+                    out_dir.mkdir()
+                    manifest = export_sqlite_tables(
+                        source,
+                        out_dir,
+                        chunk_size=chunk_size,
+                        snapshot_identifier="ascii-cell-boundary",
+                    )
+                    meta = manifest["tables"]['boundary " table']
+                    records = []
+                    for piece in meta["pieces"]:
+                        records.extend(read_lossless_xlsx(out_dir / piece["name"]))
+                    payload = [row for row in records if row["column_name"] == "value"]
+                    self.assertEqual([row["chunk_number"] for row in payload], [1, 2, 3])
+                    self.assertEqual({row["total_chunks"] for row in payload}, {3})
+                    self.assertTrue(all(len(row["value_chunk"]) <= chunk_size for row in payload))
+                    self.assertTrue(all(row["payload_encoding"] == "plain" for row in payload))
+                    self.assertTrue(all(row["source_rowid"] == 41 for row in payload))
+                    self.assertEqual("".join(row["value_chunk"] for row in payload), value)
+
+                    target = sqlite3.connect(":memory:")
+                    try:
+                        reconstruct_sqlite_tables(out_dir, target)
+                        restored = target.execute(
+                            'SELECT rowid,label,value,typeof(value) FROM "boundary "" table" ORDER BY rowid'
+                        ).fetchall()
+                        self.assertEqual(restored, source_rows)
+                        target_schema = target.execute(
+                            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+                        ).fetchall()
+                        self.assertEqual(target_schema, schema_before)
+                    finally:
+                        target.close()
+
+            oversized = list(
+                _encode_cell_chunks(
+                    'boundary " table',
+                    1,
+                    "value",
+                    value,
+                    CELL_LIMIT + 1,
+                    source_rowid=41,
+                )
+            )
+            self.assertEqual([row[4] for row in oversized], [1, 2, 3])
+            self.assertEqual({row[5] for row in oversized}, {3})
+            self.assertTrue(all(len(row[6]) <= CELL_LIMIT for row in oversized))
+            self.assertEqual("".join(row[6] for row in oversized), value)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                rejected_dir = Path(tmpdir) / "rejected"
+                rejected_dir.mkdir()
+                with self.assertRaisesRegex(ValueError, "chunk_size"):
+                    export_sqlite_tables(source, rejected_dir, chunk_size=CELL_LIMIT + 1)
+                self.assertEqual(list(rejected_dir.iterdir()), [])
+            self.assertEqual(source.serialize(), source_bytes_before)
+            self.assertEqual(
+                source.execute(
+                    "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+                ).fetchall(),
+                schema_before,
+            )
         finally:
             source.close()
 

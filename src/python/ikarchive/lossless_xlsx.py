@@ -444,6 +444,29 @@ def _encode_cell_chunks(
             source_rowid,
         )
 
+    if (
+        type(val) is str
+        and type(chunk_size) is int
+        and chunk_size > 0
+        and val.isascii()
+        and _UNSAFE_ASCII_XML_RE.search(val) is None
+    ):
+        effective_chunk_size = min(chunk_size, CELL_LIMIT)
+        total = max(1, (len(val) + effective_chunk_size - 1) // effective_chunk_size)
+        if not val:
+            yield emit("text", 1, 1, "")
+        else:
+            for chunk_number, offset in enumerate(
+                range(0, len(val), effective_chunk_size), 1
+            ):
+                yield emit(
+                    "text",
+                    chunk_number,
+                    total,
+                    val[offset : offset + effective_chunk_size],
+                )
+        return
+
     if val is None:
         yield emit("null", 1, 1, None)
     elif isinstance(val, bool):

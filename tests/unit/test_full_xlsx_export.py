@@ -1,5 +1,6 @@
 import copy
 import contextlib
+import base64
 import hashlib
 import io
 import json
@@ -161,6 +162,45 @@ class FullXlsxExportTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_independent_xstring_decoder_fast_path_and_single_pass_tokens(self):
+        base64_text = base64.b64encode(bytes(range(256)) * 16).decode("ascii")
+        prefix_free = [
+            "",
+            '{"int64":9223372036854775807,"decimal":1.2300e+04,"unknown":true}',
+            base64_text,
+            "日本語・漢字・𠮷・𠀋",
+            "text with NUL\x00 and controls\x01\x1f",
+            "_X0041_",
+            "uppercase prefix _X and punctuation !?",
+        ]
+        for text in prefix_free:
+            with self.subTest(text_kind="prefix-free", length=len(text)):
+                self.assertIs(xlsx_cli._excel_xstring_unescape(text), text)
+
+        token_cases = {
+            "_x0041_": "A",
+            "_x0000_": "\x00",
+            "_xD800_": "\ud800",
+            "_x12_": "_x12_",
+            "_xGGGG_": "_xGGGG_",
+            "_x0041": "_x0041",
+            "_x005F_x0041_": "_x0041_",
+            "_x_x0041_": "_xA",
+            "__x0041_": "_A",
+            "_x0041__x0042_": "AB",
+        }
+        for encoded, expected in token_cases.items():
+            with self.subTest(encoded=encoded):
+                self.assertEqual(xlsx_cli._excel_xstring_unescape(encoded), expected)
+
+        class TextSubclass(str):
+            pass
+
+        subclass_text = TextSubclass("plain subclass text")
+        decoded_subclass = xlsx_cli._excel_xstring_unescape(subclass_text)
+        self.assertEqual(decoded_subclass, subclass_text)
+        self.assertIs(type(decoded_subclass), str)
 
     def export(self, *, max_rows_per_sheet=200_000):
         return export_full_xlsx(
