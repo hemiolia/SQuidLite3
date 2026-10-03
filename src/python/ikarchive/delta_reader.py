@@ -1274,6 +1274,7 @@ class DeltaChainReader:
         """Own nested cursors and recheck published inputs at iterator boundaries."""
         def rows() -> Generator[Any, None, None]:
             inner = None
+            body_error: Optional[BaseException] = None
             try:
                 self._assert_public_read_state()
                 inner = iter(factory())
@@ -1284,6 +1285,15 @@ class DeltaChainReader:
                     except StopIteration:
                         return
                     yield item
+            except BaseException as error:
+                # Cleanup and the final publication guard are secondary to an
+                # exception raised by iterator creation, iteration, or the
+                # consumer. GeneratorExit is the explicit generator-close
+                # boundary: it must still allow the final guard to reject a
+                # changed published input.
+                if not isinstance(error, GeneratorExit):
+                    body_error = error
+                raise
             finally:
                 close_error: Optional[BaseException] = None
                 guard_error: Optional[BaseException] = None
@@ -1298,10 +1308,11 @@ class DeltaChainReader:
                     guard_error = error
                 finally:
                     self._iterators.discard(outer)
-                if guard_error is not None:
-                    raise guard_error
-                if close_error is not None:
-                    raise close_error
+                if body_error is None:
+                    if guard_error is not None:
+                        raise guard_error
+                    if close_error is not None:
+                        raise close_error
 
         outer = rows()
         self._iterators.add(outer)

@@ -1372,6 +1372,129 @@ class DeltaChainReaderTests(unittest.TestCase):
             self.assertIsNone(successful_reader._connection)
             self.assertEqual(successful_reader._iterators, set())
 
+    def test_tracked_iterator_preserves_primary_failures_and_still_guards_cleanup(self):
+        class SyntheticInterrupt(BaseException):
+            pass
+
+        class ClosingIterator:
+            def __init__(self, values=(), *, next_error=None, close_error=None):
+                self.values = iter(values)
+                self.next_error = next_error
+                self.close_error = close_error
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.next_error is not None:
+                    raise self.next_error
+                return next(self.values)
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_error is not None:
+                    raise self.close_error
+
+        def make_reader():
+            reader = object.__new__(DeltaChainReader)
+            reader._iterators = set()
+            return reader
+
+        body_errors = [
+            SyntheticInterrupt("original synthetic interruption"),
+            KeyboardInterrupt("original keyboard interruption"),
+            SystemExit("original system exit"),
+            RuntimeError("original iterator failure"),
+        ]
+        for body_error in body_errors:
+            with self.subTest(primary=type(body_error).__name__):
+                reader = make_reader()
+                close_error = RuntimeError("secondary close failure")
+                guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+                inner = ClosingIterator(next_error=body_error, close_error=close_error)
+                with (
+                    patch.object(reader, "_require_open"),
+                    patch.object(reader, "_assert_public_read_state", side_effect=[None, guard_error]),
+                ):
+                    rows = reader._track_iterator(lambda: inner)
+                    with self.assertRaises(type(body_error)) as caught:
+                        next(rows)
+                self.assertIs(caught.exception, body_error)
+                self.assertEqual(inner.close_calls, 1)
+                self.assertEqual(reader._iterators, set())
+
+        # Exceptions thrown into a suspended outer generator by its consumer
+        # have the same priority as failures from factory() or inner.__next__.
+        reader = make_reader()
+        consumer_error = SyntheticInterrupt("original consumer interruption")
+        inner = ClosingIterator(values=(1,), close_error=RuntimeError("close failed"))
+        guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+        with (
+            patch.object(reader, "_require_open"),
+            patch.object(reader, "_assert_public_read_state", side_effect=[None, guard_error]),
+        ):
+            rows = reader._track_iterator(lambda: inner)
+            self.assertEqual(next(rows), 1)
+            with self.assertRaises(SyntheticInterrupt) as caught:
+                rows.throw(consumer_error)
+        self.assertIs(caught.exception, consumer_error)
+        self.assertEqual(inner.close_calls, 1)
+        self.assertEqual(reader._iterators, set())
+
+        # A factory failure and a first-boundary guard failure are also primary.
+        reader = make_reader()
+        factory_error = RuntimeError("factory failure")
+        final_guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+
+        def failed_factory():
+            raise factory_error
+
+        with (
+            patch.object(reader, "_require_open"),
+            patch.object(reader, "_assert_public_read_state", side_effect=[None, final_guard_error]),
+        ):
+            rows = reader._track_iterator(failed_factory)
+            with self.assertRaises(RuntimeError) as caught:
+                next(rows)
+        self.assertIs(caught.exception, factory_error)
+        self.assertEqual(reader._iterators, set())
+
+        reader = make_reader()
+        first_guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+        final_guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+        with (
+            patch.object(reader, "_require_open"),
+            patch.object(reader, "_assert_public_read_state", side_effect=[first_guard_error, final_guard_error]),
+        ):
+            rows = reader._track_iterator(lambda: self.fail("factory ran"))
+            with self.assertRaises(DeltaReaderError) as caught:
+                next(rows)
+        self.assertIs(caught.exception, first_guard_error)
+        self.assertEqual(reader._iterators, set())
+
+        # Successful exhaustion retains the existing guard-before-close
+        # precedence, and explicit close still exposes a changed-input guard.
+        for explicit_close in (False, True):
+            reader = make_reader()
+            guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+            close_error = RuntimeError("secondary close failure")
+            inner = ClosingIterator(values=(7,), close_error=close_error)
+            with (
+                patch.object(reader, "_require_open"),
+                patch.object(reader, "_assert_public_read_state", side_effect=[None, guard_error]),
+            ):
+                rows = reader._track_iterator(lambda: inner)
+                self.assertEqual(next(rows), 7)
+                with self.assertRaises(DeltaReaderError) as caught:
+                    if explicit_close:
+                        rows.close()
+                    else:
+                        next(rows)
+            self.assertIs(caught.exception, guard_error)
+            self.assertEqual(inner.close_calls, 1)
+            self.assertEqual(reader._iterators, set())
+
     def test_wrong_parent_or_generation_and_missing_chain_are_rejected(self):
         normal_root, normal_plan = self._make_delta("wrong-parent-base", DELTA_A_ID, self.reset_plan)
         self.assertTrue(normal_plan["metadata"]["all_writers_contract_enforced"])
