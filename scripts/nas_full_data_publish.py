@@ -1204,9 +1204,14 @@ class Rclone:
         if type(drive_folder_cache) is not bool:
             raise PublishError("CONFIG_ERROR")
         self._folder_cache = None
+        self._missing_parent_copy_lock = None
         if drive_folder_cache:
             from rclone_drive_folders import DriveFolderCache
             self._folder_cache = DriveFolderCache(self._directory_stat, PublishError)
+            # A missing folder is deliberately not cached. Serialize only the
+            # path-based copy that can create it; once discoverable, later
+            # copies can use the folder ID concurrently.
+            self._missing_parent_copy_lock = threading.Lock()
 
     def _directory_stat(self, remote_path, parent_folder_id=None):
         # rclone 1.60 synthesizes directory --stat output without its Drive ID.
@@ -1304,6 +1309,31 @@ class Rclone:
 
     def copyto(self, source, remote_path, *, immutable):
         routed, folder_id = self._route(remote_path)
+        has_parent_directory = (
+            self._folder_cache is not None
+            and "/" in remote_path.split(":", 1)[1]
+        )
+        if has_parent_directory and folder_id is None:
+            with self._missing_parent_copy_lock:
+                # Another worker may have created this directory while this
+                # worker waited for the creation lock.
+                routed, folder_id = self._route(remote_path)
+                if folder_id is None:
+                    self._copyto_routed(source, routed, folder_id, immutable=immutable)
+                    # The path-based copy above must have made every parent
+                    # discoverable before this client permits another fallback.
+                    _resolved_path, resolved_id = self._route(remote_path)
+                    if resolved_id is None:
+                        raise PublishError("REMOTE_DIRECTORY_MISSING")
+                    return
+
+            # A previous worker created the missing parent. The lock is now
+            # released, so this artifact can use its verified folder ID.
+            return self._copyto_routed(source, routed, folder_id, immutable=immutable)
+
+        return self._copyto_routed(source, routed, folder_id, immutable=immutable)
+
+    def _copyto_routed(self, source, routed, folder_id, *, immutable):
         command = [self.binary, "copyto"]
         if immutable:
             command.append("--immutable")
