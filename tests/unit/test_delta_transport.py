@@ -147,11 +147,82 @@ class DeltaTransportTests(unittest.TestCase):
                     receipt = verify_delta_database(conn, database, document)
                     actual = list(iter_delta_records(database, document))
                     self.assertEqual(receipt["status"], "verified")
-                    self.assertTrue({"sqlite_sequence", "sqlite_stat1", "sqlite_stat4"} <= set(document["table_names"]))
+                    source_schema = [
+                        {"type": row[0], "name": row[1], "tbl_name": row[2], "sql": row[3]}
+                        for row in conn.execute(
+                            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+                        )
+                    ]
+                    source_tables = [item["name"] for item in source_schema if item["type"] == "table"]
+                    source_internal_tables = {
+                        name for name in source_tables if name.casefold().startswith("sqlite_")
+                    }
+                    recognized_internal_tables = {
+                        name for name in source_internal_tables
+                        if name.casefold() == "sqlite_sequence"
+                        or name.casefold() in {f"sqlite_stat{number}" for number in range(1, 5)}
+                    }
+                    self.assertEqual(source_internal_tables, recognized_internal_tables)
+                    self.assertTrue({"sqlite_sequence", "sqlite_stat1"} <= source_internal_tables)
+                    self.assertEqual(document["schemas"], source_schema)
+                    self.assertEqual(document["table_names"], source_tables)
+
+                    source_xinfo = {}
+                    source_counts = {}
+                    for table in source_tables:
+                        quoted = '"' + table.replace('"', '""') + '"'
+                        source_xinfo[table] = [
+                            {
+                                "cid": row[0], "name": row[1], "type": row[2],
+                                "notnull": row[3], "dflt_value": row[4],
+                                "pk": row[5], "hidden": row[6],
+                            }
+                            for row in conn.execute(f"PRAGMA table_xinfo({quoted})")
+                        ]
+                        source_counts[table] = int(
+                            conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+                        )
+                    self.assertEqual(document["source_table_columns"], source_xinfo)
+                    self.assertEqual(document["source_row_counts"], source_counts)
+
+                    transported_internal_tables = {
+                        name for name in document["table_names"] if name.casefold().startswith("sqlite_")
+                    }
+                    self.assertEqual(transported_internal_tables, source_internal_tables)
                     self.assertEqual(document["source_row_counts"]["sqlite_sequence"], 1)
                     sequence = [record for record in actual if record["table_name"] == "sqlite_sequence"]
                     self.assertEqual([record["operation"] for record in sequence], ["clear_table", "upsert"])
                     self.assertEqual(sequence[1]["values"], ("auto_rows", 2))
+
+                    def typed_rows(rows):
+                        def typed_value(value):
+                            if type(value) is float:
+                                return ("float", value.hex())
+                            if type(value) is bytes:
+                                return ("bytes", value.hex())
+                            return (type(value).__name__, value)
+
+                        return sorted(
+                            (tuple(typed_value(value) for value in row) for row in rows),
+                            key=repr,
+                        )
+
+                    for table in sorted(source_internal_tables):
+                        quoted = '"' + table.replace('"', '""') + '"'
+                        source_rows = [
+                            tuple(row)
+                            for row in conn.execute(f"SELECT * FROM {quoted} ORDER BY rowid")
+                        ]
+                        table_records = [record for record in actual if record["table_name"] == table]
+                        self.assertTrue(table_records, table)
+                        self.assertEqual(
+                            [record["operation"] for record in table_records],
+                            ["clear_table", *(["upsert"] * len(source_rows))],
+                            table,
+                        )
+                        self.assertEqual(table_records[0]["columns"], [item["name"] for item in source_xinfo[table]])
+                        transported_rows = [record["values"] for record in table_records[1:]]
+                        self.assertEqual(typed_rows(transported_rows), typed_rows(source_rows), table)
                     _same_records(self, actual, expected)
         finally:
             conn.close()
