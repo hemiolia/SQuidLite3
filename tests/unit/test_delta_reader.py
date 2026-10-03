@@ -18,6 +18,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from export_full_xlsx import export_full_xlsx  # noqa: E402
 import ikarchive.delta_reader as delta_reader_module  # noqa: E402
+import ikarchive.native_candidates as native_candidates_module  # noqa: E402
+import ikarchive.verified_files as verified_files_module  # noqa: E402
 from ikarchive.change_feed import install_change_feed, read_change_batch  # noqa: E402
 from ikarchive.delta_reader import DeltaChainReader, DeltaReaderError  # noqa: E402
 from ikarchive.delta_transport import build_delta_database, verify_delta_database  # noqa: E402
@@ -171,6 +173,93 @@ def _make_xlsx(source_db: Path, generation_root: Path, generation_id: str) -> di
         "index": _read_json(destination / "index.json"),
         "verification": _read_json(destination / "verification.json"),
     }
+
+
+def _rewrite_native_transport_layout(
+    generation_root: Path,
+    plan: dict,
+    current_path: Path,
+    baseline_path: Path,
+    *,
+    gapped_reordered_table: str,
+    metadata_rowid: int,
+) -> dict:
+    """Change only synthetic transport rowids, then refresh every bound proof."""
+    database_path = generation_root / "changes.sqlite3"
+    connection = sqlite3.connect(database_path)
+    try:
+        table_names, _xinfo, visible = delta_reader_module._delta._table_specs(plan["metadata"])
+        internal = delta_reader_module._delta._internal_names(plan["metadata"], table_names)
+        rowid_alias = delta_reader_module._delta._transport_rowid_alias(
+            visible[gapped_reordered_table]
+        )
+        if rowid_alias is None:
+            raise AssertionError("test table must have an unshadowed transport rowid")
+        operations_table = internal["operations_table"]
+        row_map = connection.execute(
+            f'SELECT "row_ordinal","transport_rowid" FROM "{operations_table}" '
+            'WHERE "table_name"=? AND "operation"=? ORDER BY "row_ordinal"',
+            (gapped_reordered_table, "upsert"),
+        ).fetchall()
+        old_ids = [row[1] for row in row_map]
+        temporary_ids = [(1 << 60) + index for index in range(len(old_ids))]
+        new_ids = [1001 + 17 * (len(old_ids) - index) for index in range(len(old_ids))]
+        quoted_alias = delta_reader_module._quote(rowid_alias)
+        quoted_table = delta_reader_module._quote(gapped_reordered_table)
+        for old_id, temporary_id in zip(old_ids, temporary_ids):
+            connection.execute(
+                f"UPDATE {quoted_table} SET {quoted_alias}=? WHERE {quoted_alias}=?",
+                (temporary_id, old_id),
+            )
+        for (ordinal, _old_id), temporary_id, new_id in zip(row_map, temporary_ids, new_ids):
+            connection.execute(
+                f"UPDATE {quoted_table} SET {quoted_alias}=? WHERE {quoted_alias}=?",
+                (new_id, temporary_id),
+            )
+            connection.execute(
+                f'UPDATE "{operations_table}" SET "transport_rowid"=? '
+                'WHERE "table_name"=? AND "row_ordinal"=?',
+                (new_id, gapped_reordered_table, ordinal),
+            )
+        metadata_table = internal["metadata_table"]
+        connection.execute(
+            f'UPDATE "{metadata_table}" SET "_rowid_"=?', (metadata_rowid,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    document = _read_json(generation_root / "transport-document.json")
+    database_digest = _sha256(database_path)
+    document["database"]["bytes"] = database_digest["bytes"]
+    document["database"]["sha256"] = database_digest["sha256"]
+    source = _readonly(current_path, immutable=True)
+    baseline = _readonly(baseline_path, immutable=True)
+    try:
+        source.execute("BEGIN")
+        receipt = verify_delta_database(
+            source,
+            database_path,
+            document,
+            baseline_conn=baseline if plan["kind"] == "baseline_reconciliation" else None,
+        )
+    finally:
+        source.close()
+        baseline.close()
+    _write_json(generation_root / "transport-document.json", document)
+    _write_json(generation_root / "value-verification.json", receipt)
+
+    shutil.rmtree(generation_root / "xlsx")
+    xlsx = _make_xlsx(database_path, generation_root, plan["generation_id"])
+    plan["transport_database"] = dict(document["database"])
+    plan["value_verification"] = receipt
+    plan["xlsx_verification"] = xlsx["verification"]
+    for item in plan["files"]:
+        digest = _sha256(generation_root / item["local"])
+        item["bytes"] = digest["bytes"]
+        item["sha256"] = digest["sha256"]
+    _write_json(generation_root / "delta-plan.json", plan)
+    return plan
 
 
 def _make_generation(
@@ -1207,6 +1296,82 @@ class DeltaChainReaderTests(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(pending_selector)
 
+    def test_exit_preserves_body_baseexception_and_keeps_success_guard_precedence(self):
+        indexed = self.root / "published-exit-exception-priority"
+        shutil.copytree(self.reset_root, indexed)
+        self._write_publisher_index(indexed, _read_json(indexed / "delta-plan.json"))
+
+        class SyntheticInterrupt(BaseException):
+            pass
+
+        class ClosingFailure:
+            def __init__(self, error):
+                self.error = error
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                raise self.error
+
+        body_error = SyntheticInterrupt("original body interruption")
+        close_error = RuntimeError("iterator close failure")
+        guard_error = DeltaReaderError("DELTA_PUBLISHED_INPUT_CHANGED")
+        cleanup_error = RuntimeError("cleanup follow-up failure")
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            reader = DeltaChainReader(baseline, [indexed], require_published_deltas=True)
+            body_iterator = ClosingFailure(close_error)
+            body_cleanup_calls = []
+            real_body_cleanup = reader._cleanup
+
+            def body_cleanup_then_fail():
+                body_cleanup_calls.append(True)
+                real_body_cleanup()
+                raise cleanup_error
+
+            with (
+                patch.object(reader, "_assert_public_read_state", side_effect=guard_error) as body_guard,
+                patch.object(reader, "_cleanup", side_effect=body_cleanup_then_fail),
+            ):
+                with self.assertRaises(SyntheticInterrupt) as caught:
+                    with reader:
+                        reader._iterators.add(body_iterator)
+                        raise body_error
+            self.assertIs(caught.exception, body_error)
+            self.assertTrue(body_iterator.closed)
+            self.assertEqual(body_guard.call_count, 1)
+            self.assertEqual(body_cleanup_calls, [True])
+            self.assertIsNone(reader._connection)
+            self.assertEqual(reader._iterators, set())
+
+            successful_reader = DeltaChainReader(
+                baseline, [indexed], require_published_deltas=True,
+            )
+            success_iterator = ClosingFailure(close_error)
+            success_cleanup_calls = []
+            real_success_cleanup = successful_reader._cleanup
+
+            def success_cleanup_then_fail():
+                success_cleanup_calls.append(True)
+                real_success_cleanup()
+                raise cleanup_error
+
+            with (
+                patch.object(
+                    successful_reader, "_assert_public_read_state", side_effect=guard_error,
+                ) as success_guard,
+                patch.object(successful_reader, "_cleanup", side_effect=success_cleanup_then_fail),
+            ):
+                with self.assertRaises(DeltaReaderError) as guard_caught:
+                    with successful_reader:
+                        successful_reader._iterators.add(success_iterator)
+                self.assertIs(guard_caught.exception, guard_error)
+            self.assertTrue(success_iterator.closed)
+            self.assertEqual(success_guard.call_count, 1)
+            self.assertEqual(success_cleanup_calls, [True])
+            self.assertIsNone(successful_reader._connection)
+            self.assertEqual(successful_reader._iterators, set())
+
     def test_wrong_parent_or_generation_and_missing_chain_are_rejected(self):
         normal_root, normal_plan = self._make_delta("wrong-parent-base", DELTA_A_ID, self.reset_plan)
         self.assertTrue(normal_plan["metadata"]["all_writers_contract_enforced"])
@@ -1377,6 +1542,344 @@ class DeltaChainReaderTests(unittest.TestCase):
         self.assertEqual(_tree_snapshot(self.baseline_package), baseline_before)
         self.assertEqual(_sha256(self.current_db), source_before)
 
+    def test_unique_lookup_native_reset_and_two_deltas_use_projected_candidates(self):
+        nonmatch_text = "unselected\x00𠮷" * 45_000
+        nonmatch_blob = b"N" + bytes(range(256)) * 3_500
+        selected_text = "selected\x00𠮷" * 55_000
+        selected_blob = b"S" + bytes(range(255, -1, -1)) * 4_000
+        self.writer.execute(
+            "UPDATE matches SET payload=?,raw_body=? WHERE match_key=?",
+            (nonmatch_text, nonmatch_blob, "match-b"),
+        )
+        self.writer.commit()
+        root_reset = self.root / "lookup-native-reset"
+        plan_reset = _make_generation(
+            self.current_db, self.baseline_db, root_reset,
+            "20261003T010010Z-00000011", BASELINE_ID,
+            self.baseline_identity["sha256"], kind="baseline_reconciliation",
+            transport_kind="native_sqlite",
+        )
+        self.writer.execute(
+            "UPDATE matches SET payload=?,raw_body=? WHERE match_key=?",
+            ("superseded-value", b"superseded\x00blob", "match-a"),
+        )
+        self.writer.commit()
+        root_a, plan_a = self._make_delta(
+            "lookup-native-a", "20261003T010011Z-00000012", plan_reset,
+            transport_kind="native_sqlite",
+        )
+        self.writer.execute(
+            "UPDATE matches SET payload=?,huge_integer=?,ratio=?,raw_body=? WHERE match_key=?",
+            (selected_text, HUGE_INTEGER, float("-inf"), selected_blob, "match-a"),
+        )
+        self.writer.commit()
+        root_b, _plan_b = self._make_delta(
+            "lookup-native-b", "20261003T010012Z-00000013", plan_a,
+            transport_kind="native_sqlite",
+        )
+
+        expected = self.writer.execute(
+            "SELECT rowid,* FROM matches WHERE match_key=?", ("match-a",)
+        ).fetchone()
+        expected_rowid, *expected_values = expected
+        transport_connection = sqlite3.connect(root_b / "changes.sqlite3")
+        try:
+            expected_transport_rowid = transport_connection.execute(
+                'SELECT "_rowid_" FROM "matches" WHERE "match_key"=?', ("match-a",)
+            ).fetchone()[0]
+        finally:
+            transport_connection.close()
+        source_before = _sha256(self.current_db)
+        baseline_before = _tree_snapshot(self.baseline_package)
+        read_external = delta_reader_module._lossless._read_external_cell
+        baseline_external_reads: list[str] = []
+
+        def count_baseline_external_reads(root, table_id, *args, **kwargs):
+            if Path(root).resolve() == self.baseline_package.resolve():
+                baseline_external_reads.append(table_id)
+            return read_external(root, table_id, *args, **kwargs)
+
+        real_connect = native_candidates_module._connect_readonly
+        query_log: list[tuple[Path, str, tuple[Any, ...]]] = []
+
+        class TrackedConnection:
+            def __init__(self, connection, path):
+                self.connection = connection
+                self.path = path
+
+            def execute(self, sql, parameters=()):
+                query_log.append((self.path, sql, tuple(parameters)))
+                return self.connection.execute(sql, parameters)
+
+            def close(self):
+                return self.connection.close()
+
+        def tracked_connect(path):
+            return TrackedConnection(real_connect(path), Path(path).resolve())
+
+        original_iter = native_candidates_module.NativeTransportCandidates.iter_table_candidates
+        candidate_calls: list[tuple[str, str]] = []
+
+        def tracked_iter(adapter, table, criteria_by_column, *, candidate_row_filter=None):
+            candidate_calls.append((str(adapter._root_input), table))
+            return original_iter(
+                adapter, table, criteria_by_column,
+                candidate_row_filter=candidate_row_filter,
+            )
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            with DeltaChainReader(baseline, [root_reset, root_a, root_b]) as reader:
+                with (
+                    patch.object(native_candidates_module, "_connect_readonly", side_effect=tracked_connect),
+                    patch.object(
+                        native_candidates_module.NativeTransportCandidates,
+                        "iter_table_candidates", new=tracked_iter,
+                    ),
+                    patch.object(
+                        delta_reader_module._lossless,
+                        "_read_external_cell", side_effect=count_baseline_external_reads,
+                    ),
+                    patch.object(
+                        verified_files_module, "_hash_descriptor",
+                        wraps=verified_files_module._hash_descriptor,
+                    ) as hash_file,
+                ):
+                    self.assertIsNone(
+                        reader.get_unique_row("matches", {"match_key": "no-such-row"})
+                    )
+                    result = reader.get_unique_row("matches", {"match_key": "match-a"})
+                    self.assertEqual(result, {
+                        "source_rowid": expected_rowid,
+                        "values": tuple(expected_values),
+                    })
+                    self.assertIs(type(result["values"][4]), int)
+                    self.assertEqual(result["values"][4], HUGE_INTEGER)
+                    self.assertIs(type(result["values"][5]), float)
+                    self.assertEqual(result["values"][5].hex(), "-inf")
+                    self.assertEqual(
+                        reader.get_unique_row("matches", {"ratio": float("-inf")}), result
+                    )
+                    self.assertIsNone(reader.get_unique_row("matches", {"ratio": 0}))
+                    self.assertIsNone(reader.get_unique_row(
+                        "matches", {"huge_integer": float(HUGE_INTEGER)}
+                    ))
+                    self.assertEqual(
+                        reader.get_unique_row("matches", {"huge_integer": HUGE_INTEGER}), result
+                    )
+                    with self.assertRaises(DeltaReaderError) as bool_criteria:
+                        reader.get_unique_row("matches", {"huge_integer": True})
+                    self.assertEqual(bool_criteria.exception.code, "DELTA_LOOKUP_CRITERIA_INVALID")
+                    self.assertEqual(reader.get_unique_row(
+                        "matches", {"match_key": "match-a"},
+                    ), result)
+                    self.assertEqual(reader._materialized, set())
+                    self.assertEqual(baseline_external_reads, [])
+                    self.assertEqual(hash_file.call_count, 0)
+
+                    self.assertEqual(
+                        [package["kind"] for package in reader._lookup_transport_packages],
+                        ["native_sqlite", "native_sqlite", "native_sqlite"],
+                    )
+                    for package in reader._lookup_transport_packages:
+                        operation_table = package["operations_table"]
+                        self.assertEqual(
+                            sum(root == str(package["root"]) and name == operation_table
+                                for root, name in candidate_calls),
+                            1,
+                        )
+
+                    match_scans = [
+                        sql.lower() for _path, sql, _params in query_log
+                        if 'left join "matches" as v' in sql.lower()
+                    ]
+                    self.assertTrue(match_scans)
+                    for sql in match_scans:
+                        self.assertNotIn('"payload"', sql)
+                        self.assertNotIn('"raw_body"', sql)
+                    full_match_reads = [
+                        (path, params) for path, sql, params in query_log
+                        if path == (root_b / "changes.sqlite3").resolve()
+                        and sql.lower().startswith('select * from "matches"')
+                    ]
+                    self.assertEqual(len(full_match_reads), 4)
+                    self.assertTrue(all(
+                        params == (expected_transport_rowid,)
+                        for _path, params in full_match_reads
+                    ))
+
+                    sibling = root_a / "xlsx" / "manifest.json"
+                    sibling.write_bytes(sibling.read_bytes() + b" ")
+                    with self.assertRaises(DeltaReaderError) as changed:
+                        reader.get_unique_row("matches", {"match_key": "match-a"})
+                    self.assertEqual(changed.exception.code, "DELTA_PUBLISHED_INPUT_CHANGED")
+
+        self.assertEqual(_sha256(self.current_db), source_before)
+        self.assertEqual(_tree_snapshot(self.baseline_package), baseline_before)
+
+    def test_unique_lookup_mixes_native_and_sharded_transports(self):
+        self.writer.execute(
+            "UPDATE records SET payload=?,blob_value=? WHERE id=?",
+            ("middle-state", b"M" + bytes(range(256)) * 1_500, 5),
+        )
+        self.writer.commit()
+        root_a, plan_a = self._make_delta(
+            "lookup-mixed-a", "20261003T010013Z-00000014", self.reset_plan,
+            transport_kind="lossless_sqlite_shards", shard_max_bytes=256 * 1024,
+        )
+        self.writer.execute(
+            "UPDATE records SET payload=?,large_integer=?,ratio=? WHERE id=?",
+            ("final-state\x00𠮷", HUGE_INTEGER, -0.0, 5),
+        )
+        self.writer.commit()
+        root_b, _plan_b = self._make_delta(
+            "lookup-mixed-b", "20261003T010014Z-00000015", plan_a,
+            transport_kind="native_sqlite",
+        )
+        expected = self.writer.execute(
+            "SELECT rowid,* FROM records WHERE id=?", (5,)
+        ).fetchone()
+        expected_rowid, *expected_values = expected
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            with DeltaChainReader(baseline, [self.reset_root, root_a, root_b]) as reader:
+                result = reader.get_unique_row("records", {"id": 5})
+                self.assertEqual(result, {
+                    "source_rowid": expected_rowid,
+                    "values": tuple(expected_values),
+                })
+                self.assertEqual(
+                    [package["kind"] for package in reader._lookup_transport_packages],
+                    ["native_sqlite", "lossless_sqlite_shards", "native_sqlite"],
+                )
+                self.assertEqual(reader._materialized, set())
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            with DeltaChainReader(baseline, [self.reset_root, root_a, root_b]) as full_reader:
+                full_rows = list(full_reader.iter_rows("records"))
+        full_match = next(row for row in full_rows if row[2][0] == 5)
+        self.assertEqual((full_match[1], full_match[2]), (result["source_rowid"], result["values"]))
+
+    def test_native_lookup_accepts_gapped_reordered_transport_rowids_and_metadata_rowid(self):
+        for index, metadata_rowid in enumerate((0, -7)):
+            with self.subTest(metadata_rowid=metadata_rowid):
+                self.writer.execute(
+                    "UPDATE matches SET payload=? WHERE match_key=?",
+                    (f"layout-state-{index}", "match-a"),
+                )
+                self.writer.commit()
+                root = self.root / f"native-layout-{index}"
+                generation_id = f"20261003T01002{index}Z-0000001{index}"
+                plan = _make_generation(
+                    self.current_db, self.baseline_db, root, generation_id,
+                    BASELINE_ID, self.baseline_identity["sha256"],
+                    kind="baseline_reconciliation", transport_kind="native_sqlite",
+                )
+                plan = _rewrite_native_transport_layout(
+                    root, plan, self.current_db, self.baseline_db,
+                    gapped_reordered_table="matches", metadata_rowid=metadata_rowid,
+                )
+                document = _read_json(root / "transport-document.json")
+                internal = document["internal_names"]
+                transport = sqlite3.connect(root / "changes.sqlite3")
+                try:
+                    ops = internal["operations_table"]
+                    operation_rowids = [row[0] for row in transport.execute(
+                        f'SELECT "transport_rowid" FROM "{ops}" '
+                        'WHERE "table_name"=? AND "operation"=? ORDER BY "row_ordinal"',
+                        ("matches", "upsert"),
+                    )]
+                    physical_rowids = [row[0] for row in transport.execute(
+                        'SELECT "_rowid_" FROM "matches" ORDER BY "_rowid_"'
+                    )]
+                    actual_metadata_rowid = transport.execute(
+                        f'SELECT "_rowid_" FROM "{internal["metadata_table"]}"'
+                    ).fetchone()[0]
+                finally:
+                    transport.close()
+                self.assertEqual(sorted(operation_rowids), physical_rowids)
+                self.assertEqual(operation_rowids, sorted(operation_rowids, reverse=True))
+                self.assertEqual(actual_metadata_rowid, metadata_rowid)
+
+                expected = self.writer.execute(
+                    "SELECT rowid,* FROM matches WHERE match_key=?", ("match-a",)
+                ).fetchone()
+                with LosslessShardReader(
+                    self.baseline_package, expected_generation=BASELINE_ID,
+                ) as baseline:
+                    with DeltaChainReader(baseline, [root]) as reader:
+                        result = reader.get_unique_row("matches", {"match_key": "match-a"})
+                        self.assertEqual(result, {
+                            "source_rowid": expected[0], "values": tuple(expected[1:]),
+                        })
+                        package = reader._lookup_transport_packages[0]
+                        adapter = package["adapter"]
+                        ordinal_index = package["visible"]["matches"].index("match_key")
+                        candidates = list(adapter.iter_table_candidates(
+                            "matches", {ordinal_index: "match-a"},
+                        ))
+                        self.assertEqual(len(candidates), 1)
+                        source_ordinal, physical_rowid, values = candidates[0]
+                        self.assertEqual(values, tuple(expected[1:]))
+                        reference_connection = sqlite3.connect(root / "changes.sqlite3")
+                        try:
+                            expected_reference = reference_connection.execute(
+                                f'SELECT "row_ordinal","transport_rowid" FROM "{ops}" '
+                                'WHERE "table_name"=? AND "source_rowid"=? AND "operation"=?',
+                                ("matches", expected[0], "upsert"),
+                            ).fetchone()
+                        finally:
+                            reference_connection.close()
+                        self.assertEqual(
+                            (source_ordinal, physical_rowid), expected_reference,
+                        )
+                        self.assertEqual(reader._materialized, set())
+                        self.assertEqual(reader.columns("matches"), plan["source_table_columns"]["matches"])
+
+    def test_native_lookup_rejects_bad_superseded_operation_reference(self):
+        self.writer.execute("UPDATE records SET payload=? WHERE id=?", ("older", 5))
+        self.writer.commit()
+        root_a, plan_a = self._make_delta(
+            "lookup-native-reference-a", "20261003T010030Z-00000020",
+            self.reset_plan, transport_kind="native_sqlite",
+        )
+        self.writer.execute("UPDATE records SET payload=? WHERE id=?", ("newer", 5))
+        self.writer.commit()
+        root_b, _plan_b = self._make_delta(
+            "lookup-native-reference-b", "20261003T010031Z-00000021",
+            plan_a, transport_kind="native_sqlite",
+        )
+        original_iter = native_candidates_module.NativeTransportCandidates.iter_table_candidates
+
+        def corrupt_historical_reference(
+            adapter, table, criteria_by_column, *, candidate_row_filter=None,
+        ):
+            if (Path(adapter._root_input) == root_a.resolve()
+                    and table == "records" and candidate_row_filter is not None):
+                original_filter = candidate_row_filter
+
+                def wrong_transport_rowid(ordinal, transport_rowid):
+                    return original_filter(ordinal, transport_rowid + 10_000)
+
+                candidate_row_filter = wrong_transport_rowid
+            return original_iter(
+                adapter, table, criteria_by_column,
+                candidate_row_filter=candidate_row_filter,
+            )
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            with DeltaChainReader(baseline, [self.reset_root, root_a, root_b]) as reader:
+                with patch.object(
+                    native_candidates_module.NativeTransportCandidates,
+                    "iter_table_candidates", new=corrupt_historical_reference,
+                ):
+                    with self.assertRaises(DeltaReaderError) as invalid:
+                        reader.get_unique_row("records", {"id": 999_999})
+                self.assertEqual(
+                    invalid.exception.code, "DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID"
+                )
+                self.assertNotIn("records", reader._lookup_map_tables)
+                self.assertEqual(reader._materialized, set())
+
     def test_unique_lookup_validation_and_baseline_without_rowid_fallback(self):
         baseline = LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID)
         with baseline:
@@ -1415,13 +1918,18 @@ class DeltaChainReaderTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 reader.get_unique_row("records", {"id": 5})
 
-    def test_unique_lookup_falls_back_for_native_transport_schema_changes_and_shadowed_rowid(self):
         with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
             with DeltaChainReader(baseline, [self.reset_root]) as reader:
-                result = reader.get_unique_row("records", {"id": 5})
-                self.assertEqual(result["values"][1], "new\x00text")
-                self.assertEqual(reader._materialized, {"records"})
+                current_key = reader.get_unique_row(
+                    "key_only", {"kind": "vs", "key_value": b"\x00key-a"}
+                )
+                self.assertIsNone(current_key["source_rowid"])
+                self.assertEqual(
+                    current_key["values"], (b"key\x00updated", "vs", b"\x00key-a")
+                )
+                self.assertEqual(reader._materialized, {"key_only"})
 
+    def test_unique_lookup_falls_back_for_schema_changes_and_shadowed_rowid(self):
         self.writer.execute("ALTER TABLE records ADD COLUMN lookup_added TEXT")
         self.writer.execute("UPDATE records SET lookup_added='schema-reset' WHERE id=5")
         self.writer.commit()
@@ -1439,11 +1947,12 @@ class DeltaChainReaderTests(unittest.TestCase):
                 self.assertIsNone(reader._lookup_operations_cache)
 
         shadow_source = self.root / "shadowed-rowid.sqlite3"
+        shadow_current = self.root / "shadowed-rowid-current.sqlite3"
         shadow_package = self.root / "shadowed-rowid-package"
         connection = sqlite3.connect(shadow_source)
         try:
             connection.execute(
-                "CREATE TABLE shadowed (rowid TEXT, _rowid_ TEXT, oid TEXT, payload BLOB)"
+                "CREATE TABLE shadowed (id TEXT PRIMARY KEY, rowid TEXT, _rowid_ TEXT, oid TEXT, payload BLOB)"
             )
             connection.execute(
                 "CREATE TABLE matches (account TEXT, kind TEXT, match_key TEXT, payload)"
@@ -1453,17 +1962,52 @@ class DeltaChainReaderTests(unittest.TestCase):
                 "analysis_set TEXT, rule_raw TEXT, raw_classification BLOB)"
             )
             connection.execute(
-                "INSERT INTO shadowed VALUES(?,?,?,?)", ("a", "b", "c", b"shadowed\x00row")
+                "INSERT INTO shadowed VALUES(?,?,?,?,?)",
+                ("key-a", "a", "b", "c", b"shadowed\x00row"),
             )
             connection.commit()
         finally:
             connection.close()
-        _make_baseline_package(shadow_source, shadow_package)
+        shadow_baseline_info = _make_baseline_package(shadow_source, shadow_package)
         with LosslessShardReader(shadow_package, expected_generation=BASELINE_ID) as baseline:
             with DeltaChainReader(baseline, []) as reader:
                 result = reader.get_unique_row("shadowed", {"payload": b"shadowed\x00row"})
                 self.assertIsNone(result["source_rowid"])
-                self.assertEqual(result["values"], ("a", "b", "c", b"shadowed\x00row"))
+                self.assertEqual(
+                    result["values"], ("key-a", "a", "b", "c", b"shadowed\x00row")
+                )
+                self.assertEqual(reader._materialized, {"shadowed"})
+
+        shutil.copy2(shadow_source, shadow_current)
+        writer = sqlite3.connect(shadow_current)
+        try:
+            writer.execute("PRAGMA recursive_triggers=ON")
+            install_change_feed(writer)
+            install_writer_guards(writer)
+            writer.execute(
+                "UPDATE shadowed SET payload=? WHERE id=?", (b"native\x00updated", "key-a")
+            )
+            writer.commit()
+        finally:
+            writer.close()
+        shadow_delta_root = self.root / "shadowed-native-reset"
+        _make_generation(
+            shadow_current, shadow_source, shadow_delta_root,
+            "20261003T010040Z-00000022", BASELINE_ID,
+            shadow_baseline_info["identity"]["sha256"],
+            kind="baseline_reconciliation", transport_kind="native_sqlite",
+        )
+        with LosslessShardReader(shadow_package, expected_generation=BASELINE_ID) as baseline:
+            with DeltaChainReader(baseline, [shadow_delta_root]) as reader:
+                self.assertFalse(reader._lookup_fast_eligible("shadowed"))
+                current_shadowed = reader.get_unique_row(
+                    "shadowed", {"payload": b"native\x00updated"}
+                )
+                self.assertIsNone(current_shadowed["source_rowid"])
+                self.assertEqual(
+                    current_shadowed["values"],
+                    ("key-a", "a", "b", "c", b"native\x00updated"),
+                )
                 self.assertEqual(reader._materialized, {"shadowed"})
 
     def test_unique_lookup_rechecks_prepared_and_published_tokens_and_closes_candidate_generators(self):
@@ -1607,6 +2151,64 @@ class DeltaChainReaderTests(unittest.TestCase):
                 self.assertIsNone(reader._lookup_operations_cache)
                 self.assertEqual(reader._lookup_transport_packages, [])
                 self.assertEqual(reader._materialized, set())
+
+    def test_unique_lookup_preserves_iterator_baseexception_when_close_also_fails(self):
+        class SyntheticInterrupt(BaseException):
+            pass
+
+        class InterruptingIterator:
+            def __init__(self, body_error, close_error):
+                self.body_error = body_error
+                self.close_error = close_error
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise self.body_error
+
+            def close(self):
+                self.closed = True
+                raise self.close_error
+
+        body_error = SyntheticInterrupt("original operation scan interruption")
+        close_error = RuntimeError("secondary iterator close failure")
+        original = native_candidates_module.NativeTransportCandidates.iter_table_candidates
+        interrupting_iterator = InterruptingIterator(body_error, close_error)
+
+        def interrupt_operations(adapter, table, criteria_by_column, *, candidate_row_filter=None):
+            if table == adapter.operations_table:
+                return interrupting_iterator
+            return original(
+                adapter, table, criteria_by_column,
+                candidate_row_filter=candidate_row_filter,
+            )
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            with DeltaChainReader(baseline, [self.reset_root]) as reader:
+                with patch.object(
+                    native_candidates_module.NativeTransportCandidates,
+                    "iter_table_candidates",
+                    new=interrupt_operations,
+                ):
+                    with self.assertRaises(SyntheticInterrupt) as caught:
+                        reader.get_unique_row("records", {"id": 5})
+
+                self.assertIs(caught.exception, body_error)
+                self.assertTrue(interrupting_iterator.closed)
+                self.assertIsNone(reader._lookup_operations_cache)
+                self.assertFalse(reader._lookup_operations_cache_ready)
+                self.assertEqual(reader._lookup_transport_packages, [])
+                self.assertNotIn("records", reader._lookup_map_tables)
+                self.assertEqual(reader._materialized, set())
+                self.assertFalse(any(
+                    name.startswith("_lookup_operations_")
+                    or name.startswith("_lookup_rows_")
+                    for (name,) in reader._connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                ))
 
     def test_unique_lookup_pk_only_clear_fallback_drops_map_after_operation_cursor_closes(self):
         root = self.root / "lookup-pk-only-clear"
@@ -1779,25 +2381,32 @@ class DeltaChainReaderTests(unittest.TestCase):
                 self.assertNotIn("records", reader._lookup_map_tables)
 
     def test_unique_lookup_rejects_per_generation_row_count_mismatch_and_discards_map(self):
-        root = self.root / "lookup-row-count-mismatch"
-        plan = _make_generation(
-            self.current_db, self.baseline_db, root, RESET_B_ID,
-            BASELINE_ID, self.baseline_identity["sha256"], kind="baseline_reconciliation",
-            transport_kind="lossless_sqlite_shards", shard_max_bytes=256 * 1024,
-        )
-        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
-            with DeltaChainReader(baseline, [root]) as reader:
-                reader._plans[0]["source_row_counts"]["records"] += 1
-                with self.assertRaises(DeltaReaderError) as mismatch:
-                    reader.get_unique_row("records", {"id": 5})
-                self.assertEqual(mismatch.exception.code, "DELTA_LOOKUP_ROW_COUNT_MISMATCH")
-                self.assertNotIn("records", reader._lookup_map_tables)
-                self.assertFalse(any(
-                    row[0].startswith("_lookup_rows_")
-                    for row in reader._connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    )
-                ))
+        for transport_kind in ("native_sqlite", "lossless_sqlite_shards"):
+            with self.subTest(transport_kind=transport_kind):
+                root = self.root / f"lookup-row-count-mismatch-{transport_kind}"
+                _make_generation(
+                    self.current_db, self.baseline_db, root, RESET_B_ID,
+                    BASELINE_ID, self.baseline_identity["sha256"],
+                    kind="baseline_reconciliation", transport_kind=transport_kind,
+                    shard_max_bytes=256 * 1024,
+                )
+                with LosslessShardReader(
+                    self.baseline_package, expected_generation=BASELINE_ID,
+                ) as baseline:
+                    with DeltaChainReader(baseline, [root]) as reader:
+                        reader._plans[0]["source_row_counts"]["records"] += 1
+                        with self.assertRaises(DeltaReaderError) as mismatch:
+                            reader.get_unique_row("records", {"id": 5})
+                        self.assertEqual(
+                            mismatch.exception.code, "DELTA_LOOKUP_ROW_COUNT_MISMATCH"
+                        )
+                        self.assertNotIn("records", reader._lookup_map_tables)
+                        self.assertFalse(any(
+                            row[0].startswith("_lookup_rows_")
+                            for row in reader._connection.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table'"
+                            )
+                        ))
 
     def test_unique_lookup_delete_then_reinsert_replaces_tombstone(self):
         reset_root = self.root / "lookup-delete-reset"
@@ -1871,25 +2480,32 @@ class DeltaChainReaderTests(unittest.TestCase):
             writer.commit()
         finally:
             writer.close()
-        root = self.root / "lookup-fk-generation"
-        plan = _make_generation(
-            current_db, baseline_db, root, RESET_B_ID,
-            BASELINE_ID, baseline_info["identity"]["sha256"],
-            kind="baseline_reconciliation", transport_kind="lossless_sqlite_shards",
-            shard_max_bytes=256 * 1024,
-        )
-
-        with LosslessShardReader(baseline_package, expected_generation=BASELINE_ID) as baseline:
-            with DeltaChainReader(baseline, [root]) as reader:
-                result = reader.get_unique_row("children", {"parent_id": 7})
-                self.assertEqual(result["source_rowid"], 44)
-                self.assertEqual(result["values"], (44, 7, large_body, large_note))
-                self.assertEqual(reader.columns("children"), plan["source_table_columns"]["children"])
-                self.assertEqual(
-                    reader.foreign_keys("children"), plan["source_foreign_keys"]["children"]
+        for transport_kind in ("native_sqlite", "lossless_sqlite_shards"):
+            with self.subTest(transport_kind=transport_kind):
+                root = self.root / f"lookup-fk-generation-{transport_kind}"
+                plan = _make_generation(
+                    current_db, baseline_db, root, RESET_B_ID,
+                    BASELINE_ID, baseline_info["identity"]["sha256"],
+                    kind="baseline_reconciliation", transport_kind=transport_kind,
+                    shard_max_bytes=256 * 1024,
                 )
-                self.assertEqual(reader.schema_objects(), plan["schemas"])
-                self.assertEqual(reader._materialized, set())
+
+                with LosslessShardReader(
+                    baseline_package, expected_generation=BASELINE_ID,
+                ) as baseline:
+                    with DeltaChainReader(baseline, [root]) as reader:
+                        result = reader.get_unique_row("children", {"parent_id": 7})
+                        self.assertEqual(result["source_rowid"], 44)
+                        self.assertEqual(result["values"], (44, 7, large_body, large_note))
+                        self.assertEqual(
+                            reader.columns("children"), plan["source_table_columns"]["children"]
+                        )
+                        self.assertEqual(
+                            reader.foreign_keys("children"),
+                            plan["source_foreign_keys"]["children"],
+                        )
+                        self.assertEqual(reader.schema_objects(), plan["schemas"])
+                        self.assertEqual(reader._materialized, set())
 
 
 if __name__ == "__main__":

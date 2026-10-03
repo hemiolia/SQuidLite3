@@ -8,7 +8,7 @@ Drive, or the source database.
 from __future__ import annotations
 
 import copy
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import itertools
 import json
@@ -24,6 +24,7 @@ from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Seque
 from . import delta_transport as _delta
 from . import lossless_sqlite as _lossless
 from .change_feed import CHANGE_TABLE
+from .native_candidates import NativeTransportCandidates
 from .shard_reader import LosslessShardReader
 from .slice_selectors import UNCLASSIFIED, rule_token as _rule_token
 from .verified_files import verify_files
@@ -78,6 +79,25 @@ class DeltaReaderError(ValueError):
 
 def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+@contextmanager
+def _close_iterator_preserving_exception(iterator: Any) -> Iterator[Any]:
+    """Close a candidate iterator without masking its active exception."""
+    primary_error = False
+    try:
+        yield iterator
+    except BaseException:
+        primary_error = True
+        raise
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException:
+                if not primary_error:
+                    raise
 
 
 def _canonical(value: Any) -> str:
@@ -1185,6 +1205,12 @@ class DeltaChainReader:
                 self._cleanup()
             except BaseException as error:
                 cleanup_error = error
+        # A body exception (including KeyboardInterrupt/SystemExit) is the
+        # primary failure.  Iterator close, the final published-input guard,
+        # and cleanup have all been attempted above, but a secondary failure
+        # must not replace the original exception.
+        if exc is not None:
+            return None
         if guard_error is not None:
             raise guard_error
         if close_error is not None:
@@ -1821,8 +1847,20 @@ class DeltaChainReader:
         if baseline_object is None:
             return False
         for plan in self._plans:
-            if plan.get("transport", {}).get("kind") != "lossless_sqlite_shards":
+            transport_kind = plan.get("transport", {}).get("kind")
+            if transport_kind not in ("native_sqlite", "lossless_sqlite_shards"):
                 return False
+            if transport_kind == "native_sqlite":
+                try:
+                    _names, _xinfo, visible = _delta._table_specs(plan["metadata"])
+                except Exception:
+                    return False
+                if (table not in visible
+                        or _delta._transport_rowid_alias(visible[table]) is None):
+                    # The native fast path needs a stable transport rowid for
+                    # the requested source table.  Keep the existing complete
+                    # materialization path for tables that shadow every alias.
+                    return False
             if not _same_json(plan.get("source_table_columns", {}).get(table), current_xinfo):
                 return False
             if not _same_json(table_object(plan.get("schemas")), baseline_object):
@@ -1830,7 +1868,7 @@ class DeltaChainReader:
         return True
 
     def _lookup_transport_package(self, generation_index: int) -> dict[str, Any]:
-        """Derive a no-rehash candidate token for a preverified transport tree."""
+        """Bind one preverified native DB or sharded transport package."""
         if generation_index < len(self._lookup_transport_packages):
             return self._lookup_transport_packages[generation_index]
         if generation_index != len(self._lookup_transport_packages):
@@ -1842,11 +1880,82 @@ class DeltaChainReader:
 
         plan = self._plans[generation_index]
         manifest = self._shard_manifests[generation_index]
-        if not isinstance(manifest, dict):
-            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
         generation_root = Path(plan["_root"])
-        package_root = generation_root / "transport"
         try:
+            generation_root_guard, guards = self._published_file_guards[generation_index]
+            if generation_root_guard != generation_root or not guards:
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            artifact_guard, artifact_records = guards[0]
+            plan_records = {
+                item["local"]: {"bytes": item["bytes"], "sha256": item["sha256"]}
+                for item in plan["files"]
+            }
+            if artifact_records != plan_records:
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+            transport_kind = plan["transport"].get("kind")
+            document = self._documents[generation_index]
+            table_names, _xinfo, visible = _delta._table_specs(document["metadata"])
+            internal = _delta._internal_names(document["metadata"], table_names)
+            expected_table_names = set(table_names) | {
+                internal["operations_table"], internal["metadata_table"],
+            }
+            if document.get("table_names") != table_names:
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+            if transport_kind == "native_sqlite":
+                if manifest is not None or plan["transport"].get("path") != "changes.sqlite3":
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                database_record = plan_records.get("changes.sqlite3")
+                if (database_record is None
+                        or database_record != {
+                            "bytes": document.get("database", {}).get("bytes"),
+                            "sha256": document.get("database", {}).get("sha256"),
+                        }
+                        or not _same_json(document.get("database"), plan.get("transport_database"))):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                adapter = NativeTransportCandidates(
+                    generation_root,
+                    "changes.sqlite3",
+                    document,
+                    verified_files=artifact_guard,
+                    verified_records=artifact_records,
+                )
+                if (adapter.table_names != table_names
+                        or adapter.visible != visible
+                        or adapter.operations_table != internal["operations_table"]
+                        or adapter.metadata_table != internal["metadata_table"]):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                table_documents = adapter.table_documents
+                if set(table_documents) != expected_table_names:
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                for name in table_names:
+                    if table_documents[name].get("columns") != visible[name]:
+                        raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                if (table_documents[internal["operations_table"]].get("columns")
+                        != list(_OPERATION_FIELDS)
+                        or table_documents[internal["metadata_table"]].get("columns")
+                        != ["name", "value"]):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                package = {
+                    "kind": "native_sqlite",
+                    "root": generation_root,
+                    "manifest": None,
+                    "token": artifact_guard,
+                    "records": artifact_records,
+                    "table_names": table_names,
+                    "visible": visible,
+                    "operations_table": internal["operations_table"],
+                    "metadata_table": internal["metadata_table"],
+                    "table_documents": table_documents,
+                    "adapter": adapter,
+                }
+                self._lookup_transport_packages.append(package)
+                return package
+
+            if transport_kind != "lossless_sqlite_shards" or not isinstance(manifest, dict):
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            package_root = generation_root / "transport"
             parts, external_docs, selector_files = _lossless._declared_files(
                 manifest, package_root, verify_hashes=False
             )
@@ -1869,10 +1978,6 @@ class DeltaChainReader:
                     raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
                 records[relative] = dict(record)
 
-            generation_root_guard, guards = self._published_file_guards[generation_index]
-            if generation_root_guard != generation_root or not guards:
-                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
-            artifact_guard, artifact_records = guards[0]
             selected_records = {
                 f"transport/{relative}": record for relative, record in records.items()
             }
@@ -1882,9 +1987,17 @@ class DeltaChainReader:
             # every public lookup boundary.
             if any(artifact_records.get(path) != item for path, item in selected_records.items()):
                 raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
-            table_names, _xinfo, visible = _delta._table_specs(plan["metadata"])
-            internal = _delta._internal_names(plan["metadata"], table_names)
+            table_documents = {
+                item["name"]: {
+                    "name": item["name"],
+                    "columns": list(item["columns"]),
+                    "row_count": item["row_count"],
+                }
+                for item in manifest.get("tables", [])
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+            }
             package = {
+                "kind": "lossless_sqlite_shards",
                 "root": package_root,
                 "manifest": manifest,
                 "token": transport_token,
@@ -1893,6 +2006,8 @@ class DeltaChainReader:
                 "visible": visible,
                 "operations_table": internal["operations_table"],
                 "metadata_table": internal["metadata_table"],
+                "table_documents": table_documents,
+                "adapter": None,
             }
             self._lookup_transport_packages.append(package)
             return package
@@ -1901,6 +2016,34 @@ class DeltaChainReader:
         except Exception:
             raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID") from None
 
+    def _iter_lookup_transport_candidates(
+        self,
+        package: dict[str, Any],
+        table: str,
+        criteria_by_column: dict[int, Any],
+        *,
+        candidate_row_filter: Optional[Callable[[int, Optional[int]], bool]] = None,
+    ) -> Iterator[tuple[int, Optional[int], tuple[Any, ...]]]:
+        """Dispatch typed candidate scans to the package's verified reader."""
+        package_kind = package.get("kind")
+        if package_kind == "native_sqlite":
+            adapter = package.get("adapter")
+            if not isinstance(adapter, NativeTransportCandidates):
+                raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            return adapter.iter_table_candidates(
+                table, criteria_by_column, candidate_row_filter=candidate_row_filter,
+            )
+        if package_kind == "lossless_sqlite_shards":
+            manifest = package.get("manifest")
+            if not isinstance(manifest, dict):
+                raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            return _lossless._iter_table_candidates(
+                package["root"], manifest, table, criteria_by_column,
+                verified_files=package["token"], verified_records=package["records"],
+                candidate_package_kind="transport", candidate_row_filter=candidate_row_filter,
+            )
+        raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
     def _build_lookup_operations_cache(self) -> str:
         """Validate each small operation stream once and retain only references."""
         connection = self._require_open()
@@ -1908,10 +2051,6 @@ class DeltaChainReader:
             if self._lookup_operations_cache is None:
                 raise DeltaReaderError("DELTA_LOOKUP_CACHE_INVALID")
             return self._lookup_operations_cache
-        if any(plan.get("transport", {}).get("kind") != "lossless_sqlite_shards"
-               for plan in self._plans):
-            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
-
         self._scratch_counter += 1
         suffix = f"{self._scratch_counter:08d}"
         cache_table = f"_lookup_operations_{suffix}"
@@ -1942,7 +2081,7 @@ class DeltaChainReader:
                 f"INSERT INTO {_quote(cache_table)} VALUES "
                 "(?,?,?,?,?,?,?,?,?)"
             )
-            for generation_index, (plan, document, manifest) in enumerate(
+            for generation_index, (plan, document, _manifest) in enumerate(
                 zip(self._plans, self._documents, self._shard_manifests)
             ):
                 package = self._lookup_transport_package(generation_index)
@@ -1951,11 +2090,7 @@ class DeltaChainReader:
                 visible = package["visible"]
                 operations_table = package["operations_table"]
                 metadata_table = package["metadata_table"]
-                table_docs = {
-                    item.get("name"): item
-                    for item in manifest.get("tables", [])
-                    if isinstance(item, dict)
-                }
+                table_docs = package["table_documents"]
                 expected_table_names = set(table_names) | {operations_table, metadata_table}
                 if set(table_docs) != expected_table_names:
                     raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
@@ -1983,16 +2118,12 @@ class DeltaChainReader:
                         or table_docs[metadata_table].get("columns") != ["name", "value"]):
                     raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
 
-                metadata_iterator = _lossless._iter_table_candidates(
-                    package["root"], manifest, metadata_table, {},
-                    verified_files=package["token"], verified_records=package["records"],
-                    candidate_package_kind="transport",
+                metadata_iterator = self._iter_lookup_transport_candidates(
+                    package, metadata_table, {},
                 )
-                try:
+                with _close_iterator_preserving_exception(metadata_iterator):
                     metadata_row = next(metadata_iterator, None)
                     extra_metadata_row = next(metadata_iterator, None)
-                finally:
-                    metadata_iterator.close()
                 if (metadata_row is None or extra_metadata_row is not None
                         or metadata_row[0] != 0
                         or metadata_row[2] != ("source_metadata", _canonical(plan["metadata"]))):
@@ -2004,12 +2135,10 @@ class DeltaChainReader:
                 active_clear: Optional[str] = None
                 upsert_ordinals = {name: 0 for name in table_names}
                 actual_operation_counts = {"upsert": 0, "delete": 0, "clear_table": 0}
-                operation_iterator = _lossless._iter_table_candidates(
-                    package["root"], manifest, operations_table, {},
-                    verified_files=package["token"], verified_records=package["records"],
-                    candidate_package_kind="transport",
+                operation_iterator = self._iter_lookup_transport_candidates(
+                    package, operations_table, {},
                 )
-                try:
+                with _close_iterator_preserving_exception(operation_iterator):
                     for operation_ordinal, operations_rowid, values in operation_iterator:
                         if (type(operation_ordinal) is not int
                                 or operation_ordinal != sum(actual_operation_counts.values())
@@ -2062,8 +2191,6 @@ class DeltaChainReader:
                             identity_key,
                         ))
                         actual_operation_counts[operation] += 1
-                finally:
-                    operation_iterator.close()
 
                 actual_upsert_counts = {
                     name: count for name, count in upsert_ordinals.items() if count
@@ -2106,11 +2233,8 @@ class DeltaChainReader:
         connection = self._require_open()
         for generation_index, package in enumerate(self._lookup_transport_packages):
             document = self._documents[generation_index]
-            manifest = package["manifest"]
             expected = document["upsert_counts_by_table"].get(table, 0)
-            table_doc = next(
-                (item for item in manifest["tables"] if item["name"] == table), None
-            )
+            table_doc = package["table_documents"].get(table)
             if (type(expected) is not int or expected < 0 or table_doc is None
                     or type(table_doc.get("row_count")) is not int
                     or table_doc["row_count"] != expected):
@@ -2141,19 +2265,14 @@ class DeltaChainReader:
                 # but never asks the shard reader to restore an external cell.
                 return False
 
-            candidates = _lossless._iter_table_candidates(
-                package["root"], package["manifest"], table, {},
-                verified_files=package["token"], verified_records=package["records"],
-                candidate_package_kind="transport",
-                candidate_row_filter=reject_after_reference_check,
+            candidates = self._iter_lookup_transport_candidates(
+                package, table, {}, candidate_row_filter=reject_after_reference_check,
             )
             yielded = False
-            try:
+            with _close_iterator_preserving_exception(candidates):
                 for _entry in candidates:
                     yielded = True
                     break
-            finally:
-                candidates.close()
             if reference_error or yielded or scanned != expected:
                 raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
 
@@ -2219,12 +2338,10 @@ class DeltaChainReader:
                 candidate_row_filter=index_baseline_identity,
             )
             baseline_yielded = False
-            try:
+            with _close_iterator_preserving_exception(baseline_candidates):
                 for _entry in baseline_candidates:
                     baseline_yielded = True
                     break
-            finally:
-                baseline_candidates.close()
             if (baseline_error or baseline_yielded
                     or baseline_rows != baseline_table["row_count"]):
                 raise DeltaReaderError("DELTA_LOOKUP_ROW_COUNT_MISMATCH")
@@ -2238,7 +2355,7 @@ class DeltaChainReader:
                     "ORDER BY \"operation_ordinal\"",
                     (generation_index,),
                 )
-                try:
+                with _close_iterator_preserving_exception(cursor):
                     for (operation_ordinal, op_table, operation, source_rowid,
                          identity_json, row_ordinal, transport_rowid, identity_key) in cursor:
                         if op_table != table:
@@ -2266,8 +2383,6 @@ class DeltaChainReader:
                             (source_rowid, generation_index, operation_ordinal, operation,
                              row_ordinal, transport_rowid, identity_key, active),
                         )
-                finally:
-                    cursor.close()
                 if unsupported_identity:
                     break
                 expected_count = plan.get("source_row_counts", {}).get(table)
@@ -2345,7 +2460,7 @@ class DeltaChainReader:
             cursor.close()
         return found
 
-    def _lookup_sharded_candidates(
+    def _lookup_fast_candidates(
         self,
         table: str,
         criteria_indexes: dict[int, Any],
@@ -2390,15 +2505,13 @@ class DeltaChainReader:
                 verified_records=self._baseline._verified_records,
                 candidate_package_kind="baseline", candidate_row_filter=baseline_filter,
             )
-            try:
+            with _close_iterator_preserving_exception(candidates):
                 for _ordinal, source_rowid, values in candidates:
                     if not accept(values):
                         raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
                     if type(source_rowid) is not int:
                         raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
                     record(source_rowid, values)
-            finally:
-                candidates.close()
 
         for generation_index, package in enumerate(self._lookup_transport_packages):
             active_count = connection.execute(
@@ -2430,12 +2543,10 @@ class DeltaChainReader:
                     return False
                 return True
 
-            candidates = _lossless._iter_table_candidates(
-                package["root"], package["manifest"], table, criteria_indexes,
-                verified_files=package["token"], verified_records=package["records"],
-                candidate_package_kind="transport", candidate_row_filter=delta_filter,
+            candidates = self._iter_lookup_transport_candidates(
+                package, table, criteria_indexes, candidate_row_filter=delta_filter,
             )
-            try:
+            with _close_iterator_preserving_exception(candidates):
                 for ordinal, transport_rowid, values in candidates:
                     if reference_error:
                         raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
@@ -2454,8 +2565,6 @@ class DeltaChainReader:
                     record(reference[0], values)
                 if reference_error:
                     raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
-            finally:
-                candidates.close()
         return found
 
     def get_unique_row(self, table: str, criteria: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -2497,7 +2606,7 @@ class DeltaChainReader:
             map_table = self._build_lookup_row_map(table, operations_cache)
             if map_table is None:
                 return self._lookup_materialized(table, criteria_indexes)
-            return self._lookup_sharded_candidates(table, criteria_indexes, map_table)
+            return self._lookup_fast_candidates(table, criteria_indexes, map_table)
         except BaseException as exc:
             pending_error = exc
             if not isinstance(exc, Exception):
