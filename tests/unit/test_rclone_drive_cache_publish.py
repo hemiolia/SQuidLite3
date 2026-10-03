@@ -176,6 +176,13 @@ class MissingParentDriveServer:
                 raise AssertionError('immutable conflict')
             self.objects[target] = raw
 
+        # In the pre-fix comparison, make both duplicate parents and both file
+        # objects visible before either copy returns. The following per-file
+        # readback therefore detects the ambiguous directory deterministically,
+        # instead of depending on which worker reaches its cache lookup first.
+        if self.race_barrier is not None and parent_missing:
+            self.race_barrier.wait(timeout=5)
+
         class Process:
             stderr = io.BytesIO()
             def wait(self):
@@ -373,11 +380,10 @@ class RcloneDrivePublicationTests(unittest.TestCase):
         )
 
         self.assertEqual(result['category'], 'REMOTE_DIRECTORY_AMBIGUOUS')
-        # Per-object byte receipts may be recorded before the final directory
-        # binding check; the ambiguity must still prevent publication success.
-        self.assertEqual(result['verified'], 2)
-        self.assertEqual(set(result['progress']['receipts']),
-                         {'part-0.bin', 'part-1.bin'})
+        # Each worker's post-copy readback must fail before a file receipt is
+        # written once the two ambiguous parents are visible.
+        self.assertEqual(result['verified'], 0)
+        self.assertEqual(result['progress']['receipts'], {})
         self.assertEqual(len(server.path_copies), 2)
         self.assertEqual(len(server.folder_id_copies), 0)
         self.assertEqual(sum(path == 'database/generation'
