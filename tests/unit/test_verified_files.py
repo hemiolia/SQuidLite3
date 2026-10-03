@@ -41,6 +41,30 @@ class VerifiedFilesTests(unittest.TestCase):
             result.update(extra)
         return {relative: result}
 
+    @staticmethod
+    def _record_for(raw):
+        return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def _subset_fixture(self):
+        payloads = {
+            "subset/first.bin": b"first subset payload\x00",
+            "subset/deep/second.bin": b"second subset payload",
+            "outside.bin": b"registered outside sibling",
+        }
+        records = self.record()
+        paths = {"nested/part.sqlite3": self.path}
+        for relative, raw in payloads.items():
+            path = self.root.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            records[relative] = self._record_for(raw)
+            paths[relative] = path
+        child_records = {
+            "first.bin": records["subset/first.bin"],
+            "deep/second.bin": records["subset/deep/second.bin"],
+        }
+        return verified_files.verify_files(self.root, records), records, child_records, paths
+
     def test_hashes_registered_file_and_binds_canonical_path(self):
         records = self.record(extra={"table_id": "ignored-caller-metadata"})
         with mock.patch.object(
@@ -78,6 +102,140 @@ class VerifiedFilesTests(unittest.TestCase):
         changed["nested/part.sqlite3"]["bytes"] += 1
         with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
             token.assert_matches(self.root, changed)
+
+    def test_derive_nested_subset_reuses_parent_hashes_and_preserves_parent_binding(self):
+        parent, parent_records, child_records, paths = self._subset_fixture()
+        child_root = self.root / "subset"
+
+        with mock.patch.object(
+            verified_files, "_hash_descriptor", wraps=verified_files._hash_descriptor
+        ) as hash_spy:
+            child = parent.derive("subset", child_records)
+
+        hash_spy.assert_not_called()
+        self.assertEqual(child.root, child_root)
+        child.assert_matches(child_root, child_records)
+        self.assertEqual(
+            child.checked_path("first.bin", child_records["first.bin"]),
+            paths["subset/first.bin"],
+        )
+        self.assertEqual(
+            child.checked_path("deep/second.bin", child_records["deep/second.bin"]),
+            paths["subset/deep/second.bin"],
+        )
+        parent.assert_matches(self.root, parent_records)
+
+    def test_derived_token_rejects_other_root_extra_file_and_changed_metadata(self):
+        parent, _parent_records, child_records, _paths = self._subset_fixture()
+        child = parent.derive("subset", child_records)
+        child_root = self.root / "subset"
+
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
+            child.assert_matches(self.root, child_records)
+
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
+            child.assert_matches(child_root, {
+                **child_records,
+                "unregistered.bin": self._record_for(b"not in the derived scope"),
+            })
+
+        changed_size = dict(child_records)
+        changed_size["first.bin"] = {
+            **child_records["first.bin"], "bytes": child_records["first.bin"]["bytes"] + 1,
+        }
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
+            child.assert_matches(child_root, changed_size)
+
+        changed_sha = dict(child_records)
+        changed_sha["first.bin"] = {
+            **child_records["first.bin"], "sha256": "0" * 64,
+        }
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
+            child.assert_matches(child_root, changed_sha)
+
+        with self.assertRaisesRegex(TypeError, "copied"):
+            copy.copy(child)
+        with self.assertRaisesRegex(TypeError, "serialized"):
+            pickle.dumps(child)
+
+    def test_derive_rejects_invalid_prefixes_empty_scope_and_unregistered_files(self):
+        parent, _parent_records, child_records, _paths = self._subset_fixture()
+        for prefix in (None, 1, "", ".", "./subset", "/subset", "../subset",
+                       "subset/../elsewhere", "subset/", "subset\\deep", "nul\x00prefix"):
+            with self.subTest(prefix=repr(prefix)):
+                with self.assertRaises(verified_files.VerifiedFilesError):
+                    parent.derive(prefix, child_records)
+
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "RECORDS_INVALID"):
+            parent.derive("subset", {})
+
+        unregistered = {
+            **child_records,
+            "extra.bin": self._record_for(b"valid-looking but not parent-registered"),
+        }
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
+            parent.derive("subset", unregistered)
+
+        altered = dict(child_records)
+        altered["first.bin"] = {
+            **child_records["first.bin"], "bytes": child_records["first.bin"]["bytes"] + 1,
+        }
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "BINDING_MISMATCH"):
+            parent.derive("subset", altered)
+
+    def test_derive_refuses_child_symlink_and_replaced_child_root(self):
+        parent, _parent_records, child_records, _paths = self._subset_fixture()
+        child_root = self.root / "subset"
+        moved = self.root / "subset-moved"
+        child_root.rename(moved)
+        child_root.symlink_to(moved, target_is_directory=True)
+        with self.assertRaises(verified_files.VerifiedFilesError):
+            parent.derive("subset", child_records)
+        child_root.unlink()
+        moved.rename(child_root)
+
+        parent, _parent_records, child_records, _paths = self._subset_fixture()
+        moved = self.root / "subset-moved-again"
+        child_root.rename(moved)
+        child_root.mkdir()
+        with self.assertRaises(verified_files.VerifiedFilesError):
+            parent.derive("subset", child_records)
+        child_root.rmdir()
+        moved.rename(child_root)
+
+    def test_derive_rejects_parent_root_exchange_and_same_bytes_file_replacement(self):
+        parent, _parent_records, child_records, paths = self._subset_fixture()
+        replacement = paths["subset/first.bin"].with_name("replacement.bin")
+        replacement.write_bytes(paths["subset/first.bin"].read_bytes())
+        os.replace(replacement, paths["subset/first.bin"])
+        with self.assertRaisesRegex(verified_files.VerifiedFilesError, "VERIFIED_FILES_CHANGED"):
+            parent.derive("subset", child_records)
+
+        parent, _parent_records, child_records, _paths = self._subset_fixture()
+        saved_root = self.root.with_name(self.root.name + "-saved")
+        self.root.rename(saved_root)
+        self.root.mkdir()
+        try:
+            with self.assertRaises(verified_files.VerifiedFilesError):
+                parent.derive("subset", child_records)
+        finally:
+            self.root.rmdir()
+            saved_root.rename(self.root)
+
+    def test_derive_runs_parent_guard_after_construction(self):
+        parent, _parent_records, child_records, paths = self._subset_fixture()
+        real_canonical_root = verified_files._canonical_root
+
+        def canonical_root_then_change_sibling(value):
+            result = real_canonical_root(value)
+            paths["outside.bin"].write_bytes(b"changed after derivation began")
+            return result
+
+        with mock.patch.object(
+            verified_files, "_canonical_root", side_effect=canonical_root_then_change_sibling
+        ):
+            with self.assertRaisesRegex(verified_files.VerifiedFilesError, "VERIFIED_FILES_CHANGED"):
+                parent.derive("subset", child_records)
 
     def test_same_size_rewrite_with_restored_mtime_is_rejected_by_ctime(self):
         token = verified_files.verify_files(self.root, self.record())

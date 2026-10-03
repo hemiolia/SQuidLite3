@@ -82,15 +82,16 @@ def apply_tag(store,args):
 
 def audit(store):
     from ikarchive.event_evidence import event_evidence
+    from ikarchive.asset_evidence import asset_acquisition_evidence
     row=store.db.execute('SELECT json_text FROM manifests ORDER BY fetched_at DESC LIMIT 1').fetchone()
-    if not row:return {'error':'CATALOG_MISSING','all_server_records_verified':False}
+    if not row:return {'error':'CATALOG_MISSING','all_server_records_verified':False,'image_acquisition_evidence':asset_acquisition_evidence(store.db)}
     m=json.loads(row[0]);p=Planner(m);ops=[]
     for name in p.queries:
         states=[dict(r) for r in store.db.execute('SELECT state,count(*) count FROM jobs WHERE operation=? GROUP BY state',(name,))]
         responses=store.db.execute('SELECT count(*) FROM responses WHERE operation=?',(name,)).fetchone()[0]
         entities=p.routes.get(name,{}).get('bindings',{})
         ops.append({'operation':name,'classification':'excluded' if name in p.excluded else 'unsupported' if name in p.unsupported else 'related' if entities else 'root','reason':p.excluded.get(name) or p.unsupported.get(name),'states':states,'responses':responses,'needs_entities':entities})
-    return {'catalog_at':m.get('fetched_at'),'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported,'operations':ops,'storage':store.status(),'event_evidence':event_evidence(store.db),'all_server_records_verified':False,'limit':'Server-internal records and records no longer exposed by SplatNet cannot be proven complete from the client API.'}
+    return {'catalog_at':m.get('fetched_at'),'version':m.get('version'),'extracted':len(p.queries),'read_routes':len(p.routes),'unsupported':p.unsupported,'operations':ops,'storage':store.status(),'event_evidence':event_evidence(store.db),'image_acquisition_evidence':asset_acquisition_evidence(store.db),'all_server_records_verified':False,'limit':'Server-internal records and records no longer exposed by SplatNet cannot be proven complete from the client API.'}
 
 def dispatch(store,args):
     if args.command=='init':result=store.status()
@@ -490,6 +491,160 @@ def _run_shard_cli(args):
             raise
         raise ValueError('SHARD_PACKAGE_INVALID') from exc
 
+def _run_published_cli(args):
+    if args.command == 'published-read':
+        if not args.table:
+            raise ValueError('PUBLISHED_TABLE_NOT_FOUND')
+        if args.rule_token is not None and args.mode is None:
+            raise ValueError('PUBLISHED_RULE_REQUIRES_MODE')
+        if args.limit is not None and args.limit <= 0:
+            raise ValueError('PUBLISHED_LIMIT_MUST_BE_POSITIVE')
+        if (args.mode is not None or args.rule_token is not None) and args.table != 'matches':
+            raise ValueError('PUBLISHED_SELECTOR_REQUIRES_MATCHES')
+    from scripts.nas_full_data_publish import valid_generation_id
+    if args.generation is not None and not valid_generation_id(args.generation):
+        raise ValueError('PUBLISHED_GENERATION_INVALID')
+
+    from scripts.published_sqlite_reader import PublishedSQLiteReader, PublishedSQLiteReaderError
+    try:
+        with PublishedSQLiteReader(
+            args.controls,
+            args.root,
+            args.delta_root,
+            expected_generation_id=args.generation,
+        ) as reader:
+            if args.command == 'published-list':
+                tables = reader.tables()
+                result = {
+                    'role': 'published_lossless_sqlite_reader',
+                    'reader_role': 'published_lossless_sqlite_reader',
+                    'baseline_generation': reader.baseline_generation_id,
+                    'latest_generation': reader.generation_id,
+                    'generation': reader.generation_id,
+                    'pinned_latest_sha256': reader.pinned_latest_sha256,
+                    'captured_at': reader.captured_at,
+                    'published_control_binding_verified': reader.published_control_binding_verified,
+                    'published_deltas_verified': reader.published_deltas_verified,
+                    'table_count': len(tables),
+                    'tables': tables,
+                    'schema_objects': reader.schema_objects(),
+                    'all_remote_artifacts_verified': False,
+                    'realtime_synchronized': False,
+                    'scope': 'local control + local SQLite package',
+                }
+            else:
+                tables = reader.tables()
+                table = next((item for item in tables if item['name'] == args.table), None)
+                if table is None:
+                    raise ValueError('PUBLISHED_TABLE_NOT_FOUND')
+                columns = table['columns']
+
+                if args.mode is None:
+                    rows = reader.iter_rows(args.table)
+                    ordinal_kind = 'current_table_stream_ordinal'
+                    scope = {
+                        'kind': 'full_table',
+                        'table': args.table,
+                        'source_rowid': 'original_source_rowid',
+                        'scope': 'local control + local SQLite package',
+                    }
+                else:
+                    selected = reader.iter_selected_matches(args.mode, rule_token=args.rule_token)
+                    def numbered():
+                        try:
+                            for ordinal, values in enumerate(selected):
+                                yield ordinal, None, values
+                        finally:
+                            close = getattr(selected, 'close', None)
+                            if close is not None:
+                                close()
+                    rows = numbered()
+                    ordinal_kind = 'selector_stream_ordinal'
+                    scope = {
+                        'kind': 'mode_selector' if args.rule_token is None else 'mode_rule_selector',
+                        'analysis_set': args.mode,
+                        'rule_token': args.rule_token,
+                        'source_rowid': 'unavailable for derived selector rows; not forged',
+                        'source_value_closure': 'full current source remains available through unfiltered table reads',
+                        'information_scope': (
+                            'selected rows are derived from the current full match_classification and matches tables; '
+                            'the verified baseline-plus-delta chain retains every source table and value'
+                        ),
+                        'scope': 'local control + local SQLite package',
+                    }
+
+                sentinel = object()
+                current = next(rows, sentinel)
+                full_count = reader.row_count(args.table)
+                header = {
+                    'type': 'header',
+                    'role': 'published_lossless_sqlite_reader',
+                    'reader_role': 'published_lossless_sqlite_reader',
+                    'baseline_generation': reader.baseline_generation_id,
+                    'latest_generation': reader.generation_id,
+                    'generation': reader.generation_id,
+                    'pinned_latest_sha256': reader.pinned_latest_sha256,
+                    'captured_at': reader.captured_at,
+                    'published_control_binding_verified': reader.published_control_binding_verified,
+                    'published_deltas_verified': reader.published_deltas_verified,
+                    'all_remote_artifacts_verified': False,
+                    'realtime_synchronized': False,
+                    'table': args.table,
+                    'columns': columns,
+                    'column_xinfo': reader.columns(args.table),
+                    'foreign_keys': reader.foreign_keys(args.table),
+                    'table_full_row_count': full_count,
+                    'ordinal_kind': ordinal_kind,
+                    'source_rowid_kind': 'nullable_original_source_rowid',
+                    'source_rowid_projection': 'original_source' if args.mode is None else 'unavailable_for_derived_rows',
+                    'scope': scope,
+                }
+                _write_shard_json(header)
+                sys.stdout.flush()
+
+                returned = 0
+                try:
+                    while current is not sentinel:
+                        if args.limit is not None and returned >= args.limit:
+                            break
+                        ordinal, source_rowid, values = current
+                        _write_shard_row(ordinal, values, columns, source_rowid=source_rowid,
+                                         include_source_identity=args.mode is None)
+                        returned += 1
+                        current = next(rows, sentinel)
+                finally:
+                    close = getattr(rows, 'close', None)
+                    if close is not None:
+                        close()
+
+                truncated = current is not sentinel
+                footer = {
+                    'type': 'footer',
+                    'returned_rows': returned,
+                    'truncated': truncated,
+                    'limit': args.limit,
+                    'pinned_latest_sha256': reader.pinned_latest_sha256,
+                    'generation': reader.generation_id,
+                    'latest_generation': reader.generation_id,
+                }
+        if args.command == 'published-list':
+            _write_shard_json(result)
+            sys.stdout.flush()
+            return 0
+        # Run the reader's final context guards before declaring the stream
+        # successful. A failure here must not leave a success footer behind.
+        _write_shard_json(footer)
+        sys.stdout.flush()
+        return 0
+    except PublishedSQLiteReaderError as exc:
+        raise ValueError(exc.category) from None
+    except ValueError as exc:
+        if str(exc).startswith('PUBLISHED_'):
+            raise
+        raise ValueError('PUBLISHED_PACKAGE_INVALID') from None
+    except (RuntimeError, OSError, sqlite3.Error, StopIteration, TypeError, KeyError, UnicodeError) as exc:
+        raise ValueError('PUBLISHED_PACKAGE_INVALID') from None
+
 def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__)
@@ -510,6 +665,8 @@ def main():
     sub.add_parser('published-xlsx')
     p=sub.add_parser('shard-list');p.add_argument('--root',type=Path,required=True);p.add_argument('--generation');p.add_argument('--delta-dir',dest='delta_dirs',type=Path,action='append',default=[])
     p=sub.add_parser('shard-read');p.add_argument('--root',type=Path,required=True);p.add_argument('--table',required=True);p.add_argument('--mode');p.add_argument('--rule',dest='rule_token');p.add_argument('--limit',type=int);p.add_argument('--generation');p.add_argument('--delta-dir',dest='delta_dirs',type=Path,action='append',default=[])
+    p=sub.add_parser('published-list');p.add_argument('--controls',type=Path,required=True);p.add_argument('--root',type=Path,required=True);p.add_argument('--delta-root',type=Path,required=True);p.add_argument('--generation')
+    p=sub.add_parser('published-read');p.add_argument('--controls',type=Path,required=True);p.add_argument('--root',type=Path,required=True);p.add_argument('--delta-root',type=Path,required=True);p.add_argument('--generation');p.add_argument('--table',required=True);p.add_argument('--mode');p.add_argument('--rule',dest='rule_token');p.add_argument('--limit',type=int)
     p_rec=sub.add_parser('records')
     rec_sub=p_rec.add_subparsers(dest='subaction',required=True)
     p_list=rec_sub.add_parser('list')
@@ -544,6 +701,8 @@ def main():
     args=parser.parse_args()
     if args.command in {'shard-list','shard-read'}:
         return _run_shard_cli(args)
+    if args.command in {'published-list','published-read'}:
+        return _run_published_cli(args)
     args.db=args.db.resolve()
     if args.command=='export-xlsx':
         from ikarchive.xlsx_export import LEGACY_ANALYSIS_XLSX_RETIRED

@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src/python"))
 from ikarchive.lossless_xlsx import (
     CHUNK_SIZE,
     _write_part_with_retry,
+    _excel_xstring_escape,
+    _excel_xstring_unescape,
     check_xml_safe,
     escape_xml,
     export_sqlite_tables,
@@ -192,6 +194,89 @@ class TestLosslessXlsxRoundtrip(unittest.TestCase):
                         "SELECT _rowid_, name, seq FROM sqlite_sequence ORDER BY _rowid_"
                     ).fetchall()
                     self.assertEqual(target_sequence_rows, source_sequence_rows)
+                finally:
+                    target.close()
+        finally:
+            source.close()
+
+    def test_xstring_escape_and_unescape_fast_path_boundaries(self):
+        all_ascii = "".join(chr(codepoint) for codepoint in range(128))
+        expected_ascii = "".join(
+            f"_x{codepoint:04X}_"
+            if codepoint in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20))
+            else chr(codepoint)
+            for codepoint in range(128)
+        )
+        escaped_ascii = _excel_xstring_escape(all_ascii)
+        self.assertEqual(escaped_ascii, expected_ascii)
+        self.assertEqual(_excel_xstring_unescape(escaped_ascii), all_ascii)
+        self.assertEqual(escaped_ascii[-1], "\x7f")
+
+        safe_ascii = "plain\ttab\nline\rreturn\x7fDEL"
+        self.assertIs(_excel_xstring_escape(safe_ascii), safe_ascii)
+        self.assertIs(_excel_xstring_unescape(safe_ascii), safe_ascii)
+        self.assertEqual(
+            escape_xml(safe_ascii), "plain\ttab\nline&#xD;return\x7fDEL"
+        )
+
+        literal_tokens = "_x0000_ _x0041_ _x005F_ _X0041_"
+        escaped_tokens = _excel_xstring_escape(literal_tokens)
+        self.assertIn("_x005F_x0000_", escaped_tokens)
+        self.assertIn("_x005F_x0041_", escaped_tokens)
+        self.assertIn("_x005F_x005F_", escaped_tokens)
+        self.assertEqual(_excel_xstring_unescape(escaped_tokens), literal_tokens)
+
+        non_ascii = "日本語\r\n𠀋 _x0041_"
+        self.assertEqual(
+            _excel_xstring_unescape(_excel_xstring_escape(non_ascii)), non_ascii
+        )
+
+    def test_ascii_fast_path_full_xlsx_roundtrip_preserves_values_and_source_rowids(self):
+        source = sqlite3.connect(":memory:")
+        try:
+            source.execute(
+                "CREATE TABLE fast_values(label TEXT, value, payload BLOB)"
+            )
+            ascii_json = (
+                '{"int64":9223372036854775807,"decimal":1.2300e+04,'
+                '"empty":"","unknown":true}'
+            )
+            ascii_base64 = base64.b64encode(bytes(range(256)) * 24).decode("ascii")
+            values = [
+                (5, "base64", ascii_base64, b"\x00\xffpayload"),
+                (23, "json", ascii_json, b""),
+                (77, "unicode-token-crlf", "日本語\r\n_x0041_𠀋", None),
+                (500, "all-ascii-controls", "".join(chr(i) for i in range(128)), bytes(range(256))),
+            ]
+            source.executemany(
+                "INSERT INTO fast_values(rowid,label,value,payload) VALUES(?,?,?,?)",
+                values,
+            )
+            expected = source.execute(
+                "SELECT rowid,label,value,typeof(value),payload,typeof(payload) "
+                "FROM fast_values ORDER BY rowid"
+            ).fetchall()
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_dir = Path(tmpdir)
+                manifest = export_sqlite_tables(source, out_dir)
+                pieces = manifest["tables"]["fast_values"]["pieces"]
+                self.assertTrue(pieces)
+                chunks = []
+                for piece in pieces:
+                    chunks.extend(read_lossless_xlsx(out_dir / piece["name"]))
+                self.assertEqual(
+                    {row["source_rowid"] for row in chunks}, {5, 23, 77, 500}
+                )
+
+                target = sqlite3.connect(":memory:")
+                try:
+                    reconstruct_sqlite_tables(out_dir, target)
+                    restored = target.execute(
+                        "SELECT rowid,label,value,typeof(value),payload,typeof(payload) "
+                        "FROM fast_values ORDER BY rowid"
+                    ).fetchall()
+                    self.assertEqual(restored, expected)
                 finally:
                     target.close()
         finally:

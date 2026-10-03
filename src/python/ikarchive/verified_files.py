@@ -374,6 +374,53 @@ class VerifiedFiles:
             raise _fail("VERIFIED_FILES_BINDING_MISMATCH")
         self.assert_unchanged()
 
+    def derive(
+        self,
+        prefix: str,
+        records: Mapping[str, Mapping[str, Any]],
+    ) -> "VerifiedFiles":
+        """Derive a no-rehash proof for a nonempty subset below one directory."""
+        VerifiedFiles._authenticate(self)
+        self.assert_unchanged()
+        try:
+            normalized_prefix = _canonical_relative(prefix)
+            normalized = _normalize_records(records)
+            if not normalized:
+                raise _fail("VERIFIED_FILES_RECORDS_INVALID")
+
+            parent_root = Path(object.__getattribute__(self, "_root"))
+            child_root = _canonical_root(_path_for(parent_root, normalized_prefix))
+            parent_records = object.__getattribute__(self, "_records")
+            parent_directories = object.__getattribute__(self, "_directories")
+            parent_files = object.__getattribute__(self, "_files")
+
+            child_files: dict[str, tuple[int, int, int, int, int]] = {}
+            child_directories: dict[str, tuple[int, int, int, int, int]] = {}
+            for relative, record in normalized.items():
+                parent_relative = f"{normalized_prefix}/{relative}"
+                if (parent_records.get(parent_relative) != record
+                        or parent_relative not in parent_files):
+                    raise _fail("VERIFIED_FILES_BINDING_MISMATCH")
+                child_files[relative] = parent_files[parent_relative]
+
+                for child_parent in _parent_relative_paths(relative):
+                    parent_parent = (normalized_prefix if not child_parent
+                                     else f"{normalized_prefix}/{child_parent}")
+                    fingerprint = parent_directories.get(parent_parent)
+                    if fingerprint is None:
+                        raise _fail("VERIFIED_FILES_BINDING_MISMATCH")
+                    child_directories[child_parent] = fingerprint
+
+            child = VerifiedFiles._create(
+                _TOKEN_SEAL, child_root, normalized, child_directories, child_files
+            )
+            child.assert_unchanged()
+            return child
+        finally:
+            # Keep the parent package bound across both validation and token
+            # construction, including when validation itself fails.
+            self.assert_unchanged()
+
     def checked_path(
         self,
         relative: str,

@@ -1062,6 +1062,55 @@ class DeltaChainReaderTests(unittest.TestCase):
                     self.assertIsNone(reader._connection)
                     self.assertEqual(reader._iterators, set())
 
+    def test_keyboard_interrupt_during_enter_cleans_partial_resources(self):
+        indexed = self.root / "published-enter-interrupt"
+        shutil.copytree(self.reset_root, indexed)
+        self._write_publisher_index(indexed, _read_json(indexed / "delta-plan.json"))
+        baseline_before = _tree_snapshot(self.baseline_package)
+        generation_before = _tree_snapshot(indexed)
+
+        with LosslessShardReader(self.baseline_package, expected_generation=BASELINE_ID) as baseline:
+            baseline_tables_before = baseline.tables()
+            reader = DeltaChainReader(baseline, [indexed], require_published_deltas=True)
+            opened = {}
+
+            def interrupt_after_resources_open():
+                opened["active"] = reader._active
+                opened["connection"] = reader._connection
+                opened["temp"] = reader._temp
+                opened["temp_root"] = reader._temp_root
+                opened["temp_root_existed"] = reader._temp_root.exists()
+                raise KeyboardInterrupt("controlled delta enter interrupt")
+
+            with patch.object(
+                reader, "_assert_published_inputs_unchanged",
+                side_effect=interrupt_after_resources_open,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt, "controlled delta enter interrupt"
+                ):
+                    reader.__enter__()
+
+            self.assertTrue(opened["active"])
+            self.assertIsNotNone(opened["connection"])
+            self.assertIsNotNone(opened["temp"])
+            self.assertTrue(opened["temp_root_existed"])
+            self.assertFalse(reader._active)
+            self.assertIsNone(reader._connection)
+            self.assertIsNone(reader._temp)
+            self.assertIsNone(reader._temp_root)
+            self.assertEqual(reader._iterators, set())
+            self.assertEqual(reader._cache_names, {})
+            with self.assertRaises(sqlite3.ProgrammingError):
+                opened["connection"].execute("SELECT 1")
+            self.assertFalse(opened["temp_root"].exists())
+
+            # The failed overlay enter does not close or mutate its caller-owned baseline.
+            self.assertTrue(baseline._active)
+            self.assertEqual(baseline.tables(), baseline_tables_before)
+            self.assertEqual(_tree_snapshot(self.baseline_package), baseline_before)
+            self.assertEqual(_tree_snapshot(indexed), generation_before)
+
     def test_published_partial_iterator_close_detects_change_and_closes_connections(self):
         indexed = self.root / "published-partial-close-guard"
         shutil.copytree(self.reset_root, indexed)

@@ -1149,8 +1149,10 @@ class DeltaChainReader:
             if self._published_generation_indexes_complete:
                 self._assert_published_inputs_unchanged()
             return self
-        except Exception as exc:
+        except BaseException as exc:
             self._cleanup()
+            if not isinstance(exc, Exception):
+                raise
             if isinstance(exc, DeltaReaderError):
                 raise
             code = str(exc) if isinstance(exc, ValueError) and re.fullmatch(r"[A-Z0-9_]+", str(exc)) else "DELTA_CHAIN_INVALID"

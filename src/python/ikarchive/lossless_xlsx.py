@@ -120,6 +120,7 @@ def escape_xml(text: str) -> str:
 
 
 _EXCEL_ESCAPE_RE = re.compile(r"_x[0-9A-Fa-f]{4}_")
+_UNSAFE_ASCII_XML_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def _xml_char_allowed(cp: int) -> bool:
@@ -133,6 +134,13 @@ def _xml_char_allowed(cp: int) -> bool:
 
 def _excel_xstring_escape(text: str) -> str:
     """ST_Xstringのescape tokenを1段だけ安全に出力する。"""
+    if (
+        type(text) is str
+        and text.isascii()
+        and _EXCEL_ESCAPE_RE.search(text) is None
+        and _UNSAFE_ASCII_XML_RE.search(text) is None
+    ):
+        return text
     out: list[str] = []
     i = 0
     while i < len(text):
@@ -160,6 +168,8 @@ def _excel_xstring_escape(text: str) -> str:
 
 def _excel_xstring_unescape(text: str) -> str:
     """Excel escape tokenを再帰せず一度だけ復号する。"""
+    if type(text) is str and _EXCEL_ESCAPE_RE.search(text) is None:
+        return text
     out: list[str] = []
     i = 0
     while i < len(text):
