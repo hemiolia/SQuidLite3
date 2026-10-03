@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests/unit"))
 
 import test_full_data_delta_publish as delta_fixtures  # noqa: E402
+from ikarchive import lossless_sqlite  # noqa: E402
 from ikarchive.change_feed import install_change_feed  # noqa: E402
 from ikarchive.writer_guards import install_writer_guards  # noqa: E402
 from published_sqlite_reader import (  # noqa: E402
@@ -44,18 +45,26 @@ def _write_rich_sources(case):
         "CREATE TABLE related(name TEXT PRIMARY KEY, record_id INTEGER REFERENCES records(id), payload BLOB)",
         "CREATE TABLE matches(account TEXT, kind TEXT, match_key TEXT, payload BLOB)",
         "CREATE TABLE match_classification(account TEXT, kind TEXT, match_key TEXT, analysis_set TEXT, rule_raw TEXT)",
+        "CREATE TABLE lookup_values(code, value)",
+        "CREATE TABLE lookup_without_rowid(code TEXT PRIMARY KEY, value) WITHOUT ROWID",
     )
     rows = (
         "INSERT INTO records VALUES(?,?,?,?)",
         "INSERT INTO related VALUES(?,?,?)",
         "INSERT INTO matches VALUES(?,?,?,?)",
         "INSERT INTO match_classification VALUES(?,?,?,?,?)",
+        "INSERT INTO lookup_values(rowid, code, value) VALUES(?,?,?)",
+        "INSERT INTO lookup_values(rowid, code, value) VALUES(?,?,?)",
+        "INSERT INTO lookup_without_rowid VALUES(?,?)",
     )
     data = (
         (-42, "original", 1.5, b"\x00base\xff"),
         ("foreign", -42, b"related\x00"),
         ("acct", "regular", "match-1", b"match\x00bytes"),
         ("acct", "regular", "match-1", "xmatch", "TOWER"),
+        (7, "duplicate", b"first"),
+        (19, "duplicate", "second"),
+        ("wr-key", b"without-rowid"),
     )
     for path in (case.baseline_path, case.current_path):
         conn = sqlite3.connect(path)
@@ -231,6 +240,37 @@ class PublishedSQLiteReaderTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _ = reader.generation_id
 
+    def test_unique_lookup_baseline_native_types_no_match_and_nonunique(self):
+        self._copy_publisher_controls()
+        with PublishedSQLiteReader(self.control, self.baseline_package, self.delta_root) as reader:
+            found = reader.get_unique_row("records", {"id": -42, "payload": "original"})
+            self.assertEqual(
+                found,
+                {"source_rowid": -42, "values": (-42, "original", 1.5, b"\x00base\xff")},
+            )
+            self.assertIs(type(found["values"][2]), float)
+            self.assertEqual(found["values"][2].hex(), (1.5).hex())
+
+            blob_match = reader.get_unique_row(
+                "lookup_values", {"code": "duplicate", "value": b"first"},
+            )
+            self.assertEqual(blob_match, {
+                "source_rowid": 7, "values": ("duplicate", b"first"),
+            })
+            self.assertEqual(reader.get_unique_row("lookup_without_rowid", {"code": "wr-key"}), {
+                "source_rowid": None, "values": ("wr-key", b"without-rowid"),
+            })
+            self.assertIsNone(reader.get_unique_row("records", {"payload": b"original"}))
+            self.assertIsNone(reader.get_unique_row("records", {"ratio": 1}))
+            self.assertIsNone(reader.get_unique_row("records", {"id": -999}))
+
+            with self.assertRaises(PublishedSQLiteReaderError) as nonunique:
+                reader.get_unique_row("lookup_values", {"code": "duplicate"})
+            self.assertEqual(nonunique.exception.category, "DELTA_LOOKUP_NOT_UNIQUE")
+            with self.assertRaises(PublishedSQLiteReaderError) as boolean:
+                reader.get_unique_row("records", {"id": True})
+            self.assertEqual(boolean.exception.category, "DELTA_LOOKUP_CRITERIA_INVALID")
+
     def test_all_public_apis_require_open_context(self):
         self._copy_publisher_controls()
         reader = PublishedSQLiteReader(self.control, self.baseline_package, self.delta_root)
@@ -246,6 +286,7 @@ class PublishedSQLiteReaderTests(unittest.TestCase):
             lambda: reader.foreign_keys("records"),
             lambda: reader.schema_objects(),
             lambda: reader.row_count("records"),
+            lambda: reader.get_unique_row("records", {"id": -42}),
             lambda: reader.iter_rows("records"),
             lambda: reader.iter_selected_matches("xmatch"),
         )
@@ -307,6 +348,139 @@ class PublishedSQLiteReaderTests(unittest.TestCase):
             self.assertEqual(len(list(reader.iter_selected_matches("xmatch"))), 1)
             latest = json.loads((self.control / "latest.json").read_text())
             self.assertEqual(reader.schema_objects(), latest["schemas"])
+
+    def test_unique_lookup_observes_delta_update_and_delete(self):
+        first_id, second_id = self._publish_reset_and_incremental()
+        conn = sqlite3.connect(self.case.current_path)
+        try:
+            conn.execute("PRAGMA recursive_triggers=ON")
+            conn.execute("DELETE FROM lookup_values WHERE rowid=19")
+            conn.execute("UPDATE lookup_values SET value=? WHERE rowid=7", (b"updated",))
+            conn.commit()
+        finally:
+            conn.close()
+
+        third_id = "20261003T010303Z-a0010003"
+        previous = json.loads((self.delta_root / second_id / "delta-plan.json").read_text())
+        third_dir, _third_plan = self.case.prepare(third_id, previous=previous)
+        self.assertEqual(self.case.publish(third_dir)["status"], "complete")
+        self._copy_publisher_controls((first_id, second_id, third_id))
+        third_local = self.delta_root / third_id
+        shutil.copytree(third_dir, third_local)
+        third_local.joinpath("index.json").write_bytes(
+            self.case.remote.objects[
+                f"{REMOTE}/deltas/generations/{third_id}/index.json"
+            ]
+        )
+
+        with PublishedSQLiteReader(
+            self.control, self.baseline_package, self.delta_root,
+            expected_generation_id=third_id,
+        ) as reader:
+            self.assertEqual(reader.get_unique_row("lookup_values", {"code": "duplicate"}), {
+                "source_rowid": 7, "values": ("duplicate", b"updated"),
+            })
+            self.assertIsNone(reader.get_unique_row(
+                "lookup_values", {"value": "second"},
+            ))
+
+    def test_unique_lookup_final_public_guard_rejects_control_and_baseline_changes(self):
+        self._copy_publisher_controls()
+        for target, expected_category in (
+            ("control", "PUBLISHED_CONTROL_CHANGED"),
+            ("baseline", "PUBLISHED_READER_INPUT_CHANGED"),
+        ):
+            self._copy_publisher_controls()
+            reader = PublishedSQLiteReader(self.control, self.baseline_package, self.delta_root)
+            with self.subTest(target=target), self.assertRaises(PublishedSQLiteReaderError) as caught:
+                with reader as opened:
+                    original_lookup = opened._delta_reader.get_unique_row
+
+                    def lookup_then_mutate(table, criteria):
+                        result = original_lookup(table, criteria)
+                        if target == "control":
+                            path = self.control / "generations" / BASELINE_ID / "index.json"
+                        else:
+                            path = next(self.baseline_package.rglob("*.sqlite3"))
+                        path.write_bytes(path.read_bytes() + b" ")
+                        return result
+
+                    with patch.object(opened._delta_reader, "get_unique_row",
+                                      side_effect=lookup_then_mutate):
+                        opened.get_unique_row("records", {"id": -42})
+            self.assertEqual(caught.exception.category, expected_category)
+
+    def test_unique_lookup_rejects_changed_selected_delta_artifact(self):
+        first_id, second_id = self._publish_reset_and_incremental()
+        plan = json.loads((self.delta_root / first_id / "delta-plan.json").read_text())
+        artifact = next(item["local"] for item in plan["files"]
+                        if item["local"] not in ("index.json", "delta-plan.json"))
+        artifact_path = self.delta_root / first_id / artifact
+        reader = PublishedSQLiteReader(
+            self.control, self.baseline_package, self.delta_root,
+            expected_generation_id=second_id,
+        )
+        opened = reader.__enter__()
+        artifact_path.write_bytes(artifact_path.read_bytes() + b" ")
+        with self.assertRaises(PublishedSQLiteReaderError) as caught:
+            opened.get_unique_row("records", {"id": -42})
+        self.assertEqual(caught.exception.category, "DELTA_PUBLISHED_INPUT_CHANGED")
+        with self.assertRaises(PublishedSQLiteReaderError) as close_error:
+            reader.__exit__(None, None, None)
+        self.assertEqual(close_error.exception.category, "PUBLISHED_READER_INPUT_CHANGED")
+
+    def test_unique_lookup_closes_candidate_iterators_and_reader_resources(self):
+        self._copy_publisher_controls()
+        original_factory = lossless_sqlite._iter_table_candidates
+        closed = []
+
+        def tracked_factory(*args, **kwargs):
+            inner = original_factory(*args, **kwargs)
+
+            def rows():
+                try:
+                    yield from inner
+                finally:
+                    inner.close()
+                    closed.append(True)
+
+            return rows()
+
+        reader = PublishedSQLiteReader(self.control, self.baseline_package, self.delta_root)
+        with reader as opened:
+            delta = opened._delta_reader
+            temp_root = delta._temp_root
+            with patch.object(lossless_sqlite, "_iter_table_candidates", tracked_factory):
+                with self.assertRaises(PublishedSQLiteReaderError) as caught:
+                    opened.get_unique_row("lookup_values", {"code": "duplicate"})
+            self.assertEqual(caught.exception.category, "DELTA_LOOKUP_NOT_UNIQUE")
+            self.assertTrue(closed)
+            self.assertIsNotNone(delta._connection)
+        self.assertIsNone(delta._connection)
+        self.assertIsNone(delta._temp)
+        self.assertFalse(temp_root.exists())
+
+    def test_unique_lookup_preserves_interrupt_when_final_guard_fails(self):
+        self._copy_publisher_controls()
+        reader = PublishedSQLiteReader(self.control, self.baseline_package, self.delta_root)
+        with reader as opened:
+            delta = opened._delta_reader
+            guard_calls = 0
+
+            def failing_final_guard(**_kwargs):
+                nonlocal guard_calls
+                guard_calls += 1
+                if guard_calls > 1:
+                    raise PublishedSQLiteReaderError("PUBLISHED_CONTROL_CHANGED")
+
+            with patch.object(delta, "get_unique_row",
+                              side_effect=KeyboardInterrupt("lookup interrupted")):
+                with patch.object(opened, "_assert_public_read_state", failing_final_guard):
+                    with self.assertRaisesRegex(KeyboardInterrupt, "lookup interrupted"):
+                        opened.get_unique_row("records", {"id": -42})
+            self.assertEqual(guard_calls, 2)
+        self.assertIsNone(delta._connection)
+        self.assertIsNone(delta._temp)
 
     def test_latest_index_sha_mismatch_is_rejected(self):
         self._copy_publisher_controls()
@@ -466,6 +640,9 @@ class PublishedSQLiteReaderTests(unittest.TestCase):
             self.assertEqual(reader.generation_id, BASELINE_ID)
             self.assertEqual(reader.pinned_latest_sha256, pinned)
             self.assertEqual(reader.row_count("records"), 1)
+            self.assertEqual(reader.get_unique_row("records", {"id": -42}), {
+                "source_rowid": -42, "values": (-42, "original", 1.5, b"\x00base\xff"),
+            })
 
     def test_global_index_slices_manifest_sha_mismatch_rejected(self):
         self._copy_publisher_controls()

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import resource
 import sqlite3
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src/python"))
 
@@ -19,7 +21,9 @@ from ikarchive.lossless_sqlite import (
     iter_table_rows_with_identity,
     verify_sqlite_shards,
 )
+from ikarchive import lossless_sqlite as shards
 from ikarchive.slice_selectors import export_selectors, verify_selectors
+from ikarchive.verified_files import verify_files
 
 
 def _sha(path: Path) -> str:
@@ -99,7 +103,381 @@ def _finalized_selector_package(source: sqlite3.Connection, root: Path) -> dict:
     return manifest
 
 
+def _write_json_file(path: Path, value: dict) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _package_records(root: Path) -> dict[str, dict[str, object]]:
+    return {
+        path.relative_to(root).as_posix(): {
+            "bytes": path.stat().st_size,
+            "sha256": _sha(path),
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _external_candidate_source(path: Path) -> sqlite3.Connection:
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=DELETE")
+        writer.execute(
+            "CREATE TABLE candidate_rows ("
+            "source_id INTEGER PRIMARY KEY, selector TEXT NOT NULL, large_text TEXT NOT NULL, "
+            "large_blob BLOB NOT NULL, ratio, nullable_text TEXT, empty_text TEXT)"
+        )
+        selected_text = "selected:" + "s" * (300 * 1024)
+        other_text = "other:" + "o" * (300 * 1024)
+        blob_bytes = 300 * 1024
+        writer.executemany(
+            "INSERT INTO candidate_rows VALUES(?,?,?,?,?,?,?)",
+            [
+                (10, "no", other_text, b"a" * blob_bytes, 1.25, None, ""),
+                (20, "yes", other_text, b"b" * blob_bytes, 2.5, "text", ""),
+                (40, "yes", selected_text, b"c" * blob_bytes, 3.75, None, ""),
+                (99, "no", selected_text, b"d" * blob_bytes, 4.5, "last", ""),
+            ],
+        )
+        writer.commit()
+    finally:
+        writer.close()
+    source = sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
+    source.execute("PRAGMA query_only=ON")
+    return source
+
+
+def _candidate_transport_package(base: Path):
+    source_path = base / "source.sqlite3"
+    source = _external_candidate_source(source_path)
+    package = base / "transport"
+    manifest = export_sqlite_shards(
+        source, package, snapshot_id="candidate-transport", max_bytes=MAX_ALLOWED_BYTES
+    )
+    receipt = verify_sqlite_shards(source, package, manifest)
+    if receipt["status"] != "verified":
+        raise AssertionError("synthetic transport package did not verify")
+    records = _package_records(package)
+    token = verify_files(package, records)
+    return source, source_path, package, manifest, records, token
+
+
+class _TrackedConnection:
+    def __init__(self, connection: sqlite3.Connection, opened: list, full_fetches: list):
+        self._connection = connection
+        self._opened = opened
+        self._full_fetches = full_fetches
+        self.closed = False
+        opened.append(self)
+
+    def execute(self, sql, *args):
+        normalized = sql.lstrip().upper()
+        if normalized.startswith('SELECT * FROM "CANDIDATE_ROWS" NOT INDEXED'):
+            self._full_fetches.append(sql)
+        return self._connection.execute(sql, *args)
+
+    def close(self):
+        self.closed = True
+        self._connection.close()
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 class LosslessSqliteShardsTests(unittest.TestCase):
+    def test_transport_candidate_filter_skips_payload_fetch_for_rejected_rows(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+            source, source_path, package, manifest, records, token = _candidate_transport_package(
+                Path(temporary)
+            )
+            source_sha = _sha(source_path)
+            opened = []
+            full_fetches = []
+            callback_rows = []
+            stats = {}
+            real_open = shards._open_readonly
+
+            def tracked_open(path):
+                return _TrackedConnection(real_open(path), opened, full_fetches)
+
+            try:
+                with patch.object(shards, "_open_readonly", side_effect=tracked_open), patch.object(
+                    shards, "_read_external_cell", wraps=shards._read_external_cell
+                ) as external_read:
+                    rows = list(shards._iter_table_entries(
+                        package,
+                        manifest,
+                        "candidate_rows",
+                        stats=stats,
+                        candidate_criteria={1: "yes"},
+                        verified_files=token,
+                        verified_records=records,
+                        candidate_package_kind="transport",
+                        candidate_row_filter=lambda ordinal, rowid: (
+                            callback_rows.append((ordinal, rowid)) or False
+                        ),
+                    ))
+                self.assertEqual(rows, [])
+                self.assertEqual(callback_rows, [(1, 20), (2, 40)])
+                external_read.assert_not_called()
+                self.assertEqual(full_fetches, [])
+                self.assertEqual(stats["rows"], 4)
+                self.assertEqual(stats["cells"], 0)
+                self.assertEqual(stats["external_cells"], 8)
+                self.assertTrue(opened)
+                self.assertTrue(all(connection.closed for connection in opened))
+                self.assertEqual(_sha(source_path), source_sha)
+            finally:
+                source.close()
+
+    def test_transport_candidate_filter_preserves_external_and_native_values(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+            source, source_path, package, manifest, records, token = _candidate_transport_package(
+                Path(temporary)
+            )
+            source_sha = _sha(source_path)
+            opened = []
+            full_fetches = []
+            callback_rows = []
+            real_open = shards._open_readonly
+
+            def tracked_open(path):
+                return _TrackedConnection(real_open(path), opened, full_fetches)
+
+            selected_text = "selected:" + "s" * (300 * 1024)
+            selected_blob = b"c" * (300 * 1024)
+
+            def keep_not_twenty(ordinal, rowid):
+                callback_rows.append((ordinal, rowid))
+                return rowid != 20
+
+            try:
+                with patch.object(shards, "_open_readonly", side_effect=tracked_open), patch.object(
+                    shards, "_read_external_cell", wraps=shards._read_external_cell
+                ) as external_read:
+                    rows = list(shards._iter_table_candidates(
+                        package,
+                        manifest,
+                        "candidate_rows",
+                        {1: "yes", 2: selected_text},
+                        verified_files=token,
+                        verified_records=records,
+                        candidate_package_kind="transport",
+                        candidate_row_filter=keep_not_twenty,
+                    ))
+                self.assertEqual(callback_rows, [(1, 20), (2, 40)])
+                self.assertEqual(
+                    rows,
+                    [(2, 40, (40, "yes", selected_text, selected_blob, 3.75, None, ""))],
+                )
+                self.assertEqual(external_read.call_count, 2)
+                self.assertEqual(len(full_fetches), 1)
+                self.assertTrue(opened)
+                self.assertTrue(all(connection.closed for connection in opened))
+                self.assertEqual(_sha(source_path), source_sha)
+            finally:
+                source.close()
+
+    def test_candidate_filter_errors_are_stable_and_release_connections(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+            source, _source_path, package, manifest, records, token = _candidate_transport_package(
+                Path(temporary)
+            )
+            real_open = shards._open_readonly
+
+            def raise_runtime(_ordinal, _rowid):
+                raise RuntimeError("private callback detail")
+
+            def raise_interrupt(_ordinal, _rowid):
+                raise KeyboardInterrupt()
+
+            cases = (
+                ("exception", raise_runtime, ValueError, "CANDIDATE_ROW_FILTER_FAILED"),
+                ("result", lambda _ordinal, _rowid: 1, ValueError,
+                 "CANDIDATE_ROW_FILTER_RESULT_INVALID"),
+                ("base", raise_interrupt, KeyboardInterrupt, None),
+            )
+            try:
+                for name, callback, exception_type, category in cases:
+                    with self.subTest(name=name):
+                        opened = []
+                        full_fetches = []
+
+                        def tracked_open(path):
+                            return _TrackedConnection(real_open(path), opened, full_fetches)
+
+                        with patch.object(shards, "_open_readonly", side_effect=tracked_open):
+                            generator = shards._iter_table_candidates(
+                                package,
+                                manifest,
+                                "candidate_rows",
+                                {1: "yes"},
+                                verified_files=token,
+                                verified_records=records,
+                                candidate_package_kind="transport",
+                                candidate_row_filter=callback,
+                            )
+                            with self.assertRaises(exception_type) as raised:
+                                list(generator)
+                        if category is not None:
+                            self.assertEqual(str(raised.exception), category)
+                            self.assertIsNone(raised.exception.__cause__)
+                            if category == "CANDIDATE_ROW_FILTER_FAILED":
+                                self.assertTrue(raised.exception.__suppress_context__)
+                        self.assertTrue(opened)
+                        self.assertTrue(all(connection.closed for connection in opened))
+                        self.assertEqual(full_fetches, [])
+            finally:
+                source.close()
+
+    def test_candidate_package_controls_and_lookup_options_are_exact(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+            base = Path(temporary)
+            source, _source_path, package, manifest, records, token = _candidate_transport_package(base)
+            try:
+                self.assertEqual(
+                    {"manifest.json", "verification.json"} & set(records),
+                    {"manifest.json", "verification.json"},
+                )
+                self.assertNotIn("selectors-verification.json", records)
+                with self.assertRaisesRegex(ValueError, "does not cover the complete package"):
+                    missing_control = {
+                        relative: record for relative, record in records.items()
+                        if relative != "verification.json"
+                    }
+                    missing_token = verify_files(package, missing_control)
+                    list(shards._iter_table_candidates(
+                        package, manifest, "candidate_rows", {},
+                        verified_files=missing_token,
+                        verified_records=missing_control,
+                        candidate_package_kind="transport",
+                    ))
+
+                with self.assertRaisesRegex(ValueError, "CANDIDATE_PACKAGE_KIND_INVALID"):
+                    list(shards._iter_table_candidates(
+                        package, manifest, "candidate_rows", {},
+                        verified_files=token, verified_records=records,
+                        candidate_package_kind=[],
+                    ))
+                with self.assertRaisesRegex(ValueError, "CANDIDATE_OPTIONS_REQUIRE_LOOKUP"):
+                    list(shards._iter_table_entries(
+                        package, manifest, "candidate_rows", candidate_package_kind="transport"
+                    ))
+                with self.assertRaisesRegex(ValueError, "CANDIDATE_OPTIONS_REQUIRE_LOOKUP"):
+                    list(shards._iter_table_entries(
+                        package, manifest, "candidate_rows", candidate_row_filter=lambda *_: True
+                    ))
+                with self.assertRaisesRegex(ValueError, "CANDIDATE_ROW_FILTER_INVALID"):
+                    list(shards._iter_table_candidates(
+                        package, manifest, "candidate_rows", {},
+                        verified_files=token, verified_records=records,
+                        candidate_row_filter=object(),
+                    ))
+            finally:
+                source.close()
+
+    def test_baseline_candidates_require_selector_control_and_transport_rejects_selectors(self):
+        source = _selector_source()
+        try:
+            with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+                package = Path(temporary) / "baseline"
+                manifest = _finalized_selector_package(source, package)
+                verify_sqlite_shards(source, package, manifest)
+                selector_receipt = verify_selectors(
+                    source, package, manifest, manifest["source_sha256"]
+                )
+                _write_json_file(package / "selectors-verification.json", selector_receipt)
+                records = _package_records(package)
+                token = verify_files(package, records)
+
+                rows = list(shards._iter_table_candidates(
+                    package, manifest, "matches", {2: "match-000000"},
+                    verified_files=token, verified_records=records,
+                ))
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][2][2], "match-000000")
+
+                missing_selector_control = {
+                    relative: record for relative, record in records.items()
+                    if relative != "selectors-verification.json"
+                }
+                subset_token = verify_files(package, missing_selector_control)
+                with self.assertRaisesRegex(ValueError, "does not cover the complete package"):
+                    list(shards._iter_table_candidates(
+                        package, manifest, "matches", {2: "match-000000"},
+                        verified_files=subset_token,
+                        verified_records=missing_selector_control,
+                    ))
+
+                with self.assertRaisesRegex(
+                    ValueError, "CANDIDATE_TRANSPORT_SELECTORS_FORBIDDEN"
+                ):
+                    list(shards._iter_table_candidates(
+                        package, manifest, "matches", {2: "match-000000"},
+                        verified_files=token, verified_records=records,
+                        candidate_package_kind="transport",
+                    ))
+        finally:
+            source.close()
+
+    def test_transport_candidate_early_close_releases_part_and_value_connections(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+            source, _source_path, package, manifest, records, token = _candidate_transport_package(
+                Path(temporary)
+            )
+            opened = []
+            full_fetches = []
+            real_open = shards._open_readonly
+
+            def tracked_open(path):
+                return _TrackedConnection(real_open(path), opened, full_fetches)
+
+            try:
+                with patch.object(shards, "_open_readonly", side_effect=tracked_open):
+                    rows = shards._iter_table_candidates(
+                        package, manifest, "candidate_rows", {1: "yes"},
+                        verified_files=token, verified_records=records,
+                        candidate_package_kind="transport",
+                        candidate_row_filter=lambda _ordinal, _rowid: True,
+                    )
+                    row = next(rows)
+                    self.assertEqual(row[1], 20)
+                    self.assertTrue(any(not connection.closed for connection in opened))
+                    rows.close()
+                self.assertGreaterEqual(len(opened), 2)
+                self.assertTrue(all(connection.closed for connection in opened))
+            finally:
+                source.close()
+
+    def test_transport_candidate_rejects_same_bytes_with_replaced_file_identity(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
+            source, _source_path, package, manifest, records, token = _candidate_transport_package(
+                Path(temporary)
+            )
+            try:
+                relative = manifest["tables"][0]["parts"][0]["file"]
+                target = package / relative
+                original_bytes = target.read_bytes()
+                replacement = target.with_name(target.name + ".replacement")
+                replacement.write_bytes(original_bytes)
+                self.assertEqual(_sha(replacement), records[relative]["sha256"])
+                os.replace(replacement, target)
+                with self.assertRaisesRegex(ValueError, "VERIFIED_FILES_CHANGED"):
+                    list(shards._iter_table_candidates(
+                        package,
+                        manifest,
+                        "candidate_rows",
+                        {},
+                        verified_files=token,
+                        verified_records=records,
+                        candidate_package_kind="transport",
+                    ))
+            finally:
+                source.close()
+
     def test_public_identity_stream_preserves_negative_gaps_and_key_only_rows(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as directory:
             source = sqlite3.connect(':memory:')

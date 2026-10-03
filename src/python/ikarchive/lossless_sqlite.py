@@ -20,7 +20,7 @@ import re
 import sqlite3
 import stat
 import tempfile
-from typing import Any, Generator, Iterable, Iterator, Optional, Sequence
+from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Sequence
 
 
 MANIFEST_VERSION = 2
@@ -1412,8 +1412,20 @@ def _iter_table_entries(
     candidate_criteria: Optional[dict[int, Any]] = None,
     verified_files: Any = None,
     verified_records: Optional[dict[str, dict[str, Any]]] = None,
+    candidate_package_kind: str = "baseline",
+    candidate_row_filter: Optional[Callable[[int, Optional[int]], bool]] = None,
 ) -> Generator[tuple[int, Any, tuple[Any, ...]], None, None]:
     candidate_mode = candidate_criteria is not None
+    if type(candidate_package_kind) is not str or candidate_package_kind not in {
+        "baseline", "transport"
+    }:
+        raise ValueError("CANDIDATE_PACKAGE_KIND_INVALID")
+    if not candidate_mode and (
+        candidate_package_kind != "baseline" or candidate_row_filter is not None
+    ):
+        raise ValueError("CANDIDATE_OPTIONS_REQUIRE_LOOKUP")
+    if candidate_mode and candidate_row_filter is not None and not callable(candidate_row_filter):
+        raise ValueError("CANDIDATE_ROW_FILTER_INVALID")
     tables = _manifest_tables(manifest)
     table = next((item for item in tables if item["name"] == tablename), None)
     if table is None:
@@ -1434,9 +1446,14 @@ def _iter_table_entries(
         manifest, root, verify_hashes=not candidate_mode
     )
     if candidate_mode:
+        if candidate_package_kind == "transport" and selector_files:
+            raise ValueError("CANDIDATE_TRANSPORT_SELECTORS_FORBIDDEN")
+        control_paths = {"manifest.json", "verification.json"}
+        if candidate_package_kind == "baseline":
+            control_paths.add("selectors-verification.json")
         required_record_paths = (
             set(part_files) | set(external_docs) | set(selector_files)
-            | {"manifest.json", "verification.json", "selectors-verification.json"}
+            | control_paths
         )
         if set(verified_records) != required_record_paths:
             raise ValueError("candidate lookup token does not cover the complete package")
@@ -1706,6 +1723,14 @@ def _iter_table_entries(
                             or _same_sqlite_value(criteria_values[index], expected)
                             for index, expected in candidate_criteria.items()
                         )
+                        if match and candidate_row_filter is not None:
+                            try:
+                                filter_result = candidate_row_filter(ordinal, source_rowid)
+                            except Exception:
+                                raise ValueError("CANDIDATE_ROW_FILTER_FAILED") from None
+                            if type(filter_result) is not bool:
+                                raise ValueError("CANDIDATE_ROW_FILTER_RESULT_INVALID")
+                            match = filter_result
                         decoded_external: dict[int, Any] = {}
                         if match:
                             for index, expected in candidate_criteria.items():
@@ -1867,6 +1892,8 @@ def _iter_table_candidates(
     *,
     verified_files: Any,
     verified_records: dict[str, dict[str, Any]],
+    candidate_package_kind: str = "baseline",
+    candidate_row_filter: Optional[Callable[[int, Optional[int]], bool]] = None,
 ) -> Generator[tuple[int, Any, tuple[Any, ...]], None, None]:
     """Yield matching rows from an already full-hash-verified package.
 
@@ -1874,7 +1901,15 @@ def _iter_table_candidates(
     does not recompute the complete row-stream digest or recount every
     value-chunk file. The caller's process-local token binds the complete
     declared package to its prior verification. Only candidate external cells
-    are reconstructed and chunk/SHA checked here.
+    are reconstructed and chunk/SHA checked here. A transport caller must
+    establish its exact package inventory and the manifest/verification proof
+    binding before supplying the token; this helper still rechecks the
+    manifest's declared data inventory and per-row metadata.
+
+    ``candidate_row_filter`` runs only after the cheap inline criteria match,
+    with the source ordinal and original source rowid. Returning false avoids
+    candidate external-value decoding and the complete row fetch while the
+    iterator continues validating row and external-reference metadata.
     """
     root_path = _reject_symlink_components(Path(root), label="shard root")
     if not root_path.is_dir():
@@ -1896,6 +1931,8 @@ def _iter_table_candidates(
         candidate_criteria=criteria_by_column,
         verified_files=verified_files,
         verified_records=verified_records,
+        candidate_package_kind=candidate_package_kind,
+        candidate_row_filter=candidate_row_filter,
     )
 
 

@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import nas_full_data_publish as publisher  # noqa: E402
 import publish_full_data_delta as delta_publisher  # noqa: E402
-from ikarchive.delta_reader import DeltaChainReader  # noqa: E402
+from ikarchive.delta_reader import DeltaChainReader, DeltaReaderError  # noqa: E402
 from ikarchive.shard_reader import LosslessShardReader  # noqa: E402
 from ikarchive.verified_files import verify_files  # noqa: E402
 
@@ -721,6 +721,45 @@ class PublishedSQLiteReader:
 
     def row_count(self, table: str) -> int:
         return self._public_value(lambda: self._delta_reader.row_count(table), inner_guard=True)
+
+    def get_unique_row(self, table: str, criteria: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return a unique exact-typed match from this locally pinned generation.
+
+        The delta reader owns guards for selected delta artifacts. This wrapper
+        additionally checks the pinned public controls and complete baseline
+        package on both sides of the lookup, including when lookup raises.
+        """
+        self._require_open()
+        pending_error: Optional[BaseException] = None
+        try:
+            self._assert_public_read_state(guard_delta_reader=False)
+            try:
+                result = self._delta_reader.get_unique_row(table, criteria)
+            except DeltaReaderError as exc:
+                raise PublishedSQLiteReaderError(exc.code) from None
+            if result is None:
+                return None
+            if (type(result) is not dict
+                    or set(result) != {"source_rowid", "values"}
+                    or (result["source_rowid"] is not None
+                        and type(result["source_rowid"]) is not int)
+                    or type(result["values"]) is not tuple):
+                _fail("PUBLISHED_LOOKUP_RESULT_INVALID")
+            return {
+                "source_rowid": result["source_rowid"],
+                "values": result["values"],
+            }
+        except BaseException as exc:
+            pending_error = exc
+            raise
+        finally:
+            try:
+                self._assert_public_read_state(guard_delta_reader=False)
+            except BaseException:
+                # An interrupt or another BaseException from the lookup must
+                # not be masked by a later boundary check failure.
+                if pending_error is None or isinstance(pending_error, Exception):
+                    raise
 
     def iter_rows(self, table: str) -> Iterator[tuple[int, Optional[int], tuple[Any, ...]]]:
         self._assert_public_read_state()

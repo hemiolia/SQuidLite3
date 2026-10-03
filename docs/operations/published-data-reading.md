@@ -49,10 +49,15 @@ Readerを開いた後にcontrolディレクトリのlatestが通常更新され�
 - `tables()` は表ごとに `name`、`columns`、`column_schema`、`foreign_keys`、`row_count`、その表の `schema` を返す。全SQLite schema object一覧は別の `schema_objects()` が返す。
 - `columns(table)`、`foreign_keys(table)`、`schema_objects()`、`row_count(table)` は表または全体のmetadataを返す。
 - `iter_rows(table)` は `(ordinal, source_rowid, values)` を順次返す。`values` は元列順のtupleで、SQLite値はPythonの `None`、`int`、`float`、`str`、`bytes` として保持される。`source_rowid` は保存された元rowidで、元表にrowidが無い場合は `None`。`ordinal` は出力順の番号でありrowidとは別である。
+- `get_unique_row(table, criteria)` は現在固定されているgenerationから、criteriaに型厳密一致する1行だけを返す。戻り値は `None` または `{"source_rowid": int | None, "values": tuple}` で、ordinalは含めない。0行なら `None`、2行以上なら `DELTA_LOOKUP_NOT_UNIQUE`、未知列や不正なcriteriaは安定した `DELTA_LOOKUP_*` categoryで失敗する。Pythonの `bool` は整数criteriaとして受理しない。INTEGER、REAL、TEXT、BLOBは型を区別し、REALはfloatの厳密表現で比較する。
 - `iter_selected_matches(mode, rule_token=None)` は、現在generationの `match_classification` と `matches` 全表からselectorに一致するmatches行を順次返す。mode/ruleで保存対象の全表を削るAPIではない。
 - `published_control_binding_verified` はopen時に固定したcontrol bytesとローカルpackageの対応を構造検証した状態を示す。`published_deltas_verified` は空でない有効delta chainの全世代について、publisher indexとローカルartifactの検証が成立した場合だけ真になる。baseline-onlyでは `published_control_binding_verified` が真でも `published_deltas_verified` は偽である。
 
 baseline shardを直接読む `LosslessShardReader.lookup_rows_with_identity(table, criteria)` は、 `(ordinal, source_rowid, values)` を候補行ごとに返す。Reader open時に全宣言ファイルのbyte数・SHA-256とverification証明を検査し、process-local `VerifiedFiles` tokenへパス・ファイル・親directoryのfingerprintを結び付ける。lookup中のAPI境界ではfingerprint、完全な登録ファイル集合、SQLiteのinventory、行・列・外部値chunkのmetadataを再確認する。tokenによる境界再検査は全ファイルのSHA再計算を行わない。criteriaに合わない行では画像など大きな外部値を復元せず、候補行の値だけを読み戻す。このlookupでは全row-stream digestと全value-chunk fileの再集計は行わないため、全内容のSHA・source対照を再実施したことを意味しない。保存されている情報は変えず、通常の全行readerもその全検査を維持する。
+
+`PublishedSQLiteReader.get_unique_row(table, criteria)` は同じ候補限定読取をbaseline-plus-deltaの、open時に固定したローカルgenerationへ適用する。固定済みのbaseline/delta control bindingとbaseline packageをlookup前後に検査し、差分readerは選択されたdelta artifactを自身の境界で検査する。open後にpublisherのlatestが進んでもreaderはその新世代へ切り替わらない。このAPIはremote latest、Drive上のobject、現在時点までの同期を確認せず、全row-stream digestも再計算しない。
+
+差分lookupのoperation/identity mapはreaderの一時SQLite overlayに置くmetadata-onlyのquery cacheで、保存されたbaselineやdelta値の代替ではない。適格な候補経路はcache採用前に有効chain全世代のoperation metadataと、問い合わせ表の全transport row参照（条件に合わない行や後続generationで上書きされた行を含む）、baselineの全元rowid、generationごとのrow countを照合する。外部payloadを候補値として復元しない場合も、このmetadata検査は省かない。条件に合う行だけ値を完全復元する。行identity条件が適さない場合のfallbackは、問い合わせ対象の表を一時overlayへ値ごとmaterializeする。いずれの場合も宣言済みのbaselineとdelta packageが全情報の保存元であり、lookup cacheはprivate・一時的で公開artifactではない。
 
 `VerifiedFiles.derive(prefix, records)` は、親tokenにすでに登録された `prefix/` 以下の非空ファイル集合について、相対パス・byte数・SHA-256が親記録と完全一致する場合に、親のfingerprintからchild-root用tokenを導く。親tokenを導出前と導出後にも検査し、内容の再hashはしない。派生tokenが証明する範囲は指定したchild subsetだけであり、親package全体の証明を置き換えない。chainを組む呼出元は親package tokenを保持し、child tokenと併せて親側の完全な入力guardを続ける。published `DeltaChainReader` はpublished modeでbaseline package全体と選択された各delta packageのcontrol/artifact tokenをAPI・iterator境界で再検査する。
 

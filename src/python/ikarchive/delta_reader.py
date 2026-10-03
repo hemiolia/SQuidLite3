@@ -1045,6 +1045,12 @@ class DeltaChainReader:
         self._final_metadata: dict[str, Any] = {}
         self._final_tables: dict[str, dict[str, Any]] = {}
         self._final_generation_id: Optional[str] = None
+        self._lookup_operations_cache: Optional[str] = None
+        self._lookup_operations_cache_ready = False
+        self._lookup_transport_packages: list[dict[str, Any]] = []
+        self._lookup_map_tables: dict[str, str] = {}
+        self._lookup_baseline_enabled: dict[str, bool] = {}
+        self._lookup_fallback_tables: set[str] = set()
 
     def __enter__(self) -> "DeltaChainReader":
         if self._active:
@@ -1206,6 +1212,12 @@ class DeltaChainReader:
         self._scratch_counter = 0
         self._selector_counter = 0
         self._materialized = set()
+        self._lookup_operations_cache = None
+        self._lookup_operations_cache_ready = False
+        self._lookup_transport_packages = []
+        self._lookup_map_tables = {}
+        self._lookup_baseline_enabled = {}
+        self._lookup_fallback_tables = set()
         self._iterators.clear()
         self._published_generation_indexes_complete = False
         self._published_file_guards = []
@@ -1771,6 +1783,737 @@ class DeltaChainReader:
                     cursor.close()
                 except sqlite3.Error:
                     pass
+
+    def _lookup_fast_eligible(self, table: str) -> bool:
+        """Whether rowid overlay can resolve ``table`` without values cache."""
+        if table in self._lookup_fallback_tables:
+            return False
+        baseline_manifest = self._baseline._manifest
+        if not isinstance(baseline_manifest, dict):
+            return False
+        baseline_tables = {
+            item.get("name"): item
+            for item in baseline_manifest.get("tables", [])
+            if isinstance(item, dict)
+        }
+        baseline_table = baseline_tables.get(table)
+        if not isinstance(baseline_table, dict) or baseline_table.get("rowid_kind") != "rowid":
+            return False
+        current_xinfo = self._final_metadata.get("source_table_columns", {}).get(table)
+        if not isinstance(current_xinfo, list) or not _same_json(
+            baseline_table.get("column_schema"), current_xinfo
+        ):
+            return False
+
+        def table_object(objects: Any) -> Optional[dict[str, Any]]:
+            if not isinstance(objects, list):
+                return None
+            matches = [
+                item for item in objects
+                if isinstance(item, dict)
+                and item.get("type") == "table"
+                and item.get("name") == table
+                and item.get("tbl_name") == table
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        baseline_object = table_object(baseline_manifest.get("schema_objects"))
+        if baseline_object is None:
+            return False
+        for plan in self._plans:
+            if plan.get("transport", {}).get("kind") != "lossless_sqlite_shards":
+                return False
+            if not _same_json(plan.get("source_table_columns", {}).get(table), current_xinfo):
+                return False
+            if not _same_json(table_object(plan.get("schemas")), baseline_object):
+                return False
+        return True
+
+    def _lookup_transport_package(self, generation_index: int) -> dict[str, Any]:
+        """Derive a no-rehash candidate token for a preverified transport tree."""
+        if generation_index < len(self._lookup_transport_packages):
+            return self._lookup_transport_packages[generation_index]
+        if generation_index != len(self._lookup_transport_packages):
+            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+        if (generation_index >= len(self._plans)
+                or generation_index >= len(self._shard_manifests)
+                or generation_index >= len(self._published_file_guards)):
+            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+        plan = self._plans[generation_index]
+        manifest = self._shard_manifests[generation_index]
+        if not isinstance(manifest, dict):
+            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+        generation_root = Path(plan["_root"])
+        package_root = generation_root / "transport"
+        try:
+            parts, external_docs, selector_files = _lossless._declared_files(
+                manifest, package_root, verify_hashes=False
+            )
+            if selector_files:
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            plan_files = {
+                item["local"]: {"bytes": item["bytes"], "sha256": item["sha256"]}
+                for item in plan["files"]
+            }
+            records: dict[str, dict[str, Any]] = {}
+            for relative, declared in {**parts, **external_docs}.items():
+                record = {"bytes": declared.get("bytes"), "sha256": declared.get("sha256")}
+                if plan_files.get(f"transport/{relative}") != record:
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                records[relative] = record
+            for relative in ("manifest.json", "verification.json"):
+                source_relative = f"transport/{relative}"
+                record = plan_files.get(source_relative)
+                if not isinstance(record, dict):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                records[relative] = dict(record)
+
+            generation_root_guard, guards = self._published_file_guards[generation_index]
+            if generation_root_guard != generation_root or not guards:
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            artifact_guard, artifact_records = guards[0]
+            selected_records = {
+                f"transport/{relative}": record for relative, record in records.items()
+            }
+            transport_token = artifact_guard.derive("transport", records)
+            # Keep the exact plan inventory associated with the derived token;
+            # its parent was already checked at entry and is checked again at
+            # every public lookup boundary.
+            if any(artifact_records.get(path) != item for path, item in selected_records.items()):
+                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+            table_names, _xinfo, visible = _delta._table_specs(plan["metadata"])
+            internal = _delta._internal_names(plan["metadata"], table_names)
+            package = {
+                "root": package_root,
+                "manifest": manifest,
+                "token": transport_token,
+                "records": records,
+                "table_names": table_names,
+                "visible": visible,
+                "operations_table": internal["operations_table"],
+                "metadata_table": internal["metadata_table"],
+            }
+            self._lookup_transport_packages.append(package)
+            return package
+        except DeltaReaderError:
+            raise
+        except Exception:
+            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID") from None
+
+    def _build_lookup_operations_cache(self) -> str:
+        """Validate each small operation stream once and retain only references."""
+        connection = self._require_open()
+        if self._lookup_operations_cache_ready:
+            if self._lookup_operations_cache is None:
+                raise DeltaReaderError("DELTA_LOOKUP_CACHE_INVALID")
+            return self._lookup_operations_cache
+        if any(plan.get("transport", {}).get("kind") != "lossless_sqlite_shards"
+               for plan in self._plans):
+            raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+        self._scratch_counter += 1
+        suffix = f"{self._scratch_counter:08d}"
+        cache_table = f"_lookup_operations_{suffix}"
+        identity_index = f"_lookup_identity_uq_{suffix}"
+        ordinal_index = f"_lookup_ordinal_uq_{suffix}"
+        created = False
+        packages: list[dict[str, Any]] = []
+        try:
+            connection.execute(
+                f"CREATE TABLE {_quote(cache_table)} ("
+                '"generation_index" INTEGER NOT NULL, "operation_ordinal" INTEGER NOT NULL, '
+                '"table_name" TEXT NOT NULL, "operation" TEXT NOT NULL, '
+                '"source_rowid" INTEGER, "identity_json" TEXT, "row_ordinal" INTEGER, '
+                '"transport_rowid" INTEGER, "identity_key" TEXT, '
+                'PRIMARY KEY ("generation_index", "operation_ordinal"))'
+            )
+            created = True
+            connection.execute(
+                f"CREATE UNIQUE INDEX {_quote(identity_index)} ON {_quote(cache_table)} "
+                '("generation_index", "identity_key") WHERE "identity_key" IS NOT NULL'
+            )
+            connection.execute(
+                f"CREATE UNIQUE INDEX {_quote(ordinal_index)} ON {_quote(cache_table)} "
+                '("generation_index", "table_name", "row_ordinal") '
+                'WHERE "row_ordinal" IS NOT NULL'
+            )
+            insert_sql = (
+                f"INSERT INTO {_quote(cache_table)} VALUES "
+                "(?,?,?,?,?,?,?,?,?)"
+            )
+            for generation_index, (plan, document, manifest) in enumerate(
+                zip(self._plans, self._documents, self._shard_manifests)
+            ):
+                package = self._lookup_transport_package(generation_index)
+                packages.append(package)
+                table_names = package["table_names"]
+                visible = package["visible"]
+                operations_table = package["operations_table"]
+                metadata_table = package["metadata_table"]
+                table_docs = {
+                    item.get("name"): item
+                    for item in manifest.get("tables", [])
+                    if isinstance(item, dict)
+                }
+                expected_table_names = set(table_names) | {operations_table, metadata_table}
+                if set(table_docs) != expected_table_names:
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                if document.get("table_names") != table_names:
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+                counts = document.get("upsert_counts_by_table")
+                operation_counts = document.get("operation_counts")
+                if (not isinstance(counts, dict)
+                        or set(counts) - set(table_names)
+                        or any(type(value) is not int or value <= 0 for value in counts.values())
+                        or not isinstance(operation_counts, dict)
+                        or set(operation_counts) != {"upsert", "delete", "clear_table"}
+                        or any(type(value) is not int or value < 0
+                               for value in operation_counts.values())):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                expected_counts = {name: counts.get(name, 0) for name in table_names}
+                expected_counts[operations_table] = sum(operation_counts.values())
+                expected_counts[metadata_table] = 1
+                for name in expected_table_names:
+                    row_count = table_docs[name].get("row_count")
+                    if type(row_count) is not int or row_count != expected_counts[name]:
+                        raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                if (table_docs[operations_table].get("columns") != list(_OPERATION_FIELDS)
+                        or table_docs[metadata_table].get("columns") != ["name", "value"]):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+                metadata_iterator = _lossless._iter_table_candidates(
+                    package["root"], manifest, metadata_table, {},
+                    verified_files=package["token"], verified_records=package["records"],
+                    candidate_package_kind="transport",
+                )
+                try:
+                    metadata_row = next(metadata_iterator, None)
+                    extra_metadata_row = next(metadata_iterator, None)
+                finally:
+                    metadata_iterator.close()
+                if (metadata_row is None or extra_metadata_row is not None
+                        or metadata_row[0] != 0
+                        or metadata_row[2] != ("source_metadata", _canonical(plan["metadata"]))):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+                cleared: set[str] = set()
+                clear_closed: set[str] = set()
+                seen_table_ops: set[str] = set()
+                active_clear: Optional[str] = None
+                upsert_ordinals = {name: 0 for name in table_names}
+                actual_operation_counts = {"upsert": 0, "delete": 0, "clear_table": 0}
+                operation_iterator = _lossless._iter_table_candidates(
+                    package["root"], manifest, operations_table, {},
+                    verified_files=package["token"], verified_records=package["records"],
+                    candidate_package_kind="transport",
+                )
+                try:
+                    for operation_ordinal, operations_rowid, values in operation_iterator:
+                        if (type(operation_ordinal) is not int
+                                or operation_ordinal != sum(actual_operation_counts.values())
+                                or operations_rowid is not None and operations_rowid != operation_ordinal
+                                or len(values) != len(_OPERATION_FIELDS)
+                                or values[0] != operation_ordinal):
+                            raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                        record_fields = dict(zip(_OPERATION_FIELDS, values))
+                        table_name = record_fields["table_name"]
+                        operation = record_fields["operation"]
+                        source_rowid = record_fields["source_rowid"]
+                        identity_json = record_fields["identity_json"]
+                        row_ordinal = record_fields["row_ordinal"]
+                        transport_rowid = record_fields["transport_rowid"]
+                        identity_key = record_fields["identity_key"]
+                        if table_name not in table_names or operation not in actual_operation_counts:
+                            raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                        if operation == "upsert":
+                            expected_ordinal = upsert_ordinals[table_name]
+                            if (type(row_ordinal) is not int or row_ordinal != expected_ordinal
+                                    or type(transport_rowid) is not int or transport_rowid <= 0):
+                                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                            upsert_ordinals[table_name] += 1
+                            placeholder_values: Optional[tuple[Any, ...]] = tuple(
+                                None for _ in visible[table_name]
+                            )
+                        else:
+                            if row_ordinal is not None or transport_rowid is not None:
+                                raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                            placeholder_values = None
+                        if identity_key is not None and not isinstance(identity_key, str):
+                            raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                        record = {
+                            "table_name": table_name,
+                            "columns": visible[table_name],
+                            "source_rowid": source_rowid,
+                            "identity_json": identity_json,
+                            "operation": operation,
+                            "values": placeholder_values,
+                        }
+                        normalized, computed_key, active_clear = _delta._validate_record(
+                            record, set(table_names), visible, cleared, clear_closed,
+                            active_clear, seen_table_ops,
+                        )
+                        if computed_key != identity_key:
+                            raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+                        connection.execute(insert_sql, (
+                            generation_index, operation_ordinal, table_name, operation,
+                            source_rowid, identity_json, row_ordinal, transport_rowid,
+                            identity_key,
+                        ))
+                        actual_operation_counts[operation] += 1
+                finally:
+                    operation_iterator.close()
+
+                actual_upsert_counts = {
+                    name: count for name, count in upsert_ordinals.items() if count
+                }
+                if (actual_operation_counts != operation_counts
+                        or actual_upsert_counts != counts
+                        or any(table_docs[name]["row_count"] != upsert_ordinals[name]
+                               for name in table_names)):
+                    raise ValueError("DELTA_LOOKUP_TRANSPORT_INVALID")
+
+            self._lookup_operations_cache = cache_table
+            self._lookup_operations_cache_ready = True
+            self._lookup_transport_packages = packages
+            return cache_table
+        except BaseException as exc:
+            if created:
+                try:
+                    connection.execute(f"DROP TABLE IF EXISTS {_quote(cache_table)}")
+                except BaseException:
+                    pass
+                for index_name in (identity_index, ordinal_index):
+                    try:
+                        connection.execute(f"DROP INDEX IF EXISTS {_quote(index_name)}")
+                    except BaseException:
+                        pass
+            self._lookup_operations_cache = None
+            self._lookup_operations_cache_ready = False
+            self._lookup_transport_packages = []
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, DeltaReaderError):
+                raise
+            code = (str(exc) if isinstance(exc, ValueError)
+                    and re.fullmatch(r"[A-Z0-9_]+", str(exc))
+                    else "DELTA_LOOKUP_TRANSPORT_INVALID")
+            raise DeltaReaderError(code) from None
+
+    def _verify_lookup_transport_references(self, table: str, operations_cache: str) -> None:
+        """Bind every value ordinal to its operation row without decoding cells."""
+        connection = self._require_open()
+        for generation_index, package in enumerate(self._lookup_transport_packages):
+            document = self._documents[generation_index]
+            manifest = package["manifest"]
+            expected = document["upsert_counts_by_table"].get(table, 0)
+            table_doc = next(
+                (item for item in manifest["tables"] if item["name"] == table), None
+            )
+            if (type(expected) is not int or expected < 0 or table_doc is None
+                    or type(table_doc.get("row_count")) is not int
+                    or table_doc["row_count"] != expected):
+                raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
+
+            scanned = 0
+            reference_error = False
+
+            def reject_after_reference_check(
+                ordinal: int, transport_rowid: Optional[int], *, _index=generation_index,
+            ) -> bool:
+                nonlocal scanned, reference_error
+                scanned += 1
+                if type(ordinal) is not int or ordinal < 0:
+                    reference_error = True
+                    return False
+                reference = connection.execute(
+                    f"SELECT \"operation\", \"transport_rowid\" FROM {_quote(operations_cache)} "
+                    'WHERE "generation_index"=? AND "table_name"=? AND "row_ordinal"=?',
+                    (_index, table, ordinal),
+                ).fetchone()
+                if (reference is None or reference[0] != "upsert"
+                        or type(reference[1]) is not int or reference[1] <= 0
+                        or type(transport_rowid) is not int
+                        or transport_rowid != reference[1]):
+                    reference_error = True
+                # This pass validates every historical/superseded reference,
+                # but never asks the shard reader to restore an external cell.
+                return False
+
+            candidates = _lossless._iter_table_candidates(
+                package["root"], package["manifest"], table, {},
+                verified_files=package["token"], verified_records=package["records"],
+                candidate_package_kind="transport",
+                candidate_row_filter=reject_after_reference_check,
+            )
+            yielded = False
+            try:
+                for _entry in candidates:
+                    yielded = True
+                    break
+            finally:
+                candidates.close()
+            if reference_error or yielded or scanned != expected:
+                raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
+
+    def _build_lookup_row_map(self, table: str, operations_cache: str) -> Optional[str]:
+        """Index final rowid operations; None requests safe full materialization."""
+        connection = self._require_open()
+        if table in self._lookup_map_tables:
+            return self._lookup_map_tables[table]
+        self._verify_lookup_transport_references(table, operations_cache)
+        self._scratch_counter += 1
+        suffix = f"{self._scratch_counter:08d}"
+        map_table = f"_lookup_rows_{suffix}"
+        index_name = f"_lookup_rows_genord_{suffix}"
+        created = False
+        unsupported_identity = False
+        try:
+            connection.execute(
+                f"CREATE TABLE {_quote(map_table)} ("
+                '"source_rowid" INTEGER PRIMARY KEY, "generation_index" INTEGER NOT NULL, '
+                '"operation_ordinal" INTEGER NOT NULL, "operation" TEXT NOT NULL, '
+                '"row_ordinal" INTEGER, "transport_rowid" INTEGER, "identity_key" TEXT, '
+                '"active" INTEGER NOT NULL)'
+            )
+            created = True
+            connection.execute(
+                f"CREATE UNIQUE INDEX {_quote(index_name)} ON {_quote(map_table)} "
+                '("generation_index", "row_ordinal") '
+                'WHERE "operation"=\'upsert\' AND "active"=1'
+            )
+
+            baseline_root, baseline_manifest = self._baseline._require_open()
+            baseline_table = next(
+                (item for item in baseline_manifest["tables"] if item["name"] == table), None
+            )
+            if (baseline_table is None or type(baseline_table.get("row_count")) is not int
+                    or baseline_table["row_count"] < 0):
+                raise DeltaReaderError("DELTA_LOOKUP_ROW_COUNT_MISMATCH")
+            baseline_rows = 0
+            baseline_error = False
+
+            def index_baseline_identity(ordinal: int, source_rowid: Optional[int]) -> bool:
+                nonlocal baseline_rows, baseline_error
+                if (type(ordinal) is not int or ordinal != baseline_rows
+                        or type(source_rowid) is not int
+                        or not _delta._MIN_INT64 <= source_rowid <= _delta._MAX_INT64):
+                    baseline_error = True
+                else:
+                    try:
+                        connection.execute(
+                            f"INSERT INTO {_quote(map_table)} VALUES (?,?,?,?,?,?,?,?)",
+                            (source_rowid, -1, ordinal, "baseline", None, None, None, 1),
+                        )
+                    except sqlite3.IntegrityError:
+                        baseline_error = True
+                baseline_rows += 1
+                return False
+
+            baseline_candidates = _lossless._iter_table_candidates(
+                baseline_root, baseline_manifest, table, {},
+                verified_files=self._baseline._verified_files,
+                verified_records=self._baseline._verified_records,
+                candidate_package_kind="baseline",
+                candidate_row_filter=index_baseline_identity,
+            )
+            baseline_yielded = False
+            try:
+                for _entry in baseline_candidates:
+                    baseline_yielded = True
+                    break
+            finally:
+                baseline_candidates.close()
+            if (baseline_error or baseline_yielded
+                    or baseline_rows != baseline_table["row_count"]):
+                raise DeltaReaderError("DELTA_LOOKUP_ROW_COUNT_MISMATCH")
+
+            baseline_enabled = True
+            for generation_index, plan in enumerate(self._plans):
+                cursor = connection.execute(
+                    f"SELECT operation_ordinal, table_name, operation, source_rowid, "
+                    f"identity_json, row_ordinal, transport_rowid, identity_key "
+                    f"FROM {_quote(operations_cache)} WHERE \"generation_index\"=? "
+                    "ORDER BY \"operation_ordinal\"",
+                    (generation_index,),
+                )
+                try:
+                    for (operation_ordinal, op_table, operation, source_rowid,
+                         identity_json, row_ordinal, transport_rowid, identity_key) in cursor:
+                        if op_table != table:
+                            continue
+                        if operation == "clear_table":
+                            connection.execute(f"DELETE FROM {_quote(map_table)}")
+                            baseline_enabled = False
+                            continue
+                        # The fast overlay is keyed by original source rowid. A
+                        # legal PK-only or post-clear ordinal identity cannot be
+                        # translated to that key without reading old values.
+                        if (type(source_rowid) is not int or identity_json is not None
+                                or operation not in ("upsert", "delete")):
+                            unsupported_identity = True
+                            break
+                        active = 1 if operation == "upsert" else 0
+                        connection.execute(
+                            f"INSERT INTO {_quote(map_table)} VALUES (?,?,?,?,?,?,?,?) "
+                            "ON CONFLICT(\"source_rowid\") DO UPDATE SET "
+                            '"generation_index"=excluded."generation_index", '
+                            '"operation_ordinal"=excluded."operation_ordinal", '
+                            '"operation"=excluded."operation", "row_ordinal"=excluded."row_ordinal", '
+                            '"transport_rowid"=excluded."transport_rowid", '
+                            '"identity_key"=excluded."identity_key", "active"=excluded."active"',
+                            (source_rowid, generation_index, operation_ordinal, operation,
+                             row_ordinal, transport_rowid, identity_key, active),
+                        )
+                finally:
+                    cursor.close()
+                if unsupported_identity:
+                    break
+                expected_count = plan.get("source_row_counts", {}).get(table)
+                actual_count = connection.execute(
+                    f"SELECT COUNT(*) FROM {_quote(map_table)} WHERE \"active\"=1"
+                ).fetchone()[0]
+                if type(expected_count) is not int or actual_count != expected_count:
+                    raise DeltaReaderError("DELTA_LOOKUP_ROW_COUNT_MISMATCH")
+            if unsupported_identity:
+                connection.execute(f"DROP TABLE IF EXISTS {_quote(map_table)}")
+                connection.execute(f"DROP INDEX IF EXISTS {_quote(index_name)}")
+                self._lookup_fallback_tables.add(table)
+                return None
+            final_expected = self._final_metadata.get("source_row_counts", {}).get(table)
+            final_actual = connection.execute(
+                f"SELECT COUNT(*) FROM {_quote(map_table)} WHERE \"active\"=1"
+            ).fetchone()[0]
+            if type(final_expected) is not int or final_actual != final_expected:
+                raise DeltaReaderError("DELTA_LOOKUP_ROW_COUNT_MISMATCH")
+            self._lookup_map_tables[table] = map_table
+            self._lookup_baseline_enabled[table] = baseline_enabled
+            return map_table
+        except BaseException as exc:
+            if created:
+                try:
+                    connection.execute(f"DROP TABLE IF EXISTS {_quote(map_table)}")
+                except BaseException:
+                    pass
+                try:
+                    connection.execute(f"DROP INDEX IF EXISTS {_quote(index_name)}")
+                except BaseException:
+                    pass
+            self._lookup_map_tables.pop(table, None)
+            self._lookup_baseline_enabled.pop(table, None)
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, DeltaReaderError):
+                raise
+            code = (str(exc) if isinstance(exc, ValueError)
+                    and re.fullmatch(r"[A-Z0-9_]+", str(exc))
+                    else "DELTA_LOOKUP_CACHE_INVALID")
+            raise DeltaReaderError(code) from None
+
+    def _lookup_materialized(
+        self, table: str, criteria_indexes: dict[int, Any],
+    ) -> Optional[dict[str, Any]]:
+        connection = self._require_open()
+        self._materialize(table)
+        cache_table = self._cache_names[table]
+        column_count = sum(
+            item["hidden"] != 1
+            for item in self._final_metadata["source_table_columns"][table]
+        )
+        columns = [f'"v{index:06d}"' for index in range(column_count)]
+        projection = '"source_rowid"' + (f", {', '.join(columns)}" if columns else "")
+        query = (
+            f"SELECT {projection} "
+            f"FROM {_quote(cache_table)} WHERE \"live\"=1 ORDER BY \"sequence\""
+        )
+        cursor = connection.execute(query)
+        found: Optional[dict[str, Any]] = None
+        try:
+            for row in cursor:
+                source_rowid, *values = row
+                typed_values = tuple(values)
+                if not all(
+                    _lossless._same_sqlite_value(typed_values[index], expected)
+                    for index, expected in criteria_indexes.items()
+                ):
+                    continue
+                if found is not None:
+                    raise DeltaReaderError("DELTA_LOOKUP_NOT_UNIQUE")
+                found = {"source_rowid": source_rowid, "values": typed_values}
+        finally:
+            cursor.close()
+        return found
+
+    def _lookup_sharded_candidates(
+        self,
+        table: str,
+        criteria_indexes: dict[int, Any],
+        map_table: str,
+    ) -> Optional[dict[str, Any]]:
+        connection = self._require_open()
+        columns = [item["name"] for item in self._final_metadata["source_table_columns"][table]
+                   if item["hidden"] != 1]
+        found: Optional[dict[str, Any]] = None
+
+        def accept(values: tuple[Any, ...]) -> bool:
+            if len(values) != len(columns) or any(not _delta._type_ok(value) for value in values):
+                raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
+            return all(
+                _lossless._same_sqlite_value(values[index], expected)
+                for index, expected in criteria_indexes.items()
+            )
+
+        def record(source_rowid: Any, values: tuple[Any, ...]) -> None:
+            nonlocal found
+            if not accept(values):
+                raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
+            if found is not None:
+                raise DeltaReaderError("DELTA_LOOKUP_NOT_UNIQUE")
+            found = {"source_rowid": source_rowid, "values": values}
+
+        baseline_root, baseline_manifest = self._baseline._require_open()
+        if self._lookup_baseline_enabled.get(table, True):
+            def baseline_filter(_ordinal: int, source_rowid: Optional[int]) -> bool:
+                if type(source_rowid) is not int:
+                    raise ValueError("baseline row identity is invalid")
+                state = connection.execute(
+                    f"SELECT \"operation\", \"active\" FROM {_quote(map_table)} "
+                    'WHERE "source_rowid"=?',
+                    (source_rowid,),
+                ).fetchone()
+                return state is not None and state[0] == "baseline" and state[1] == 1
+
+            candidates = _lossless._iter_table_candidates(
+                baseline_root, baseline_manifest, table, criteria_indexes,
+                verified_files=self._baseline._verified_files,
+                verified_records=self._baseline._verified_records,
+                candidate_package_kind="baseline", candidate_row_filter=baseline_filter,
+            )
+            try:
+                for _ordinal, source_rowid, values in candidates:
+                    if not accept(values):
+                        raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
+                    if type(source_rowid) is not int:
+                        raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
+                    record(source_rowid, values)
+            finally:
+                candidates.close()
+
+        for generation_index, package in enumerate(self._lookup_transport_packages):
+            active_count = connection.execute(
+                f"SELECT COUNT(*) FROM {_quote(map_table)} "
+                'WHERE "generation_index"=? AND "operation"=\'upsert\' AND "active"=1',
+                (generation_index,),
+            ).fetchone()[0]
+            if active_count == 0:
+                continue
+            reference_error = False
+
+            def delta_filter(ordinal: int, transport_rowid: Optional[int], *, _index=generation_index) -> bool:
+                nonlocal reference_error
+                if type(ordinal) is not int:
+                    reference_error = True
+                    return False
+                reference = connection.execute(
+                    f"SELECT \"source_rowid\", \"transport_rowid\", \"operation\", \"active\" "
+                    f"FROM {_quote(map_table)} WHERE \"generation_index\"=? AND \"row_ordinal\"=?",
+                    (_index, ordinal),
+                ).fetchone()
+                if reference is None:
+                    return False
+                _source_rowid, expected_transport_rowid, operation, active = reference
+                if (operation != "upsert" or active != 1
+                        or type(transport_rowid) is not int
+                        or transport_rowid != expected_transport_rowid):
+                    reference_error = True
+                    return False
+                return True
+
+            candidates = _lossless._iter_table_candidates(
+                package["root"], package["manifest"], table, criteria_indexes,
+                verified_files=package["token"], verified_records=package["records"],
+                candidate_package_kind="transport", candidate_row_filter=delta_filter,
+            )
+            try:
+                for ordinal, transport_rowid, values in candidates:
+                    if reference_error:
+                        raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
+                    if not accept(values):
+                        raise DeltaReaderError("DELTA_LOOKUP_CANDIDATE_INVALID")
+                    reference = connection.execute(
+                        f"SELECT \"source_rowid\", \"transport_rowid\", \"operation\", \"active\" "
+                        f"FROM {_quote(map_table)} WHERE \"generation_index\"=? AND \"row_ordinal\"=?",
+                        (generation_index, ordinal),
+                    ).fetchone()
+                    if (reference is None or reference[2] != "upsert" or reference[3] != 1
+                            or type(transport_rowid) is not int
+                            or reference[1] != transport_rowid
+                            or type(reference[0]) is not int):
+                        raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
+                    record(reference[0], values)
+                if reference_error:
+                    raise DeltaReaderError("DELTA_LOOKUP_TRANSPORT_REFERENCE_INVALID")
+            finally:
+                candidates.close()
+        return found
+
+    def get_unique_row(self, table: str, criteria: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return one exact-typed row without restoring unrelated large values.
+
+        The result preserves the original source rowid (or ``None`` for a
+        table whose source identity is unavailable). It deliberately omits an
+        archive ordinal, which is generation-local and is not a source key.
+        Before returning, it checks the open package tokens, complete operation
+        metadata, every requested-table operation-to-transport reference, and
+        per-generation row counts. It restores full values only for matching
+        candidates; this is not a second full source-versus-shards proof.
+        """
+        self._require_open()
+        pending_error: Optional[BaseException] = None
+        try:
+            self._assert_published_inputs_unchanged()
+            if type(table) is not str or table not in self._final_tables:
+                raise DeltaReaderError("DELTA_LOOKUP_TABLE_UNKNOWN")
+            if type(criteria) is not dict:
+                raise DeltaReaderError("DELTA_LOOKUP_CRITERIA_INVALID")
+            xinfo = self._final_metadata.get("source_table_columns", {}).get(table)
+            if not isinstance(xinfo, list):
+                raise DeltaReaderError("DELTA_LOOKUP_TABLE_UNKNOWN")
+            columns = [item["name"] for item in xinfo if item["hidden"] != 1]
+            criteria_indexes: dict[int, Any] = {}
+            for name, value in criteria.items():
+                if type(name) is not str:
+                    raise DeltaReaderError("DELTA_LOOKUP_CRITERIA_INVALID")
+                if name not in columns:
+                    raise DeltaReaderError("DELTA_LOOKUP_COLUMN_UNKNOWN")
+                if not _delta._type_ok(value):
+                    raise DeltaReaderError("DELTA_LOOKUP_CRITERIA_INVALID")
+                criteria_indexes[columns.index(name)] = value
+
+            if not self._lookup_fast_eligible(table):
+                return self._lookup_materialized(table, criteria_indexes)
+            operations_cache = self._build_lookup_operations_cache()
+            map_table = self._build_lookup_row_map(table, operations_cache)
+            if map_table is None:
+                return self._lookup_materialized(table, criteria_indexes)
+            return self._lookup_sharded_candidates(table, criteria_indexes, map_table)
+        except BaseException as exc:
+            pending_error = exc
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, DeltaReaderError):
+                raise
+            code = (str(exc) if isinstance(exc, ValueError)
+                    and re.fullmatch(r"[A-Z0-9_]+", str(exc))
+                    else "DELTA_LOOKUP_FAILED")
+            raise DeltaReaderError(code) from None
+        finally:
+            try:
+                self._assert_published_inputs_unchanged()
+            except BaseException:
+                if pending_error is None or isinstance(pending_error, Exception):
+                    raise
 
     def iter_rows(self, table: str) -> Iterator[tuple[int, Optional[int], tuple[Any, ...]]]:
         """Yield current rows as ``(ordinal, original_source_rowid, values)``."""
