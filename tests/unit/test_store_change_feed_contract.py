@@ -6,11 +6,13 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'src/python'))
 
 from ikarchive.change_feed import install_change_feed
+import ikarchive.store as store_module
 from ikarchive.store import Store
 from ikarchive.writer_guards import inspect_writer_guards, install_writer_guards
 
@@ -18,6 +20,52 @@ from ikarchive.writer_guards import inspect_writer_guards, install_writer_guards
 def _writer_guard_name(table, operation):
     digest = hashlib.sha256((table + '\0' + operation).encode('utf-8', 'surrogatepass')).hexdigest()
     return 'ia_writer_guard_' + digest
+
+
+class _FakeCursor:
+    def fetchone(self):
+        return None
+
+
+class _FakeConnection:
+    def __init__(self, *, failures=None, close_error=None, rollback_error=None, script_error=None):
+        self.failures = failures or {}
+        self.close_error = close_error
+        self.rollback_error = rollback_error
+        self.script_error = script_error
+        self.executed = []
+        self.close_calls = 0
+        self.rollback_calls = 0
+        self.executescript_calls = 0
+        self.closed = False
+        self.row_factory = None
+
+    @property
+    def in_transaction(self):
+        return True
+
+    def execute(self, sql, *_args):
+        self.executed.append(sql)
+        failure = self.failures.get(sql)
+        if failure is not None:
+            raise failure
+        return _FakeCursor()
+
+    def executescript(self, _script):
+        self.executescript_calls += 1
+        if self.script_error is not None:
+            raise self.script_error
+
+    def rollback(self):
+        self.rollback_calls += 1
+        if self.rollback_error is not None:
+            raise self.rollback_error
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
 
 
 class StoreChangeFeedContractTests(unittest.TestCase):
@@ -53,6 +101,100 @@ class StoreChangeFeedContractTests(unittest.TestCase):
         ).fetchone()[0]
         conn.close()
         return user_sql
+
+    def test_database_is_slice_preserves_query_error_when_probe_close_fails(self):
+        query_error = KeyboardInterrupt('synthetic slice-probe interrupt')
+        close_error = RuntimeError('synthetic probe close failure')
+        connection = _FakeConnection(
+            failures={
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'": query_error,
+            },
+            close_error=close_error,
+        )
+        with patch.object(store_module.sqlite3, 'connect', return_value=connection):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                store_module.database_is_slice(self.path)
+        self.assertIs(caught.exception, query_error)
+        self.assertEqual(connection.close_calls, 1)
+        self.assertFalse(connection.closed)
+
+    def test_readonly_constructor_closes_each_failed_connection_phase(self):
+        probe_cases = (
+            (
+                'probe_interrupt',
+                KeyboardInterrupt('synthetic probe interrupt'),
+                'PRAGMA query_only=ON',
+            ),
+            (
+                'probe_query_error',
+                OSError('synthetic probe query error'),
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'",
+            ),
+        )
+        main_cases = (
+            ('main_interrupt', KeyboardInterrupt('synthetic main interrupt')),
+            ('main_query_error', OSError('synthetic main query error')),
+        )
+
+        for name, original, sql in probe_cases:
+            with self.subTest(phase=name):
+                close_error = RuntimeError('synthetic close collision')
+                probe = _FakeConnection(failures={sql: original}, close_error=close_error)
+                instance = Store.__new__(Store)
+                with patch.object(store_module.sqlite3, 'connect', return_value=probe):
+                    with self.assertRaises(type(original)) as caught:
+                        Store.__init__(instance, self.path, readonly=True)
+                self.assertIs(caught.exception, original)
+                self.assertEqual(probe.close_calls, 1)
+                self.assertFalse(probe.closed)
+                self.assertIsNone(instance.db)
+
+        for name, original in main_cases:
+            with self.subTest(phase=name):
+                close_error = RuntimeError('synthetic main close collision')
+                probe = _FakeConnection()
+                main = _FakeConnection(
+                    failures={'PRAGMA query_only=ON': original},
+                    close_error=close_error,
+                )
+                instance = Store.__new__(Store)
+                with patch.object(store_module.sqlite3, 'connect', side_effect=[probe, main]):
+                    with self.assertRaises(type(original)) as caught:
+                        Store.__init__(instance, self.path, readonly=True)
+                self.assertIs(caught.exception, original)
+                self.assertEqual(probe.close_calls, 1)
+                self.assertTrue(probe.closed)
+                self.assertEqual(main.close_calls, 1)
+                self.assertFalse(main.closed)
+                self.assertIsNone(instance.db)
+
+    def test_successful_probe_close_failure_propagates_and_writable_failure_keeps_original(self):
+        probe_close_error = RuntimeError('normal probe close failure')
+        probe = _FakeConnection(close_error=probe_close_error)
+        with patch.object(store_module.sqlite3, 'connect', return_value=probe):
+            with self.assertRaises(RuntimeError) as caught_probe:
+                Store(self.path, readonly=True)
+        self.assertIs(caught_probe.exception, probe_close_error)
+        self.assertEqual(probe.close_calls, 1)
+
+        original = KeyboardInterrupt('synthetic writer setup interrupt')
+        rollback_error = OSError('synthetic rollback collision')
+        close_error = RuntimeError('synthetic writer close collision')
+        writer_connection = _FakeConnection(
+            script_error=original,
+            rollback_error=rollback_error,
+            close_error=close_error,
+        )
+        instance = Store.__new__(Store)
+        with patch.object(store_module, 'database_is_slice', return_value=False):
+            with patch.object(store_module.sqlite3, 'connect', return_value=writer_connection):
+                with self.assertRaises(KeyboardInterrupt) as caught_writer:
+                    Store.__init__(instance, self.path, readonly=False)
+        self.assertIs(caught_writer.exception, original)
+        self.assertEqual(writer_connection.rollback_calls, 1)
+        self.assertEqual(writer_connection.close_calls, 1)
+        self.assertFalse(writer_connection.closed)
+        self.assertIsNone(instance.db)
 
     def test_existing_feed_reopen_installs_missing_table_tracking_and_writer_guards(self):
         user_sql = self._install_feed_then_add_untracked_table()

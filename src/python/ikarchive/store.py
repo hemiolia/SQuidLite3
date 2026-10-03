@@ -14,6 +14,13 @@ def digest(body):return hashlib.sha256(body).hexdigest()
 def _immutable_uri(path):
     return f'{Path(path).resolve().as_uri()}?mode=ro&immutable=1'
 
+def _close_preserving_active_exception(connection):
+    """Try cleanup without replacing the exception that caused the cleanup."""
+    try:
+        connection.close()
+    except BaseException:
+        pass
+
 def database_is_slice(path):
     """slice_meta がある派生ファイルなら真。無いファイルは偽。wal は作らない。"""
     path=Path(path)
@@ -22,9 +29,12 @@ def database_is_slice(path):
     connection=sqlite3.connect(_immutable_uri(path),uri=True,timeout=30)
     try:
         connection.execute('PRAGMA query_only=ON')
-        return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None
-    finally:
-        connection.close()
+        is_slice=connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None
+    except BaseException:
+        _close_preserving_active_exception(connection)
+        raise
+    connection.close()
+    return is_slice
 
 DETAIL_ROOTS={
     'VsHistoryDetailQuery':'vsHistoryDetail',
@@ -40,29 +50,38 @@ RELATED_EMPTY_ROOTS={
 
 class Store:
     def __init__(self,path,readonly=False):
+        self.db=None
         self.path=Path(path);self.output_root=self.path.parent.parent if self.path.parent.name=='database' else self.path.parent
         self.readonly=readonly
         if readonly:
             if not self.path.is_file():raise FileNotFoundError(f'Database not found: {self.path}')
             probe=sqlite3.connect(_immutable_uri(self.path),uri=True,timeout=30)
-            probe.row_factory=sqlite3.Row
-            probe.execute('PRAGMA query_only=ON')
-            is_slice=probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None
-            if is_slice:
-                role=probe.execute("SELECT value FROM slice_meta WHERE key='role'").fetchone()
-                probe.close()
-                if role is not None and role[0]=='lossless_slice_selector':
-                    raise ValueError('LOSSLESS_SELECTOR_REQUIRES_SHARD_READER')
-                raise ValueError('INCOMPLETE_LEGACY_SLICE')
+            try:
+                probe.row_factory=sqlite3.Row
+                probe.execute('PRAGMA query_only=ON')
+                is_slice=probe.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='slice_meta'").fetchone() is not None
+                if is_slice:
+                    role=probe.execute("SELECT value FROM slice_meta WHERE key='role'").fetchone()
+                    if role is not None and role[0]=='lossless_slice_selector':
+                        raise ValueError('LOSSLESS_SELECTOR_REQUIRES_SHARD_READER')
+                    raise ValueError('INCOMPLETE_LEGACY_SLICE')
+            except BaseException:
+                _close_preserving_active_exception(probe)
+                raise
             probe.close()
-            self.db=sqlite3.connect(f'{self.path.resolve().as_uri()}?mode=ro',uri=True,timeout=30)
-            self.db.row_factory=sqlite3.Row
-            self.db.execute('PRAGMA query_only=ON')
+            connection=sqlite3.connect(f'{self.path.resolve().as_uri()}?mode=ro',uri=True,timeout=30)
+            self.db=connection
+            try:
+                connection.row_factory=sqlite3.Row
+                connection.execute('PRAGMA query_only=ON')
+            except BaseException:
+                self.db=None
+                _close_preserving_active_exception(connection)
+                raise
             return
         if database_is_slice(self.path):
             raise ValueError('SLICE_READONLY')
         self.path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-        self.db=None
         try:
             self.db=sqlite3.connect(self.path,timeout=30);self.db.row_factory=sqlite3.Row
             # SQLite's implicit deletes during REPLACE must reach the change feed.
@@ -81,10 +100,13 @@ class Store:
                 try:
                     if connection.in_transaction:
                         connection.rollback()
-                except sqlite3.Error:
+                except BaseException:
+                    pass
+                try:
+                    connection.close()
+                except BaseException:
                     pass
                 finally:
-                    connection.close()
                     self.db=None
             raise
     def _install_existing_change_feed(self):

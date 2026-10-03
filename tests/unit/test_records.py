@@ -16,12 +16,41 @@
 
 import hashlib, json, sqlite3, sys, tempfile, unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src/python"))
 
 from ikarchive.store import Store, js
 from ikarchive.records import RecordReader
+
+
+class _FakeReaderConnection:
+    def __init__(self, *, begin_error=None, close_error=None):
+        self.begin_error = begin_error
+        self.close_error = close_error
+        self.statements = []
+        self.close_calls = 0
+        self.closed = False
+
+    def execute(self, sql):
+        self.statements.append(sql)
+        if sql == "BEGIN" and self.begin_error is not None:
+            raise self.begin_error
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
+
+
+class _FakeReaderStore:
+    def __init__(self, connection):
+        self.db = connection
+
+    def close(self):
+        self.db.close()
 
 
 class TestRecordReader(unittest.TestCase):
@@ -554,6 +583,99 @@ class TestRecordReader(unittest.TestCase):
         with RecordReader(self.db_path) as active_reader:
             with self.assertRaises(sqlite3.OperationalError):
                 active_reader._store.db.execute("INSERT INTO matches VALUES('x','vs','k','t','t',NULL)")
+
+    def test_begin_baseexceptions_close_failure_preserves_identity_and_allows_reentry(self):
+        begin_errors = (
+            KeyboardInterrupt("synthetic begin interrupt"),
+            SystemExit("synthetic begin exit"),
+            RuntimeError("synthetic begin error"),
+        )
+        for begin_error in begin_errors:
+            with self.subTest(error=type(begin_error).__name__):
+                close_error = OSError("synthetic close failure")
+                failed_connection = _FakeReaderConnection(
+                    begin_error=begin_error, close_error=close_error,
+                )
+                retry_connection = _FakeReaderConnection()
+                failed_store = _FakeReaderStore(failed_connection)
+                retry_store = _FakeReaderStore(retry_connection)
+                reader = RecordReader(self.db_path)
+
+                with patch("ikarchive.records.Store", side_effect=[failed_store, retry_store]):
+                    with self.assertRaises(type(begin_error)) as caught:
+                        reader.__enter__()
+                    self.assertIs(caught.exception, begin_error)
+                    self.assertEqual(failed_connection.close_calls, 1)
+                    self.assertFalse(failed_connection.closed)
+                    self.assertEqual(failed_connection.statements, ["BEGIN"])
+                    self.assertFalse(reader._entered)
+                    self.assertIsNone(reader._store)
+
+                    self.assertIs(reader.__enter__(), reader)
+                    self.assertIs(reader._store, retry_store)
+                    reader.__exit__(None, None, None)
+
+                self.assertTrue(retry_connection.closed)
+                self.assertFalse(reader._entered)
+                self.assertIsNone(reader._store)
+
+    def test_exit_preserves_body_exception_and_surfaces_close_failure_on_success(self):
+        body_error = KeyboardInterrupt("synthetic body interrupt")
+        body_close_error = OSError("body cleanup failed")
+        success_close_error = RuntimeError("successful body cleanup failed")
+        body_connection = _FakeReaderConnection(close_error=body_close_error)
+        success_connection = _FakeReaderConnection(close_error=success_close_error)
+        retry_connection = _FakeReaderConnection()
+        stores = [
+            _FakeReaderStore(body_connection),
+            _FakeReaderStore(success_connection),
+            _FakeReaderStore(retry_connection),
+        ]
+        reader = RecordReader(self.db_path)
+
+        with patch("ikarchive.records.Store", side_effect=stores):
+            with self.assertRaises(KeyboardInterrupt) as caught_body:
+                with reader:
+                    raise body_error
+            self.assertIs(caught_body.exception, body_error)
+            self.assertEqual(body_connection.close_calls, 1)
+            self.assertFalse(body_connection.closed)
+            self.assertFalse(reader._entered)
+            self.assertIsNone(reader._store)
+
+            with self.assertRaises(RuntimeError) as caught_close:
+                with reader:
+                    pass
+            self.assertIs(caught_close.exception, success_close_error)
+            self.assertEqual(success_connection.close_calls, 1)
+            self.assertFalse(success_connection.closed)
+            self.assertFalse(reader._entered)
+            self.assertIsNone(reader._store)
+
+            self.assertIs(reader.__enter__(), reader)
+            reader.__exit__(None, None, None)
+
+        self.assertTrue(retry_connection.closed)
+
+    def test_readonly_reader_preserves_database_bytes_and_change_count(self):
+        before = self.db_path.read_bytes()
+        before_sha = hashlib.sha256(before).hexdigest()
+        reader = RecordReader(self.db_path)
+
+        with reader as opened:
+            connection = opened._store.db
+            self.assertEqual(connection.execute("PRAGMA query_only").fetchone()[0], 1)
+            changes_before = connection.total_changes
+            page = opened.list_matches("readonly-contract-account")
+            self.assertEqual(page["total"], 0)
+            self.assertEqual(connection.total_changes, changes_before)
+            self.assertEqual(changes_before, 0)
+
+        after = self.db_path.read_bytes()
+        self.assertEqual(after, before)
+        self.assertEqual(hashlib.sha256(after).hexdigest(), before_sha)
+        self.assertFalse(reader._entered)
+        self.assertIsNone(reader._store)
 
     def test_wal_snapshot_isolation_during_active_context(self):
         """WAL人工DBをRecordReaderで最初にlistし、そのcontextを開いたまま別writerでmatchを追加。

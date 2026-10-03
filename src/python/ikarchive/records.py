@@ -93,20 +93,31 @@ class RecordReader:
         self._store = Store(self.path, readonly=True)
         try:
             self._store.db.execute("BEGIN")
-        except Exception:
-            self._store.close()
+        except BaseException:
+            store = self._store
             self._store = None
+            self._entered = False
+            try:
+                store.close()
+            except BaseException:
+                pass
             raise
         self._entered = True
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        store = self._store
         self._entered = False
-        if self._store is not None:
+        self._store = None
+        if store is None:
+            return
+        if exc_type is not None:
             try:
-                self._store.close()
-            finally:
-                self._store = None
+                store.close()
+            except BaseException:
+                pass
+            return
+        store.close()
 
     def _check_active(self) -> None:
         if not self._entered or self._store is None:
