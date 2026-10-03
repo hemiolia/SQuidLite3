@@ -6,7 +6,7 @@
 2. list comprehensiveness: 詳細なし対戦・バイト（pending/unavailable/unresolved等）を母集合から落とさない
 3. account / kind isolation: アカウント分離および対戦/バイト種別分離
 4. limit / offset / invalidbounds: ページネーションおよび境界値不正（0, 201, -1, 空account等）で nonzero
-5. get canonical: 原文 unknown key / 特殊 number 表記の base64 完全一致、headers 不在、detail_json 保持
+5. get canonical: 原文 unknown key / 特殊 number 表記の base64 完全一致、全source列typed保存、detail_json 保持
 6. get missing / corrupt: 不在 key で null / exit 0、欠損 canonical で nonzero (exit 1)
 7. DB bytes / schema immutability: list / get 実行前後で DB の SHA256 が完全一致（無書込確認）
 8. NAS marker / NAS forwarding: デフォルトパス拒否 (NAS_STORAGE_ACTIVE) および
@@ -119,7 +119,7 @@ class TestRecordsCLI(unittest.TestCase):
                 "test-query-id",
                 "10.0.0",
                 200,
-                js({"x-secret-auth": "MUST_NOT_BE_RETURNED", "authorization": "Bearer secret"}),
+                js({"x-fixture-header": "synthetic-header-marker", "x-fixture-auth-marker": "synthetic-auth-marker"}),
                 body_sha,
                 doc_json,
             ),
@@ -281,8 +281,8 @@ class TestRecordsCLI(unittest.TestCase):
         proc_empty_acc = self._run_cli(["records", "list", "--account", ""])
         self.assertNotEqual(proc_empty_acc.returncode, 0)
 
-    def test_05_records_get_canonical_integrity_and_no_headers(self):
-        """原文未知キー/特殊数値表記の base64 完全一致および headers 不在の検証。"""
+    def test_05_records_get_canonical_integrity_and_full_original_records(self):
+        """原文bodyに加えresponses/bodies全列をtyped source metadataとして返す。"""
         acc = "account-get"
         match_key = "vs-get-01"
         # 未知項目・巨大数値表現を含む raw bytes
@@ -299,16 +299,22 @@ class TestRecordsCLI(unittest.TestCase):
             acc, "vs", match_key, 201, raw_body_bytes, doc_json,
             genre="bankara_open", rule_raw="CLAM"
         )
+        query_id_blob = b"\x00fixture-query\xff"
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE responses SET query_id=?,http_status=? WHERE id=201",
+            (query_id_blob, float("inf")),
+        )
+        conn.commit()
+        conn.close()
 
         proc = self._run_cli(["records", "get", "--account", acc, "--kind", "vs", "--match-key", match_key])
         self.assertEqual(proc.returncode, 0, f"CLI error: {proc.stderr}")
 
-        # 出力テキスト全体に秘密ヘッダーが含まれないことを直接文字列探索で確認
-        self.assertNotIn("MUST_NOT_BE_RETURNED", proc.stdout)
-        self.assertNotIn("Bearer secret", proc.stdout)
-        self.assertNotIn("x-secret-auth", proc.stdout)
+        def reject_non_json_constant(value):
+            raise ValueError("non-standard JSON numeric constant")
 
-        data = json.loads(proc.stdout)
+        data = json.loads(proc.stdout, parse_constant=reject_non_json_constant)
         self.assertEqual(data["account"], acc)
         self.assertEqual(data["kind"], "vs")
         self.assertEqual(data["match_key"], match_key)
@@ -318,11 +324,38 @@ class TestRecordsCLI(unittest.TestCase):
         self.assertIn("source", data)
         self.assertIn("body_base64", data["source"])
         self.assertNotIn("body_bytes", data["source"])
-        self.assertNotIn("headers", data["source"])
-        self.assertNotIn("headers_json", data["source"])
 
         decoded_bytes = base64.b64decode(data["source"]["body_base64"])
         self.assertEqual(decoded_bytes, raw_body_bytes)
+        original = data["source"]["original_records"]
+        self.assertEqual(original["version"], 1)
+        self.assertEqual(set(original), {"version", "responses", "bodies"})
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        for table, envelope in (("responses", original["responses"]), ("bodies", original["bodies"])):
+            xinfo = conn.execute(f'PRAGMA table_xinfo("{table}")').fetchall()
+            self.assertEqual(envelope["columns"], [row[1] for row in sorted(xinfo, key=lambda row: row[0])])
+        response_values = dict(zip(original["responses"]["columns"], original["responses"]["values"]))
+        self.assertEqual(response_values["headers_json"], {
+            "type": "TEXT",
+            "value": '{"x-fixture-auth-marker":"synthetic-auth-marker","x-fixture-header":"synthetic-header-marker"}',
+        })
+        expected_query_id = {"type": "BLOB", "value": base64.b64encode(query_id_blob).decode("ascii")}
+        self.assertEqual(data["source"]["query_id"], expected_query_id)
+        self.assertEqual(response_values["query_id"], expected_query_id)
+        expected_http_status = {"type": "REAL", "value": float("inf").hex()}
+        self.assertEqual(data["source"]["http_status"], expected_http_status)
+        self.assertEqual(response_values["http_status"], expected_http_status)
+        body_values = dict(zip(original["bodies"]["columns"], original["bodies"]["values"]))
+        self.assertEqual(body_values["body"], {
+            "type": "BLOB",
+            "reference": "source_body",
+            "byte_length": len(raw_body_bytes),
+            "sha256": hashlib.sha256(raw_body_bytes).hexdigest(),
+        })
+        self.assertEqual(base64.b64decode(data["source"]["body_base64"], validate=True), raw_body_bytes)
+        conn.close()
 
     def test_06_records_get_missing_and_corrupt(self):
         """存在しないキーで null/exit 0、欠損 canonical で nonzero (exit 1)。"""

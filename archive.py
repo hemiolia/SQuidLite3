@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """イカリング3の取得・保存・監査CLI（Python標準ライブラリのみ）。"""
-import argparse, base64, json, os, plistlib, re, shutil, sqlite3, subprocess, sys, uuid
+import argparse, base64, json, math, os, plistlib, re, shutil, sqlite3, subprocess, sys, uuid
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent/'src/python'))
 from ikarchive.store import Store, now, js, database_is_slice
@@ -780,6 +780,15 @@ def main():
                     src=dict(item['source'])
                     body_bytes=src.pop('body_bytes')
                     src['body_base64']=base64.b64encode(body_bytes).decode('ascii')
+                    # original_records の source_body token はこのcarrierを参照する。
+                    # 巨大BLOBをtyped row側へ重複base64化せず、旧CLI carrier名も維持する。
+                    # 既知source scalar列へ保存されたSQLite BLOBは、Python APIではbytesのまま、
+                    # JSON境界でだけ型付きbase64へ変換して値を落とさない。
+                    for key,value in tuple(src.items()):
+                        if type(value) is bytes:
+                            src[key]={'type':'BLOB','value':base64.b64encode(value).decode('ascii')}
+                        elif type(value) is float and not math.isfinite(value):
+                            src[key]={'type':'REAL','value':value.hex()}
                     item=dict(item)
                     item['source']=src
                 print(json.dumps(item,ensure_ascii=False,indent=2))

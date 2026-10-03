@@ -6,8 +6,11 @@
 detail_json は派生 JSON 表現である。
 """
 
+import base64
+import hashlib
 import math
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from .display import GENRE_ORDER, genre_sort_index, rule_sort_index
@@ -28,6 +31,163 @@ from .store import Store
 _ANALYSIS_SET_RE = re.compile(r'(?:unclassified|[a-z0-9_]{1,64})\Z')
 _RULE_RE = re.compile(r'[A-Za-z0-9_]{1,64}\Z')
 _PLAYED_RE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z')
+_SQLITE_IDENTIFIER_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def _sqlite_identifier_fold(value: str) -> str:
+    """SQLite identifiers fold ASCII A-Z only; Unicode casefold would merge legal names."""
+    return value.translate(_SQLITE_IDENTIFIER_TRANSLATION)
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    if type(value) is not str or not value:
+        raise RuntimeError("Corrupt record: source column name is invalid")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _original_table_columns(db: sqlite3.Connection, table: str) -> List[str]:
+    rows = db.execute(f"PRAGMA table_xinfo({_quote_sqlite_identifier(table)})").fetchall()
+    if not rows:
+        raise RuntimeError("Corrupt record: original source table schema is missing")
+    ordered = sorted(rows, key=lambda row: row["cid"])
+    columns = [row["name"] for row in ordered]
+    if (
+        any(type(name) is not str or not name for name in columns)
+        or len({_sqlite_identifier_fold(name) for name in columns}) != len(columns)
+    ):
+        raise RuntimeError("Corrupt record: original source table columns are invalid")
+    return columns
+
+
+def _observable_source_rowid(
+    db: sqlite3.Connection, table: str, columns: List[str]
+) -> Optional[str]:
+    shadowed = {_sqlite_identifier_fold(name) for name in columns}
+    candidate = next(
+        (name for name in ("_rowid_", "rowid", "oid") if _sqlite_identifier_fold(name) not in shadowed),
+        None,
+    )
+    if candidate is None:
+        return None
+
+    table_info = None
+    try:
+        table_rows = db.execute("PRAGMA table_list").fetchall()
+        table_info = next(
+            (
+                row for row in table_rows
+                if len(row) >= 5 and row[0] == "main" and type(row[1]) is str
+                and _sqlite_identifier_fold(row[1]) == _sqlite_identifier_fold(table)
+            ),
+            None,
+        )
+    except sqlite3.DatabaseError:
+        pass
+    if table_info is not None and type(table_info[4]) is int:
+        if table_info[4] != 0:
+            return None
+        return candidate
+
+    # Older SQLite builds may accept PRAGMA table_list but return no rows. Check
+    # the qualified pseudo-column directly; an unqualified quoted name can be
+    # interpreted as a string literal by SQLite's legacy DQS behavior.
+    try:
+        db.execute(
+            f"SELECT source.{_quote_sqlite_identifier(candidate)} "
+            f"FROM {_quote_sqlite_identifier(table)} AS source LIMIT 0"
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such column" in str(exc).casefold():
+            return None
+        raise
+    return candidate
+
+
+def _read_original_table_row(
+    db: sqlite3.Connection, table: str, where_column: str, where_value: Any
+) -> tuple[List[str], tuple[Any, ...], Any]:
+    columns = _original_table_columns(db, table)
+    lookup = {_sqlite_identifier_fold(name): name for name in columns}
+    resolved_where = lookup.get(_sqlite_identifier_fold(where_column))
+    if resolved_where is None:
+        raise RuntimeError("Corrupt record: original source lookup column is missing")
+    rowid_column = _observable_source_rowid(db, table, columns)
+    rowid_select = (
+        f"source.{_quote_sqlite_identifier(rowid_column)}"
+        if rowid_column is not None else "NULL"
+    )
+    selected_columns = ", ".join(
+        f"source.{_quote_sqlite_identifier(name)}" for name in columns
+    )
+    query = (
+        f"SELECT {rowid_select}, {selected_columns} "
+        f"FROM {_quote_sqlite_identifier(table)} AS source "
+        f"WHERE source.{_quote_sqlite_identifier(resolved_where)} = ?"
+    )
+    row = db.execute(query, (where_value,)).fetchone()
+    if row is None:
+        raise RuntimeError("Corrupt record: original source row is missing")
+    return columns, tuple(row[1:]), row[0]
+
+
+def _sqlite_typed_cell(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {"type": "NULL", "value": None}
+    if type(value) is int:
+        return {"type": "INTEGER", "value": str(value)}
+    if type(value) is float:
+        return {"type": "REAL", "value": value.hex()}
+    if type(value) is str:
+        return {"type": "TEXT", "value": value}
+    if type(value) is bytes:
+        return {"type": "BLOB", "value": base64.b64encode(value).decode("ascii")}
+    raise RuntimeError("Corrupt record: original source cell has an unsupported SQLite value")
+
+
+def _original_column_value(columns: List[str], values: tuple[Any, ...], wanted: str) -> Any:
+    folded = _sqlite_identifier_fold(wanted)
+    for name, value in zip(columns, values):
+        if _sqlite_identifier_fold(name) == folded:
+            return value
+    return None
+
+
+def _source_rowid_cell(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise RuntimeError("Corrupt record: original source rowid is not an integer")
+    return {"type": "INTEGER", "value": str(value)}
+
+
+def _original_row_envelope(
+    table: str, columns: List[str], values: tuple[Any, ...], source_rowid: Any,
+    *, body_bytes: Optional[bytes] = None, body_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
+    if len(columns) != len(values):
+        raise RuntimeError("Corrupt record: original source row width is invalid")
+    encoded_values: List[Dict[str, Any]] = []
+    for name, value in zip(columns, values):
+        if _sqlite_identifier_fold(table) == "bodies" and _sqlite_identifier_fold(name) == "body":
+            if type(value) is not bytes or body_bytes is None or value != body_bytes:
+                raise RuntimeError("Corrupt record: body BLOB storage type is invalid")
+            if type(body_sha256) is not str:
+                raise RuntimeError("Corrupt record: body SHA-256 is invalid")
+            encoded_values.append({
+                "type": "BLOB",
+                "reference": "source_body",
+                "byte_length": len(value),
+                "sha256": body_sha256,
+            })
+        else:
+            encoded_values.append(_sqlite_typed_cell(value))
+    return {
+        "columns": list(columns),
+        "values": encoded_values,
+        "source_rowid": _source_rowid_cell(source_rowid),
+    }
 
 
 def _whole_count(value: Any) -> int:
@@ -376,7 +536,7 @@ class RecordReader:
         他 account の同じ key は漏らさない。
         detail_json は派生 JSON 表現であり raw ではない。
         未知項目/数値表記の正典は source['body_bytes'] である。
-        ヘッダー/認証データは返さない。
+        original_records は元responses/bodies行の全table_xinfo列とsource_rowidをtyped cellで返す。
         canonical 以外の新しい pager/部分応答を採用しない。
         元 response/BLOB 不在なら破損を隠さず RuntimeError を送出する（詳細なしは通常 None）。
 
@@ -455,41 +615,79 @@ class RecordReader:
             if not has_responses:
                 source = None
             else:
-                source_query = """
-                SELECT
-                    r.id AS response_id,
-                    r.operation,
-                    r.fetched_at,
-                    r.query_id,
-                    r.app_version,
-                    r.http_status,
-                    r.body_sha256,
-                    b.body AS body_bytes
-                FROM responses r
-                LEFT JOIN bodies b ON b.sha256 = r.body_sha256
-                WHERE r.id = ?
-                """
-                source_row = db.execute(source_query, (detail_response_id,)).fetchone()
-                if not source_row:
-                    raise RuntimeError(
-                        f"Corrupt record: response {detail_response_id} not found for match "
-                        f"({account}, {kind}, {match_key})"
+                try:
+                    response_columns, response_values, response_rowid = _read_original_table_row(
+                        db, "responses", "id", detail_response_id
                     )
-                if source_row["body_bytes"] is None:
+                except RuntimeError as exc:
+                    if str(exc) == "Corrupt record: original source row is missing":
+                        raise RuntimeError(
+                            f"Corrupt record: response {detail_response_id} not found for match "
+                            f"({account}, {kind}, {match_key})"
+                        ) from None
+                    raise
+                response_account = _original_column_value(response_columns, response_values, "account")
+                if response_account != account:
+                    raise RuntimeError(
+                        "Corrupt record: canonical response account does not match the selected match"
+                    )
+                response_body_sha = _original_column_value(
+                    response_columns, response_values, "body_sha256"
+                )
+                if type(response_body_sha) is not str:
+                    raise RuntimeError(
+                        "Corrupt record: canonical response body SHA-256 is invalid"
+                    )
+                try:
+                    body_columns, body_values, body_rowid = _read_original_table_row(
+                        db, "bodies", "sha256", response_body_sha
+                    )
+                except RuntimeError as exc:
+                    if str(exc) == "Corrupt record: original source row is missing":
+                        raise RuntimeError(
+                            f"Corrupt record: body BLOB missing for response {detail_response_id} "
+                            f"(body_sha256={response_body_sha})"
+                        ) from None
+                    raise
+                body_bytes = _original_column_value(body_columns, body_values, "body")
+                body_sha = _original_column_value(body_columns, body_values, "sha256")
+                body_length = _original_column_value(body_columns, body_values, "byte_length")
+                if body_bytes is None:
                     raise RuntimeError(
                         f"Corrupt record: body BLOB missing for response {detail_response_id} "
-                        f"(body_sha256={source_row['body_sha256']})"
+                        f"(body_sha256={response_body_sha})"
                     )
+                if type(body_bytes) is not bytes:
+                    raise RuntimeError("Corrupt record: body BLOB storage type is invalid")
+                actual_body_sha = hashlib.sha256(body_bytes).hexdigest()
+                if (
+                    type(body_sha) is not str
+                    or body_sha != response_body_sha
+                    or actual_body_sha != response_body_sha
+                    or type(body_length) is not int
+                    or body_length != len(body_bytes)
+                ):
+                    raise RuntimeError("Corrupt record: body BLOB metadata does not match its bytes")
 
                 source = {
-                    "response_id": source_row["response_id"],
-                    "operation": source_row["operation"],
-                    "fetched_at": source_row["fetched_at"],
-                    "query_id": source_row["query_id"],
-                    "app_version": source_row["app_version"],
-                    "http_status": source_row["http_status"],
-                    "body_sha256": source_row["body_sha256"],
-                    "body_bytes": source_row["body_bytes"],
+                    "response_id": _original_column_value(response_columns, response_values, "id"),
+                    "operation": _original_column_value(response_columns, response_values, "operation"),
+                    "fetched_at": _original_column_value(response_columns, response_values, "fetched_at"),
+                    "query_id": _original_column_value(response_columns, response_values, "query_id"),
+                    "app_version": _original_column_value(response_columns, response_values, "app_version"),
+                    "http_status": _original_column_value(response_columns, response_values, "http_status"),
+                    "body_sha256": response_body_sha,
+                    "body_bytes": body_bytes,
+                    "original_records": {
+                        "version": 1,
+                        "responses": _original_row_envelope(
+                            "responses", response_columns, response_values, response_rowid
+                        ),
+                        "bodies": _original_row_envelope(
+                            "bodies", body_columns, body_values, body_rowid,
+                            body_bytes=body_bytes, body_sha256=actual_body_sha,
+                        ),
+                    },
                 }
 
         return {

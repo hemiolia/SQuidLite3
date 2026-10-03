@@ -14,7 +14,7 @@
 - detail_state優先度（unavailable+retryはpending優先、availableならjobsよりcanonical優先）
 """
 
-import hashlib, json, sqlite3, sys, tempfile, unittest
+import base64, hashlib, json, sqlite3, sys, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src/python"))
 
 from ikarchive.store import Store, js
-from ikarchive.records import RecordReader
+from ikarchive.records import RecordReader, _observable_source_rowid
 
 
 class _FakeReaderConnection:
@@ -127,7 +127,7 @@ class TestRecordReader(unittest.TestCase):
                 "test-query-id",
                 "10.0.0",
                 200,
-                js({"x-secret-auth": "MUST_NOT_BE_RETURNED"}),
+                js({"x-fixture-header": "synthetic-header-marker"}),
                 body_sha,
                 doc_json,
             ),
@@ -157,6 +157,73 @@ class TestRecordReader(unittest.TestCase):
             )
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _decode_original_cell(cell, *, body_bytes=None):
+        kind = cell["type"]
+        if kind == "NULL":
+            return None
+        if kind == "INTEGER":
+            return int(cell["value"])
+        if kind == "REAL":
+            return float.fromhex(cell["value"])
+        if kind == "TEXT":
+            return cell["value"]
+        if kind == "BLOB" and cell.get("reference") == "source_body":
+            if body_bytes is None:
+                raise AssertionError("source_body reference needs its carrier bytes")
+            return body_bytes
+        if kind == "BLOB":
+            return base64.b64decode(cell["value"], validate=True)
+        raise AssertionError(f"unexpected typed cell kind: {kind!r}")
+
+    def _assert_original_table_record(
+        self, db, table, lookup_column, lookup_value, envelope, *, body_bytes=None
+    ):
+        schema_rows = db.execute(f'PRAGMA table_xinfo("{table}")').fetchall()
+        expected_columns = [row[1] for row in sorted(schema_rows, key=lambda row: row[0])]
+        self.assertEqual(envelope["columns"], expected_columns)
+        fold = lambda value: value.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+        shadowed = {fold(name) for name in expected_columns}
+        rowid_name = next(
+            (name for name in ("_rowid_", "rowid", "oid") if fold(name) not in shadowed),
+            None,
+        )
+        table_info = next(
+            row for row in db.execute("PRAGMA table_list").fetchall()
+            if row[0] == "main" and fold(row[1]) == fold(table)
+        )
+        if table_info[4] or rowid_name is None:
+            self.assertIsNone(envelope["source_rowid"])
+            rowid_select = "NULL"
+        else:
+            rowid_select = '"' + rowid_name + '"'
+        quoted_columns = ",".join('"' + name.replace('"', '""') + '"' for name in expected_columns)
+        source = db.execute(
+            f'SELECT {rowid_select},{quoted_columns} FROM "{table}" WHERE "{lookup_column}"=?',
+            (lookup_value,),
+        ).fetchone()
+        self.assertIsNotNone(source)
+        if rowid_name is not None and not table_info[4]:
+            self.assertEqual(envelope["source_rowid"], {"type": "INTEGER", "value": str(source[0])})
+        cells = envelope["values"]
+        self.assertEqual(len(cells), len(expected_columns))
+        self.assertEqual(len(source) - 1, len(cells))
+        for column, native, cell in zip(expected_columns, source[1:], cells):
+            if table.casefold() == "bodies" and column.casefold() == "body":
+                self.assertEqual(cell["type"], "BLOB")
+                self.assertEqual(cell["reference"], "source_body")
+                self.assertEqual(cell["byte_length"], len(body_bytes))
+                self.assertEqual(cell["sha256"], hashlib.sha256(body_bytes).hexdigest())
+                decoded = self._decode_original_cell(cell, body_bytes=body_bytes)
+            else:
+                decoded = self._decode_original_cell(cell, body_bytes=body_bytes)
+            if type(native) is float:
+                self.assertIs(type(decoded), float, column)
+                self.assertEqual(decoded.hex(), native.hex(), column)
+            else:
+                self.assertIs(type(decoded), type(native), column)
+                self.assertEqual(decoded, native, column)
 
     def test_list_matches_comprehensiveness_and_states(self):
         """VS/Coop/詳細なしpending/unavailable/unresolved/未分類を母集合から落とさない。"""
@@ -493,17 +560,272 @@ class TestRecordReader(unittest.TestCase):
             self.assertIn(b'"empty_arr":[]', source["body_bytes"])
             self.assertIn(b'"unknown_nested":{"custom_flag":true}', source["body_bytes"])
 
-            # 認証情報やヘッダーが source に含まれていないこと
-            self.assertNotIn("headers_json", source)
-            self.assertNotIn("x-secret-auth", str(source))
-            self.assertNotIn("headers", source)
-
-            # source の必須フィールド
+            # 既存source carrierの8キーを維持し、全responses/bodies列は別のtyped envelopeで返す。
             expected_fields = {
                 "response_id", "operation", "fetched_at", "query_id",
-                "app_version", "http_status", "body_sha256", "body_bytes"
+                "app_version", "http_status", "body_sha256", "body_bytes", "original_records"
             }
             self.assertEqual(set(source.keys()), expected_fields)
+            original = source["original_records"]
+            self.assertEqual(original["version"], 1)
+            self.assertEqual(set(original), {"version", "responses", "bodies"})
+
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            self._assert_original_table_record(
+                conn, "responses", "id", 401, original["responses"], body_bytes=raw_body
+            )
+            self._assert_original_table_record(
+                conn, "bodies", "sha256", source["body_sha256"], original["bodies"],
+                body_bytes=raw_body,
+            )
+            response_cell_by_name = dict(zip(
+                original["responses"]["columns"], original["responses"]["values"]
+            ))
+            self.assertEqual(
+                response_cell_by_name["headers_json"],
+                {"type": "TEXT", "value": '{"x-fixture-header":"synthetic-header-marker"}'},
+            )
+            conn.close()
+
+    def test_original_records_include_unknown_and_generated_native_columns(self):
+        """未来列・生成列・全SQLite native型・観測可能rowidを独立SQL結果と照合する。"""
+        acc = "account-original-rows"
+        key = "vs-original-rows"
+        raw_body = b'{"data":{"vsHistoryDetail":{"playedTime":"2026-09-01T00:00:00Z"}}}'
+        self._insert_match(acc, "vs", key)
+        self._insert_canonical_detail(acc, "vs", key, 410, raw_body, '{"playedTime":"2026-09-01T00:00:00Z"}')
+
+        future_text = "unknown\x00column-astral-𠮷"
+        future_blob = b"\x00future\xffblob"
+        future_query_blob = b"\x00query-id\xff"
+        body_extra_blob = b"body-extra\x00\xff"
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE responses SET query_id=?,http_status=? WHERE id=?",
+            (future_query_blob, float("inf"), 410),
+        )
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("""ALTER TABLE responses RENAME TO responses_before_extension""")
+        conn.execute("""
+            CREATE TABLE responses(
+                id INTEGER PRIMARY KEY, event_id TEXT UNIQUE NOT NULL,
+                run_id INTEGER REFERENCES runs(id), account TEXT NOT NULL,
+                fetched_at TEXT NOT NULL, operation TEXT NOT NULL, variables_json TEXT NOT NULL,
+                query_id TEXT, app_version TEXT, http_status INTEGER, headers_json TEXT NOT NULL,
+                body_sha256 TEXT NOT NULL REFERENCES bodies(sha256), json_text TEXT, parse_error TEXT,
+                projected INTEGER NOT NULL DEFAULT 0,
+                future_nullable_text TEXT, future_blob BLOB, future_real REAL, future_zero REAL,
+                future_int INTEGER, future_empty_text TEXT, future_empty_blob BLOB,
+                future_null TEXT,
+                K TEXT, "K" TEXT, SS TEXT, "ß" TEXT,
+                generated_stored INTEGER GENERATED ALWAYS AS (id + 700) STORED,
+                generated_virtual TEXT GENERATED ALWAYS AS (operation || ':virtual') VIRTUAL
+            )
+        """)
+        conn.execute("""
+            INSERT INTO responses(
+                id,event_id,run_id,account,fetched_at,operation,variables_json,query_id,
+                app_version,http_status,headers_json,body_sha256,json_text,parse_error,projected,
+                future_nullable_text,future_blob,future_real,future_zero,future_int,
+                future_empty_text,future_empty_blob,future_null,K,"K",SS,"ß"
+            )
+            SELECT id,event_id,run_id,account,fetched_at,operation,variables_json,query_id,
+                app_version,http_status,headers_json,body_sha256,json_text,parse_error,projected,
+                ?,?,?,?,?,?,?,NULL,?,?,?,? FROM responses_before_extension
+        """, (future_text, future_blob, float("-inf"), -0.0, 2**63 - 1, "", b"", "ascii-K", "kelvin-sign", "ascii-SS", "sharp-s"))
+        conn.execute("DROP TABLE responses_before_extension")
+        conn.execute("CREATE INDEX response_operation ON responses(account,operation,fetched_at)")
+
+        conn.execute("ALTER TABLE bodies RENAME TO bodies_before_extension")
+        conn.execute("""
+            CREATE TABLE bodies(
+                sha256 TEXT PRIMARY KEY, body BLOB NOT NULL, byte_length INTEGER NOT NULL,
+                future_blob BLOB, future_text TEXT,
+                generated_stored INTEGER GENERATED ALWAYS AS (byte_length + 10) STORED,
+                generated_virtual TEXT GENERATED ALWAYS AS (substr(sha256,1,8)) VIRTUAL
+            )
+        """)
+        conn.execute("""
+            INSERT INTO bodies(sha256,body,byte_length,future_blob,future_text)
+            SELECT sha256,body,byte_length,?,? FROM bodies_before_extension
+        """, (body_extra_blob, "body-future\x00𠮷"))
+        conn.execute("DROP TABLE bodies_before_extension")
+        conn.commit()
+        conn.close()
+
+        with RecordReader(self.db_path) as reader:
+            match = reader.get_match(acc, "vs", key)
+        self.assertIsNotNone(match)
+        source = match["source"]
+        self.assertEqual(source["body_bytes"], raw_body)
+        self.assertIs(type(source["query_id"]), bytes)
+        self.assertEqual(source["query_id"], future_query_blob)
+        self.assertIs(type(source["http_status"]), float)
+        self.assertEqual(source["http_status"].hex(), float("inf").hex())
+        original = source["original_records"]
+        self.assertIn("future_nullable_text", original["responses"]["columns"])
+        self.assertIn("future_blob", original["responses"]["columns"])
+        self.assertIn("generated_stored", original["responses"]["columns"])
+        self.assertIn("generated_virtual", original["responses"]["columns"])
+        self.assertIn("generated_stored", original["bodies"]["columns"])
+        self.assertIn("generated_virtual", original["bodies"]["columns"])
+
+        conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        response_xinfo = conn.execute('PRAGMA table_xinfo("responses")').fetchall()
+        body_xinfo = conn.execute('PRAGMA table_xinfo("bodies")').fetchall()
+        self.assertEqual({row[6] for row in response_xinfo if row[1].startswith("generated_")}, {2, 3})
+        self.assertEqual({row[6] for row in body_xinfo if row[1].startswith("generated_")}, {2, 3})
+        self._assert_original_table_record(
+            conn, "responses", "id", 410, original["responses"], body_bytes=raw_body
+        )
+        self._assert_original_table_record(
+            conn, "bodies", "sha256", source["body_sha256"], original["bodies"], body_bytes=raw_body
+        )
+        response_values = dict(zip(original["responses"]["columns"], original["responses"]["values"]))
+        self.assertEqual(response_values["future_nullable_text"], {"type": "TEXT", "value": future_text})
+        self.assertEqual(response_values["future_blob"], {
+            "type": "BLOB", "value": base64.b64encode(future_blob).decode("ascii")
+        })
+        self.assertEqual(response_values["future_real"], {"type": "REAL", "value": float("-inf").hex()})
+        self.assertEqual(response_values["http_status"], {"type": "REAL", "value": float("inf").hex()})
+        self.assertEqual(response_values["future_zero"]["type"], "REAL")
+        self.assertEqual(response_values["future_int"], {"type": "INTEGER", "value": str(2**63 - 1)})
+        self.assertEqual(response_values["future_empty_text"], {"type": "TEXT", "value": ""})
+        self.assertEqual(response_values["future_empty_blob"], {"type": "BLOB", "value": ""})
+        self.assertEqual(response_values["query_id"], {
+            "type": "BLOB", "value": base64.b64encode(future_query_blob).decode("ascii")
+        })
+        self.assertEqual(response_values["future_null"], {"type": "NULL", "value": None})
+        self.assertEqual(response_values["K"], {"type": "TEXT", "value": "ascii-K"})
+        self.assertEqual(response_values["K"], {"type": "TEXT", "value": "kelvin-sign"})
+        self.assertEqual(response_values["SS"], {"type": "TEXT", "value": "ascii-SS"})
+        self.assertEqual(response_values["ß"], {"type": "TEXT", "value": "sharp-s"})
+        body_values = dict(zip(original["bodies"]["columns"], original["bodies"]["values"]))
+        self.assertEqual(body_values["future_blob"], {
+            "type": "BLOB", "value": base64.b64encode(body_extra_blob).decode("ascii")
+        })
+        self.assertEqual(body_values["future_text"], {"type": "TEXT", "value": "body-future\x00𠮷"})
+        conn.close()
+
+    def test_original_rowid_is_null_when_unobservable(self):
+        """WITHOUT ROWIDおよび全rowid alias shadow時にrowidを捏造しない。"""
+        acc = "account-rowid-unobservable"
+        key = "vs-rowid-unobservable"
+        raw_body = b'{"data":{"vsHistoryDetail":{"playedTime":"2026-09-01T00:00:00Z"}}}'
+        self._insert_match(acc, "vs", key)
+        self._insert_canonical_detail(acc, "vs", key, 420, raw_body, '{"playedTime":"2026-09-01T00:00:00Z"}')
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("ALTER TABLE responses RENAME TO responses_before_rowid_test")
+        conn.execute("""
+            CREATE TABLE responses(
+                id INTEGER PRIMARY KEY, event_id TEXT UNIQUE NOT NULL,
+                run_id INTEGER REFERENCES runs(id), account TEXT NOT NULL,
+                fetched_at TEXT NOT NULL, operation TEXT NOT NULL, variables_json TEXT NOT NULL,
+                query_id TEXT, app_version TEXT, http_status INTEGER, headers_json TEXT NOT NULL,
+                body_sha256 TEXT NOT NULL REFERENCES bodies(sha256), json_text TEXT, parse_error TEXT,
+                projected INTEGER NOT NULL DEFAULT 0,
+                _rowid_ TEXT, rowid TEXT, oid TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO responses(
+                id,event_id,run_id,account,fetched_at,operation,variables_json,query_id,
+                app_version,http_status,headers_json,body_sha256,json_text,parse_error,projected,
+                _rowid_,rowid,oid
+            ) SELECT id,event_id,run_id,account,fetched_at,operation,variables_json,query_id,
+                app_version,http_status,headers_json,body_sha256,json_text,parse_error,projected,
+                NULL,NULL,NULL FROM responses_before_rowid_test
+        """)
+        conn.execute("DROP TABLE responses_before_rowid_test")
+        conn.execute("CREATE INDEX response_operation ON responses(account,operation,fetched_at)")
+        conn.commit()
+        conn.close()
+        with RecordReader(self.db_path) as reader:
+            match = reader.get_match(acc, "vs", key)
+        self.assertIsNone(match["source"]["original_records"]["responses"]["source_rowid"])
+
+        # WITHOUT ROWID ordinary primary-key table follows the same honest null contract.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("ALTER TABLE bodies RENAME TO bodies_before_without_rowid")
+        conn.execute("""
+            CREATE TABLE bodies(
+                sha256 TEXT PRIMARY KEY, body BLOB NOT NULL, byte_length INTEGER NOT NULL
+            ) WITHOUT ROWID
+        """)
+        conn.execute("""
+            INSERT INTO bodies(sha256,body,byte_length)
+            SELECT sha256,body,byte_length FROM bodies_before_without_rowid
+        """)
+        conn.execute("DROP TABLE bodies_before_without_rowid")
+        conn.commit()
+        conn.close()
+        with RecordReader(self.db_path) as reader:
+            match = reader.get_match(acc, "vs", key)
+        self.assertIsNone(match["source"]["original_records"]["bodies"]["source_rowid"])
+
+    def test_rowid_detection_falls_back_when_table_list_is_unavailable(self):
+        """空PRAGMA table_list時にqualified rowid probeで通常/ WITHOUT ROWIDを区別する。"""
+        class EmptyTableListConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, *args):
+                if sql == "PRAGMA table_list":
+                    return self.connection.execute("SELECT 1 WHERE 0")
+                return self.connection.execute(sql, *args)
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE ordinary(id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.execute("CREATE TABLE without_rowid(key TEXT PRIMARY KEY) WITHOUT ROWID")
+        proxy = EmptyTableListConnection(conn)
+        self.assertEqual(_observable_source_rowid(proxy, "ordinary", ["id", "payload"]), "_rowid_")
+        self.assertIsNone(_observable_source_rowid(proxy, "without_rowid", ["key"]))
+        conn.close()
+
+    def test_body_original_metadata_corruption_is_rejected(self):
+        """SHA・byte_length・SQLite BLOB storage classの不一致を失敗にする。"""
+        acc = "account-body-metadata-corrupt"
+        key = "vs-body-metadata-corrupt"
+        raw_body = b'{"data":{"vsHistoryDetail":{"playedTime":"2026-09-01T00:00:00Z"}}}'
+        body_sha = hashlib.sha256(raw_body).hexdigest()
+        self._insert_match(acc, "vs", key)
+        self._insert_canonical_detail(acc, "vs", key, 430, raw_body, '{"playedTime":"2026-09-01T00:00:00Z"}')
+
+        def assert_corrupt(statement, params):
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(statement, params)
+            conn.commit()
+            conn.close()
+            with RecordReader(self.db_path) as reader:
+                with self.assertRaisesRegex(RuntimeError, "Corrupt record"):
+                    reader.get_match(acc, "vs", key)
+
+        assert_corrupt("UPDATE bodies SET byte_length=byte_length+1 WHERE sha256=?", (body_sha,))
+        assert_corrupt("UPDATE bodies SET byte_length='not-an-integer' WHERE sha256=?", (body_sha,))
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE bodies SET byte_length=? WHERE sha256=?", (len(raw_body), body_sha))
+        conn.execute("UPDATE bodies SET body=? WHERE sha256=?", (raw_body[:-1] + b"!", body_sha))
+        conn.commit()
+        conn.close()
+        with RecordReader(self.db_path) as reader:
+            with self.assertRaisesRegex(RuntimeError, "Corrupt record"):
+                reader.get_match(acc, "vs", key)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE bodies SET body=? WHERE sha256=?", (raw_body, body_sha))
+        conn.execute("UPDATE bodies SET body=CAST(body AS TEXT) WHERE sha256=?", (body_sha,))
+        conn.commit()
+        conn.close()
+        with RecordReader(self.db_path) as reader:
+            with self.assertRaisesRegex(RuntimeError, "Corrupt record"):
+                reader.get_match(acc, "vs", key)
 
     def test_corrupt_record_raises_runtime_error(self):
         """元response/BLOB不在なら破損を隠さずRuntimeError（詳細なしは通常None）。"""
