@@ -2171,6 +2171,10 @@ globalThis.ikaringRateText = ikaringRateText;
    * 詳細ペインのデータ描画
    */
   function renderDetail(record) {
+    sourceInfoContentEl.textContent = '';
+    currentSourceBase64 = null;
+    sourceDownloadAreaEl.classList.add('hidden');
+
     detailPlayedTimeEl.textContent = formatPlayedTime(record.played_time);
     detailKindEl.textContent = formatKind(record.kind);
     detailGenreEl.textContent = formatClassifiedGenre(record);
@@ -2185,24 +2189,22 @@ globalThis.ikaringRateText = ikaringRateText;
     }
 
     // 元の応答ダウンロードボタンと保存情報
-    sourceInfoContentEl.textContent = '';
-    currentSourceBase64 = null;
-
-    if (record.source && typeof record.source === 'object' && typeof record.source.body_base64 === 'string') {
-      currentSourceBase64 = record.source.body_base64;
+    const source = record.source && typeof record.source === 'object' ? record.source : null;
+    if (source && typeof source.body_base64 === 'string') {
+      currentSourceBase64 = source.body_base64;
       sourceDownloadAreaEl.classList.remove('hidden');
 
       const dl = document.createElement('dl');
       dl.className = 'source-meta-grid';
 
-      if (record.source.fetched_at) {
-        dl.appendChild(createMetaRow('取得日時', formatIsoDate(record.source.fetched_at)));
+      if (source.fetched_at) {
+        dl.appendChild(createMetaRow('取得日時', formatIsoDate(source.fetched_at)));
       }
-      if (record.source.body_sha256) {
-        dl.appendChild(createMetaRow('SHA-256', record.source.body_sha256));
+      if (source.body_sha256) {
+        dl.appendChild(createMetaRow('SHA-256', source.body_sha256));
       }
-      if (record.source.operation) {
-        dl.appendChild(createMetaRow('操作名', record.source.operation));
+      if (source.operation) {
+        dl.appendChild(createMetaRow('操作名', source.operation));
       }
       sourceInfoContentEl.appendChild(dl);
     } else {
@@ -2218,6 +2220,44 @@ globalThis.ikaringRateText = ikaringRateText;
         p.textContent = '元の応答データはありません。';
       }
       sourceInfoContentEl.appendChild(p);
+    }
+
+    const hasOriginalRecords = Boolean(
+      source && Object.prototype.hasOwnProperty.call(source, 'original_records')
+    );
+    if (hasOriginalRecords) {
+      const originalRecords = source.original_records;
+      const panel = document.createElement('details');
+      panel.className = 'folded-panel';
+
+      const summary = document.createElement('summary');
+      summary.className = 'folded-summary';
+      summary.textContent = '保存時の全取得情報';
+      panel.appendChild(summary);
+
+      const pre = document.createElement('pre');
+      pre.className = 'folded-pre';
+      pre.textContent = JSON.stringify(originalRecords, null, 2);
+      panel.appendChild(pre);
+
+      const bodies = originalRecords && typeof originalRecords === 'object' && !Array.isArray(originalRecords)
+        ? originalRecords.bodies
+        : null;
+      const hasSourceBodyReference = Boolean(
+        bodies && Array.isArray(bodies.values) && bodies.values.some(function (cell) {
+          return cell && typeof cell === 'object'
+            && cell.type === 'BLOB'
+            && cell.reference === 'source_body';
+        })
+      );
+      if (hasSourceBodyReference && source && typeof source.body_base64 === 'string') {
+        const bodyNote = document.createElement('p');
+        bodyNote.className = 'source-notice';
+        bodyNote.textContent = '本文は「元の応答を保存」から取得できます。';
+        panel.appendChild(bodyNote);
+      }
+
+      sourceInfoContentEl.appendChild(panel);
     }
 
     renderTagSection(record);
