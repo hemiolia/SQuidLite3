@@ -134,7 +134,18 @@ def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _large_text(label: str, repetitions: int) -> str:
+    return (label + "\x00𐀀𠮷雪\r\n") * repetitions
+
+
+def _large_blob(prefix: bytes, repetitions: int, *, reverse: bool = False) -> bytes:
+    pattern = bytes(range(255, -1, -1) if reverse else range(256))
+    return prefix + pattern * repetitions
+
+
 def _write_source(path: Path) -> None:
+    large_text = _large_text("baseline", 16_000)
+    large_blob = _large_blob(b"\x00\xff\x80baseline\x00", 1_400)
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -156,6 +167,12 @@ def _write_source(path: Path) -> None:
                 nullable_value,
                 empty_text TEXT,
                 empty_blob BLOB
+            );
+            CREATE TABLE lookup_payloads (
+                lookup_id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES parents(parent_id),
+                payload_text TEXT,
+                payload_blob BLOB
             );
             CREATE TABLE rowid_values (
                 label TEXT UNIQUE,
@@ -192,21 +209,25 @@ def _write_source(path: Path) -> None:
                 -(1 << 63),
                 (1 << 63) - 1,
                 1.25,
-                "left\x00middle\r\n雪とastral𐀀",
+                large_text,
                 '{"literal":true,"large":9007199254740993}',
-                b"\x00\xff\x80native-blob\x00",
+                large_blob,
                 None,
                 "",
                 b"",
             ),
         )
         connection.execute(
-            "INSERT INTO rowid_values(rowid,label,payload,note) VALUES(?,?,?,?)",
-            (-401, "rowid-negative", b"\x00first\xff", "rowid source"),
+            "INSERT INTO lookup_payloads VALUES(?,?,?,?)",
+            (1, 31, large_text, large_blob),
         )
         connection.execute(
             "INSERT INTO rowid_values(rowid,label,payload,note) VALUES(?,?,?,?)",
-            (9001, "rowid-to-delete", b"delete-me", "retained until final delta"),
+            (-401, "rowid-negative", b"\x00first\xff", "duplicate-note"),
+        )
+        connection.execute(
+            "INSERT INTO rowid_values(rowid,label,payload,note) VALUES(?,?,?,?)",
+            (9001, "rowid-to-delete", b"delete-me", "duplicate-note"),
         )
         connection.execute(
             "INSERT INTO matches VALUES(?,?,?,?)",
@@ -425,6 +446,116 @@ def _check_native_examples(snapshot: dict[str, Any]) -> None:
              "EMPTY_TABLE_NOT_PRESERVED")
 
 
+def _expected_unique_row(snapshot: dict[str, Any], table: str,
+                         criteria: dict[str, Any]) -> dict[str, Any] | None:
+    table_snapshot = snapshot["tables"].get(table)
+    if table_snapshot is None:
+        raise FixtureFailure("LOOKUP_EXPECTED_TABLE_MISSING")
+    columns = table_snapshot["columns"]
+    matches = []
+    for row in table_snapshot["rows"]:
+        values = dict(zip(columns, row["values"]))
+        if all(_typed(values[name]) == _typed(expected) for name, expected in criteria.items()):
+            matches.append(row)
+    if len(matches) > 1:
+        raise FixtureFailure("LOOKUP_EXPECTED_ROW_NOT_UNIQUE")
+    return matches[0] if matches else None
+
+
+def _check_unique_lookup_result(result: Any, expected: dict[str, Any] | None,
+                                code_prefix: str) -> None:
+    if expected is None:
+        _require(result is None, code_prefix + "_MISSING_ROW_NOT_NONE")
+        return
+    _require(isinstance(result, dict) and set(result) == {"source_rowid", "values"}
+             and type(result["values"]) is tuple, code_prefix + "_RESULT_SHAPE_INVALID")
+    _require(_typed(result["source_rowid"]) == _typed(expected["rowid"]),
+             code_prefix + "_SOURCE_ROWID_MISMATCH")
+    _require(tuple(_typed(value) for value in result["values"])
+             == tuple(_typed(value) for value in expected["values"]),
+             code_prefix + "_NATIVE_VALUES_MISMATCH")
+
+
+def _verify_external_value_cells(package_root: Path, table_name: str,
+                                 expected_values: dict[str, Any]) -> None:
+    try:
+        manifest = json.loads((package_root / "manifest.json").read_bytes())
+    except (OSError, json.JSONDecodeError):
+        raise FixtureFailure("EXTERNAL_VALUE_MANIFEST_UNREADABLE") from None
+    table = next((item for item in manifest.get("tables", [])
+                  if item.get("name") == table_name), None)
+    _require(isinstance(table, dict), "EXTERNAL_VALUE_TABLE_MISSING")
+    column_names = table.get("columns")
+    table_id = table.get("table_id")
+    metadata_names = table.get("archive_metadata_tables")
+    _require(isinstance(column_names, list) and isinstance(table_id, str)
+             and isinstance(metadata_names, dict)
+             and isinstance(metadata_names.get("external_cells"), str),
+             "EXTERNAL_VALUE_TABLE_METADATA_INVALID")
+    external_table = metadata_names["external_cells"]
+    external_cells = {}
+    for part in table.get("parts", []):
+        try:
+            with closing(_readonly(package_root / part["file"])) as connection:
+                rows = connection.execute(
+                    f"SELECT column_ordinal,sqlite_type,byte_length,sha256,chunk_total,"
+                    f"value_files_json FROM {_quote(external_table)} WHERE table_id=?",
+                    (table_id,),
+                )
+                for column_ordinal, sqlite_type, byte_length, digest, chunk_total, refs_raw in rows:
+                    if type(column_ordinal) is not int or not 0 <= column_ordinal < len(column_names):
+                        raise FixtureFailure("EXTERNAL_VALUE_COLUMN_ORDINAL_INVALID")
+                    column_name = column_names[column_ordinal]
+                    if column_name in external_cells:
+                        raise FixtureFailure("EXTERNAL_VALUE_CELL_DUPLICATED")
+                    refs = json.loads(refs_raw)
+                    external_cells[column_name] = {
+                        "sqlite_type": sqlite_type,
+                        "byte_length": byte_length,
+                        "sha256": digest,
+                        "chunk_total": chunk_total,
+                        "files": refs,
+                    }
+        except FixtureFailure:
+            raise
+        except Exception:
+            raise FixtureFailure("EXTERNAL_VALUE_METADATA_UNREADABLE") from None
+
+    _require(set(expected_values).issubset(external_cells),
+             "EXPECTED_EXTERNAL_VALUE_CELL_MISSING")
+    external_docs = {
+        item.get("file"): item for item in manifest.get("external_values", [])
+        if isinstance(item, dict) and item.get("table_id") == table_id
+    }
+    referenced_files = set()
+    for column_name, expected in expected_values.items():
+        item = external_cells[column_name]
+        if type(expected) is str:
+            sqlite_type = "text"
+            payload = expected.encode("utf-8", "surrogatepass")
+        elif type(expected) is bytes:
+            sqlite_type = "blob"
+            payload = expected
+        else:
+            raise FixtureFailure("EXPECTED_EXTERNAL_SQLITE_TYPE_INVALID")
+        files = item["files"]
+        _require(item["sqlite_type"] == sqlite_type
+                 and item["byte_length"] == len(payload)
+                 and item["sha256"] == _sha256(payload)
+                 and item["chunk_total"] == (len(payload) + 65_535) // 65_536
+                 and item["chunk_total"] > 1
+                 and isinstance(files, list) and bool(files)
+                 and len(files) == len(set(files)),
+                 "EXTERNAL_VALUE_CELL_BINDING_MISMATCH")
+        for relative in files:
+            file_doc = external_docs.get(relative)
+            _require(isinstance(file_doc, dict) and file_doc.get("table_id") == table_id,
+                     "EXTERNAL_VALUE_FILE_REFERENCE_MISMATCH")
+            referenced_files.add(relative)
+    _require(referenced_files == set(external_docs),
+             "EXTERNAL_VALUE_FILE_CLOSURE_MISMATCH")
+
+
 def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
     result = {}
     for path in sorted(root.rglob("*")):
@@ -565,6 +696,10 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
         import prepare_full_data_delta as delta_preparer
         import publish_full_data_delta as delta_publisher
         from published_sqlite_reader import PublishedSQLiteReader, PublishedSQLiteReaderError
+        import ikarchive.delta_reader as delta_reader_module
+        import ikarchive.delta_transport as delta_transport_module
+        import ikarchive.lossless_sqlite as lossless_sqlite_module
+        import ikarchive.verified_files as verified_files_module
         from ikarchive.change_feed import install_change_feed
         from ikarchive.writer_guards import install_writer_guards
     except Exception:
@@ -633,7 +768,23 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
             _require(baseline_result.get("status") == "complete", "BASELINE_PUBLISH_FIXTURE_FAILED")
             baseline_latest_raw = remote.objects[f"{REMOTE}/latest.json"]
             baseline_package = baseline_generation_dir / "slices"
+            baseline_state = _capture_source(baseline_db)
+            _verify_external_value_cells(
+                baseline_package, "typed_records",
+                {
+                    "text_value": baseline_state["tables"]["typed_records"]["rows"][0]["values"][5],
+                    "blob_value": baseline_state["tables"]["typed_records"]["rows"][0]["values"][7],
+                },
+            )
+            _verify_external_value_cells(
+                baseline_package, "lookup_payloads",
+                {
+                    "payload_text": baseline_state["tables"]["lookup_payloads"]["rows"][0]["values"][2],
+                    "payload_blob": baseline_state["tables"]["lookup_payloads"]["rows"][0]["values"][3],
+                },
+            )
             passed_checks.append("publisher_baseline_generation_complete")
+            passed_checks.append("baseline_large_text_blob_external_cells")
 
             with closing(sqlite3.connect(current_db)) as connection:
                 connection.execute("PRAGMA foreign_keys=ON")
@@ -663,9 +814,13 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
                      and initial_plan["replaces_delta_chain"] is True,
                      "INITIAL_RESET_NOT_PUBLISHED")
 
+            reset_text = _large_text("schema-reset", 16_000)
+            reset_blob = _large_blob(b"\x00\xffreset\x00", 1_450, reverse=True)
             _apply_update(current_db, (
-                ("UPDATE typed_records SET real_value=?,text_value=? WHERE record_id=?",
-                 (2.5, "before schema reset\x00𐀀", 41)),
+                ("UPDATE typed_records SET real_value=?,text_value=?,blob_value=? WHERE record_id=?",
+                 (2.5, reset_text, reset_blob, 41)),
+                ("UPDATE lookup_payloads SET payload_text=?,payload_blob=? WHERE lookup_id=?",
+                 (reset_text, reset_blob, 1)),
                 ("UPDATE rowid_values SET payload=? WHERE rowid=?", (b"\x00before-reset", -401)),
             ))
             with closing(sqlite3.connect(current_db)) as connection:
@@ -680,10 +835,25 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
             _require(reset_plan["kind"] == "baseline_reconciliation"
                      and reset_plan["replaces_delta_chain"] is True,
                      "SCHEMA_RESET_NOT_PUBLISHED")
+            state_reset = _capture_source(current_db)
+            _verify_external_value_cells(
+                generations[RESET_ID] / "transport", "typed_records",
+                {"text_value": reset_text, "blob_value": reset_blob},
+            )
+            _verify_external_value_cells(
+                generations[RESET_ID] / "transport", "lookup_payloads",
+                {"payload_text": reset_text, "payload_blob": reset_blob},
+            )
 
+            incremental_one_text = _large_text("incremental-one", 16_500)
+            incremental_one_blob = _large_blob(
+                b"\x00\xffincremental-one\x00", 1_500, reverse=True,
+            )
             _apply_update(current_db, (
                 ("UPDATE typed_records SET real_value=?,text_value=?,blob_value=? WHERE record_id=?",
-                 (3.5, "incremental-one\x00𐀀", b"\x00\xffincremental-one", 41)),
+                 (3.5, incremental_one_text, incremental_one_blob, 41)),
+                ("UPDATE lookup_payloads SET payload_text=?,payload_blob=? WHERE lookup_id=?",
+                 (incremental_one_text, incremental_one_blob, 1)),
                 ("UPDATE rowid_values SET payload=?,note=? WHERE rowid=?",
                  (b"\x00updated-on-delta-one", "updated exact rowid", -401)),
                 ("INSERT INTO rowid_values(rowid,label,payload,note) VALUES(?,?,?,?)",
@@ -694,12 +864,23 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
                      and incremental_one_plan["replaces_delta_chain"] is False,
                      "FIRST_INCREMENTAL_NOT_PUBLISHED")
             state_one = _capture_source(current_db)
+            _verify_external_value_cells(
+                generations[INCREMENTAL_ONE_ID] / "transport", "typed_records",
+                {"text_value": incremental_one_text, "blob_value": incremental_one_blob},
+            )
+            _verify_external_value_cells(
+                generations[INCREMENTAL_ONE_ID] / "transport", "lookup_payloads",
+                {"payload_text": incremental_one_text, "payload_blob": incremental_one_blob},
+            )
 
             final_json_text = '{"generation":"final","n":2}'
-            final_blob = b"\x00\xff\x80final-native-blob\x00"
+            final_text = _large_text("incremental-two", 17_000)
+            final_blob = _large_blob(b"\x00\xff\x80final-native-blob\x00", 1_600)
             _apply_update(current_db, (
-                ("UPDATE typed_records SET literal_json=?,blob_value=?,nullable_value=?,empty_text=?,empty_blob=? WHERE record_id=?",
-                 (final_json_text, final_blob, None, "", b"", 41)),
+                ("UPDATE typed_records SET literal_json=?,text_value=?,blob_value=?,nullable_value=?,empty_text=?,empty_blob=? WHERE record_id=?",
+                 (final_json_text, final_text, final_blob, None, "", b"", 41)),
+                ("UPDATE lookup_payloads SET payload_text=?,payload_blob=? WHERE lookup_id=?",
+                 (final_text, final_blob, 1)),
                 ("DELETE FROM rowid_values WHERE rowid=?", (9001,)),
                 ("UPDATE match_classification SET analysis_set=?,rule_raw=?,raw_classification=?",
                  ("fixture_mode", "RULE_FIXTURE", b"\x00final-classification")),
@@ -711,6 +892,15 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
                      "SECOND_INCREMENTAL_NOT_PUBLISHED")
             state_two = _capture_source(current_db)
             _check_native_examples(state_two)
+            _verify_external_value_cells(
+                generations[INCREMENTAL_TWO_ID] / "transport", "typed_records",
+                {"text_value": final_text, "blob_value": final_blob},
+            )
+            _verify_external_value_cells(
+                generations[INCREMENTAL_TWO_ID] / "transport", "lookup_payloads",
+                {"payload_text": final_text, "payload_blob": final_blob},
+            )
+            passed_checks.append("reset_and_two_incremental_large_external_cells")
 
             effective_chain = (RESET_ID, INCREMENTAL_ONE_ID, INCREMENTAL_TWO_ID)
             _require([row["generation_id"] for row in json.loads(latest_two_raw)["delta_chain"]]
@@ -849,6 +1039,69 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
                      "BASELINE_CLI_MUTATED_CONTROLS")
             passed_checks.append("archive_cli_baseline_list_and_absent_delta_chain")
 
+            # A baseline-only published context exposes exact rows through the
+            # same point-lookup API, including original rowid and native large
+            # TEXT/BLOB values. Missing and nonmatching criteria must not
+            # decode the payload; the selected row alone does.
+            baseline_lookup_manifest = json.loads(
+                (baseline_package / "manifest.json").read_bytes()
+            )
+            baseline_lookup_doc = next(
+                item for item in baseline_lookup_manifest["tables"]
+                if item["name"] == "lookup_payloads"
+            )
+            baseline_external_reads = []
+            original_read_external_cell = lossless_sqlite_module._read_external_cell
+
+            def baseline_external_spy(*args, **kwargs):
+                baseline_external_reads.append(
+                    (Path(args[0]).resolve(), args[2], args[4])
+                )
+                return original_read_external_cell(*args, **kwargs)
+
+            with PublishedSQLiteReader(
+                baseline_control_root, baseline_package, delta_root,
+                expected_generation_id=BASELINE_ID,
+            ) as opened:
+                _require(opened.published_deltas_verified is False,
+                         "BASELINE_LOOKUP_DELTA_STATUS_INVALID")
+                with patch.object(lossless_sqlite_module, "_read_external_cell",
+                                  new=baseline_external_spy):
+                    _check_unique_lookup_result(
+                        opened.get_unique_row("lookup_payloads", {"lookup_id": 999}),
+                        None, "BASELINE_LOOKUP_MISSING",
+                    )
+                    _check_unique_lookup_result(
+                        opened.get_unique_row("lookup_payloads", {"parent_id": 999}),
+                        None, "BASELINE_LOOKUP_NONMATCH",
+                    )
+                    _require(not baseline_external_reads,
+                             "BASELINE_LOOKUP_UNMATCHED_PAYLOAD_DECODED")
+                    baseline_lookup_expected = _expected_unique_row(
+                        baseline_state, "lookup_payloads", {"lookup_id": 1},
+                    )
+                    _check_unique_lookup_result(
+                        opened.get_unique_row("lookup_payloads", {"lookup_id": 1}),
+                        baseline_lookup_expected, "BASELINE_LOOKUP_SELECTED",
+                    )
+                    _require(
+                        len(baseline_external_reads) == 2
+                        and all(root == baseline_package.resolve()
+                                and table_id == baseline_lookup_doc["table_id"]
+                                for root, table_id, _column in baseline_external_reads)
+                        and {column for _root, _table_id, column in baseline_external_reads}
+                        == {2, 3},
+                        "BASELINE_LOOKUP_SELECTED_EXTERNAL_DECODE_INVALID",
+                    )
+                    try:
+                        opened.get_unique_row("rowid_values", {"note": "duplicate-note"})
+                    except PublishedSQLiteReaderError as exc:
+                        _require(exc.category == "DELTA_LOOKUP_NOT_UNIQUE",
+                                 "BASELINE_LOOKUP_CARDINALITY_CATEGORY_INVALID")
+                    else:
+                        raise FixtureFailure("BASELINE_LOOKUP_DUPLICATE_NOT_REJECTED")
+            passed_checks.append("baseline_unique_lookup_native_row_and_cardinality")
+
             package_fingerprints = {
                 "baseline_generation": _tree_snapshot(baseline_generation_dir),
                 **{generation_id: _tree_snapshot(generations[generation_id])
@@ -945,26 +1198,224 @@ def _run(code_root_arg: Path) -> dict[str, Any]:
                 _require(opened.published_control_binding_verified is True
                          and opened.published_deltas_verified is True,
                          "PUBLISHED_BINDING_PROOF_MISSING")
+                pinned_lookup_expected = _expected_unique_row(
+                    state_one, "lookup_payloads", {"lookup_id": 1},
+                )
+                pinned_lookup_before_advance = opened.get_unique_row(
+                    "lookup_payloads", {"lookup_id": 1},
+                )
+                _check_unique_lookup_result(
+                    pinned_lookup_before_advance, pinned_lookup_expected,
+                    "FIRST_PINNED_LOOKUP_BEFORE_ADVANCE",
+                )
                 tables_one, rows_one = _check_reader(opened, state_one)
                 # latest is mutable by design: advancing it must not change
                 # this reader's pinned generation or typed snapshot.
                 (control_root / "latest.json").write_bytes(latest_two_raw)
                 _require(opened.generation_id == INCREMENTAL_ONE_ID,
                          "OPEN_READER_MOVED_WITH_LATEST")
+                pinned_lookup_after_advance = opened.get_unique_row(
+                    "lookup_payloads", {"lookup_id": 1},
+                )
+                _check_unique_lookup_result(
+                    pinned_lookup_after_advance, pinned_lookup_expected,
+                    "FIRST_PINNED_LOOKUP_AFTER_ADVANCE",
+                )
                 _require(_check_reader(opened, state_one) == (tables_one, rows_one),
                          "OPEN_READER_SNAPSHOT_CHANGED_AFTER_ADVANCE")
+                _require(
+                    tuple(_typed(value) for value in pinned_lookup_after_advance["values"])
+                    == tuple(_typed(value) for value in pinned_lookup_before_advance["values"]),
+                    "OPEN_LOOKUP_RESULT_CHANGED_AFTER_ADVANCE",
+                )
             passed_checks.append("all_tables_schema_xinfo_foreign_keys_and_native_rows")
+            passed_checks.append("pinned_unique_lookup_survives_latest_advance")
 
             # A fresh context observes the advanced latest and the second
             # incremental delta, including the reset-era schema.
+            lookup_operation_roots: dict[Path, tuple[str, str]] = {}
+            for generation_id in effective_chain:
+                generation_metadata = plans[generation_id]["metadata"]
+                table_names, _xinfo, _visible = delta_transport_module._table_specs(
+                    generation_metadata
+                )
+                internal_names = delta_transport_module._internal_names(
+                    generation_metadata, table_names,
+                )
+                transport_root = (delta_root / generation_id / "transport").resolve(strict=True)
+                lookup_operation_roots[transport_root] = (
+                    generation_id, internal_names["operations_table"],
+                )
+            operation_scan_counts = {generation_id: 0 for generation_id in effective_chain}
+            operation_candidate_iterator = lossless_sqlite_module._iter_table_candidates
+            external_decode_calls = []
+            digest_calls = []
+            token_hash_calls = []
+            original_delta_file_digest = delta_reader_module._file_digest
+            original_token_hash = verified_files_module._hash_descriptor
+
+            def operation_candidate_spy(*args, **kwargs):
+                package_root = Path(args[0]).resolve()
+                table_name = args[2]
+                operation_identity = lookup_operation_roots.get(package_root)
+                if (kwargs.get("candidate_package_kind") == "transport"
+                        and operation_identity is not None
+                        and table_name == operation_identity[1]):
+                    operation_scan_counts[operation_identity[0]] += 1
+                return operation_candidate_iterator(*args, **kwargs)
+
+            def delta_file_digest_spy(path):
+                digest_calls.append(Path(path))
+                return original_delta_file_digest(path)
+
+            def token_hash_spy(descriptor):
+                token_hash_calls.append(descriptor)
+                return original_token_hash(descriptor)
+
+            def final_external_spy(*args, **kwargs):
+                external_decode_calls.append(
+                    (Path(args[0]).resolve(), args[2], args[3], args[4])
+                )
+                return original_read_external_cell(*args, **kwargs)
+
+            lookup_payload_table_ids = {}
+            baseline_manifest_for_lookup = json.loads(
+                (baseline_package / "manifest.json").read_bytes()
+            )
+            baseline_lookup_docs = [
+                item for item in baseline_manifest_for_lookup["tables"]
+                if item.get("name") == "lookup_payloads"
+            ]
+            _require(len(baseline_lookup_docs) == 1,
+                     "BASELINE_LOOKUP_TABLE_METADATA_INVALID")
+            lookup_payload_table_ids[baseline_package.resolve()] = (
+                baseline_lookup_docs[0]["table_id"]
+            )
+            for generation_id in effective_chain:
+                transport_root = (delta_root / generation_id / "transport").resolve(strict=True)
+                transport_manifest = json.loads(
+                    (transport_root / "manifest.json").read_bytes()
+                )
+                lookup_docs = [
+                    item for item in transport_manifest["tables"]
+                    if item.get("name") == "lookup_payloads"
+                ]
+                _require(len(lookup_docs) == 1,
+                         "DELTA_LOOKUP_TABLE_METADATA_INVALID")
+                lookup_payload_table_ids[transport_root] = lookup_docs[0]["table_id"]
+
+            def lookup_payload_decodes():
+                return [
+                    call for call in external_decode_calls
+                    if lookup_payload_table_ids.get(call[0]) == call[1]
+                ]
+
+            final_lookup_manifest = json.loads(
+                (delta_root / INCREMENTAL_TWO_ID / "transport" / "manifest.json").read_bytes()
+            )
+            final_lookup_doc = next(
+                item for item in final_lookup_manifest["tables"]
+                if item["name"] == "lookup_payloads"
+            )
+            final_lookup_expected = _expected_unique_row(
+                state_two, "lookup_payloads", {"lookup_id": 1},
+            )
             with PublishedSQLiteReader(
                 control_root, baseline_package, delta_root,
                 expected_generation_id=INCREMENTAL_TWO_ID,
             ) as opened:
                 _require(opened.generation_id == INCREMENTAL_TWO_ID,
                          "NEW_CONTEXT_DID_NOT_OBSERVE_LATEST")
+                _require(opened._delta_reader._lookup_fast_eligible("lookup_payloads"),
+                         "FINAL_LOOKUP_FAST_PATH_NOT_ELIGIBLE")
+                with (
+                    patch.object(lossless_sqlite_module, "_iter_table_candidates",
+                                 new=operation_candidate_spy),
+                    patch.object(lossless_sqlite_module, "_read_external_cell",
+                                 new=final_external_spy),
+                    patch.object(delta_reader_module, "_file_digest",
+                                 new=delta_file_digest_spy),
+                    patch.object(verified_files_module, "_hash_descriptor",
+                                 new=token_hash_spy),
+                ):
+                    _check_unique_lookup_result(
+                        opened.get_unique_row("lookup_payloads", {"lookup_id": 999}),
+                        None, "FINAL_LOOKUP_MISSING",
+                    )
+                    _require("lookup_payloads" not in opened._delta_reader._lookup_fallback_tables,
+                             "FINAL_LOOKUP_UNEXPECTED_FULL_MATERIALIZATION")
+                    _require(not lookup_payload_decodes(),
+                             "FINAL_LOOKUP_MISSING_PAYLOAD_DECODED")
+                    _check_unique_lookup_result(
+                        opened.get_unique_row("lookup_payloads", {"parent_id": 999}),
+                        None, "FINAL_LOOKUP_NONMATCH",
+                    )
+                    _require(not lookup_payload_decodes(),
+                             "FINAL_LOOKUP_NONMATCH_PAYLOAD_DECODED")
+                    _require(operation_scan_counts == {
+                        generation_id: 1 for generation_id in effective_chain
+                    }, "FINAL_LOOKUP_OPERATION_METADATA_SCAN_COUNT_INVALID")
+
+                    decode_start = len(external_decode_calls)
+                    selected_lookup = opened.get_unique_row(
+                        "lookup_payloads", {"lookup_id": 1},
+                    )
+                    _check_unique_lookup_result(
+                        selected_lookup, final_lookup_expected,
+                        "FINAL_LOOKUP_SELECTED",
+                    )
+                    expected_latest_transport = (
+                        delta_root / INCREMENTAL_TWO_ID / "transport"
+                    ).resolve()
+                    selected_external_calls = external_decode_calls[decode_start:]
+                    _require(
+                        len(selected_external_calls) == 2
+                        and all(root == expected_latest_transport
+                                and table_id == final_lookup_doc["table_id"]
+                                for root, table_id, _ordinal, _column in selected_external_calls)
+                        and {column for _root, _table_id, _ordinal, column
+                             in selected_external_calls} == {2, 3},
+                        "FINAL_LOOKUP_DECODED_SUPERSEDED_OR_UNSELECTED_PAYLOAD",
+                    )
+                    selected_decode_count = len(lookup_payload_decodes())
+                    operation_counts_after_selected = dict(operation_scan_counts)
+                    digest_count_after_selected = len(digest_calls)
+                    token_hash_count_after_selected = len(token_hash_calls)
+
+                    repeated_decode_start = len(external_decode_calls)
+                    repeated_lookup = opened.get_unique_row(
+                        "lookup_payloads", {"lookup_id": 1},
+                    )
+                    _check_unique_lookup_result(
+                        repeated_lookup, final_lookup_expected,
+                        "FINAL_LOOKUP_REPEATED",
+                    )
+                    _require(
+                        len(lookup_payload_decodes()) == selected_decode_count * 2
+                        and len(external_decode_calls[repeated_decode_start:]) == 2
+                        and all(root == expected_latest_transport
+                                and table_id == final_lookup_doc["table_id"]
+                                for root, table_id, _ordinal, _column
+                                in external_decode_calls[repeated_decode_start:]),
+                        "FINAL_LOOKUP_REPEAT_DECODE_SCOPE_INVALID",
+                    )
+                    _require(operation_scan_counts == operation_counts_after_selected
+                             and operation_counts_after_selected == {
+                                 generation_id: 1 for generation_id in effective_chain
+                             }, "FINAL_LOOKUP_RESCANNED_OPERATION_METADATA")
+                    _require(len(digest_calls) == digest_count_after_selected == 0
+                             and len(token_hash_calls) == token_hash_count_after_selected == 0,
+                             "FINAL_LOOKUP_REHASHED_PACKAGE_FILES")
+
                 tables_final, rows_final = _check_reader(opened, state_two)
                 _require(tables_final == len(state_two["tables"]), "FINAL_TABLE_COUNT_MISMATCH")
+                _require(
+                    tuple(_typed(value) for value in selected_lookup["values"])
+                    == tuple(_typed(value) for value in repeated_lookup["values"]),
+                    "FINAL_LOOKUP_REPEAT_VALUES_CHANGED",
+                )
+            passed_checks.append("delta_unique_lookup_selective_external_decode")
+            passed_checks.append("delta_unique_lookup_cache_reuses_operation_metadata")
             _check_native_examples(state_two)
             passed_checks.append("source_rowids_and_sqlite_native_types")
             passed_checks.append("latest_pin_and_new_context_advance")
