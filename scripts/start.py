@@ -14,6 +14,7 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('--check', action='store_true')
     p.add_argument('--no-login', action='store_true')
+    p.add_argument('--static', action='store_true')
     a = p.parse_args(argv)
 
     if sys.version_info < (3, 10):
@@ -26,8 +27,11 @@ def main(argv=None):
                 raise RuntimeError('sshコマンドが見つかりません。NASモードにはSSHクライアントが必要です。')
             print('NAS起動条件を満たしています。')
             return 0
-        nas_script = ROOT / 'scripts' / 'nas_archive.py'
-        res = subprocess.run([sys.executable, str(nas_script), 'gui'])
+        if a.static:
+            nas_script = ROOT / 'scripts' / 'nas_archive.py'
+            res = subprocess.run([sys.executable, str(nas_script), 'gui'])
+            return res.returncode
+        res = subprocess.run([sys.executable, str(ROOT / 'scripts' / 'desktop_app.py')])
         return res.returncode
 
     node = shutil.which('node')

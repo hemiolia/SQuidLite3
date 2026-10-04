@@ -88,7 +88,7 @@ class Store:
             # Set this on every authoritative writer, before any schema/data work.
             self.db.execute('PRAGMA recursive_triggers=ON')
             self.db.execute('PRAGMA journal_mode=WAL');self.db.execute('PRAGMA synchronous=FULL')
-            self.db.executescript((Path(__file__).resolve().parents[3]/'sql/schema.sql').read_text());self.db.commit()
+            self._apply_schema()
             if 'empty_retries' not in {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}:
                 self.db.execute('ALTER TABLE jobs ADD COLUMN empty_retries INTEGER NOT NULL DEFAULT 0')
                 self.db.commit()
@@ -109,6 +109,15 @@ class Store:
                 finally:
                     self.db=None
             raise
+    def _apply_schema(self):
+        # schema.sql は内容が変わったときだけ、一つのトランザクションで適用する。
+        # PRAGMA foreign_keys はトランザクション内では無効なので、毎回ここで接続に設定する。
+        self.db.execute('PRAGMA foreign_keys=ON')
+        text=(Path(__file__).resolve().parents[3]/'sql/schema.sql').read_text()
+        wanted=hashlib.sha256(text.encode('utf-8')).hexdigest()
+        has_control=self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='control'").fetchone() is not None
+        if has_control and self._control('schema_sql_sha256')==wanted:return
+        self.db.executescript('BEGIN IMMEDIATE;\n'+text+"\nINSERT INTO control(key,value) VALUES('schema_sql_sha256','"+wanted+"') ON CONFLICT(key) DO UPDATE SET value=excluded.value;\nCOMMIT;")
     def _install_existing_change_feed(self):
         """Repair feed coverage only for databases whose baseline already opted in.
 
@@ -334,7 +343,8 @@ class Store:
     def _write_weapon_snapshots(self,r,data,fetched_at,event_id):
         for item in weapon_snapshots(data):
             self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
-                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value''',
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value
+                WHERE rate_points.label IS NOT excluded.label OR rate_points.value IS NOT excluded.value''',
                 (r['account'],item['series_id'],item['label'],item['genre'],item['rule_raw'],'fetch:'+event_id,fetched_at,item['value'],'api_snapshot','primary'))
     def _matches(self,r,data,okay):
         for path,v in walk(data):
@@ -625,19 +635,32 @@ class Store:
         info=classify_detail(detail) if kind=='vs' else classify_coop(detail)
         self.db.execute('''INSERT INTO match_classification(account,kind,match_key,genre,mode_raw,bankara_mode,rule_raw,rule_name,roster_class,analysis_set,team_count,my_player_count,opponent_counts,detail_response_id,classified_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(account,kind,match_key) DO UPDATE SET genre=excluded.genre,mode_raw=excluded.mode_raw,bankara_mode=excluded.bankara_mode,rule_raw=excluded.rule_raw,rule_name=excluded.rule_name,roster_class=excluded.roster_class,analysis_set=excluded.analysis_set,team_count=excluded.team_count,my_player_count=excluded.my_player_count,opponent_counts=excluded.opponent_counts,detail_response_id=excluded.detail_response_id,classified_at=excluded.classified_at''',
+            ON CONFLICT(account,kind,match_key) DO UPDATE SET genre=excluded.genre,mode_raw=excluded.mode_raw,bankara_mode=excluded.bankara_mode,rule_raw=excluded.rule_raw,rule_name=excluded.rule_name,roster_class=excluded.roster_class,analysis_set=excluded.analysis_set,team_count=excluded.team_count,my_player_count=excluded.my_player_count,opponent_counts=excluded.opponent_counts,detail_response_id=excluded.detail_response_id,classified_at=excluded.classified_at
+            WHERE match_classification.genre IS NOT excluded.genre OR match_classification.mode_raw IS NOT excluded.mode_raw OR match_classification.bankara_mode IS NOT excluded.bankara_mode
+              OR match_classification.rule_raw IS NOT excluded.rule_raw OR match_classification.rule_name IS NOT excluded.rule_name OR match_classification.roster_class IS NOT excluded.roster_class
+              OR match_classification.analysis_set IS NOT excluded.analysis_set OR match_classification.team_count IS NOT excluded.team_count OR match_classification.my_player_count IS NOT excluded.my_player_count
+              OR match_classification.opponent_counts IS NOT excluded.opponent_counts OR match_classification.detail_response_id IS NOT excluded.detail_response_id''',
             (account,kind,key,info['genre'],info['mode_raw'],info['bankara_mode'],info['rule_raw'],info['rule_name'],info['roster_class'],info['analysis_set'],info['team_count'],info['my_player_count'],js(info['opponent_counts']),row['detail_response_id'],now()))
     def _write_rates(self,account,kind,key):
         row=self.db.execute('''SELECT d.json_text,c.genre,c.analysis_set,c.rule_raw,json_extract(d.json_text,'$.playedTime') played_time,json_extract(d.json_text,'$.judgement') judgement
             FROM match_classification c JOIN documents d ON d.response_id=c.detail_response_id AND d.account=c.account AND d.kind=c.kind AND d.match_key=c.match_key
             WHERE c.account=? AND c.kind=? AND c.match_key=?''',(account,kind,key)).fetchone()
-        self.db.execute('DELETE FROM rate_points WHERE account=? AND match_key=? AND source=?',(account,key,'api'))
-        if not row:return
+        if not row:
+            self.db.execute('DELETE FROM rate_points WHERE account=? AND match_key=? AND source=?',(account,key,'api'));return
         detail=json.loads(row['json_text'])
         genre=row['analysis_set'] if row['genre']=='private' else row['genre']
-        for item in observations(detail,genre,row['rule_raw']):
+        new={}
+        for item in observations(detail,genre,row['rule_raw']):new[item['series_id']]=item  # 同一系列は後勝ち（従来の上書きと同じ）
+        for (sid,) in self.db.execute('SELECT series_id FROM rate_points WHERE account=? AND match_key=? AND source=?',(account,key,'api')).fetchall():
+            if sid not in new:self.db.execute('DELETE FROM rate_points WHERE account=? AND series_id=? AND match_key=? AND source=?',(account,sid,key,'api'))
+        for item in new.values():
             self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
-                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value,played_time=excluded.played_time,priority=excluded.priority,source=excluded.source''',
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value,played_time=excluded.played_time,priority=excluded.priority,source=excluded.source,
+                genre=CASE WHEN rate_points.source='api' THEN excluded.genre ELSE rate_points.genre END,
+                rule_raw=CASE WHEN rate_points.source='api' THEN excluded.rule_raw ELSE rate_points.rule_raw END
+                WHERE rate_points.label IS NOT excluded.label OR rate_points.value IS NOT excluded.value OR rate_points.played_time IS NOT excluded.played_time
+                  OR rate_points.priority IS NOT excluded.priority OR rate_points.source IS NOT excluded.source
+                  OR (rate_points.source='api' AND (rate_points.genre IS NOT excluded.genre OR rate_points.rule_raw IS NOT excluded.rule_raw))''',
                 (account,item['series_id'],item['label'],item['genre'],item['rule_raw'],key,row['played_time'],item['value'],item['source'],item['priority']))
     def verify(self):
         errors=[]

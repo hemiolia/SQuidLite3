@@ -121,7 +121,7 @@ class ClientDataRootTests(unittest.TestCase):
         with patch.object(start.subprocess, 'run') as run:
             run.return_value.returncode = 0
             self.assertEqual(start.main([]), 0)
-            run.assert_called_once_with([sys.executable, str(Path(start.ROOT) / 'scripts/nas_archive.py'), 'gui'])
+            run.assert_called_once_with([sys.executable, str(Path(start.ROOT) / 'scripts' / 'desktop_app.py')])
         with patch.object(archive, 'OUTPUT', self.client), \
              patch.object(archive, 'DEFAULT', self.client / 'database/archive.sqlite3'), \
              patch.object(sys, 'argv', ['archive.py', 'sync']):

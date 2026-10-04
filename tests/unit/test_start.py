@@ -60,7 +60,7 @@ class StartScriptTests(unittest.TestCase):
             exit_code = start.main([])
             self.assertEqual(exit_code, 42)
             self.assertEqual(len(calls), 1)
-            expected_cmd = [sys.executable, str(ROOT / 'scripts/nas_archive.py'), 'gui']
+            expected_cmd = [sys.executable, str(ROOT / 'scripts' / 'desktop_app.py')]
             self.assertEqual(calls[0], expected_cmd)
             mock_which.assert_not_called()
 
@@ -77,6 +77,25 @@ class StartScriptTests(unittest.TestCase):
         with patch.object(start.subprocess, 'run', side_effect=fake_run), \
              patch.object(start.shutil, 'which') as mock_which:
             exit_code = start.main(['--no-login'])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(calls), 1)
+            expected_cmd = [sys.executable, str(ROOT / 'scripts' / 'desktop_app.py')]
+            self.assertEqual(calls[0], expected_cmd)
+            mock_which.assert_not_called()
+
+    def test_nas_static_runs_nas_archive_gui(self):
+        self.create_marker()
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            mock_res = MagicMock()
+            mock_res.returncode = 0
+            return mock_res
+
+        with patch.object(start.subprocess, 'run', side_effect=fake_run), \
+             patch.object(start.shutil, 'which') as mock_which:
+            exit_code = start.main(['--static'])
             self.assertEqual(exit_code, 0)
             self.assertEqual(len(calls), 1)
             expected_cmd = [sys.executable, str(ROOT / 'scripts/nas_archive.py'), 'gui']
