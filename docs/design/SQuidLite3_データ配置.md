@@ -1,4 +1,4 @@
-# SQuidLite3 データ配置（設計 0.2・2026-10-05 Opus 5.5）
+# SQuidLite3 データ配置（設計 0.3・2026-10-05 Opus 5.5）
 
 ## この設計が満たす前田さんの指示（要点。全文は開発ログの原文）
 
@@ -37,8 +37,9 @@ db/
   README_FOR_AI.md          目録から生成する読み方の案内（人と AI 向け）
   catalog.sqlite3           目録（公開の確定点）
   catalog.xlsx              目録の xlsx 版
-  matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3
-  responses/<operation>/<期間>.sqlite3
+  matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3
+  responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3
+  responses/<ランキング系の operation>/<YYYY-MM>/<YYYY-MM-DD>/<response_id>.sqlite3
   images/<SHA-256 の先頭2桁>.sqlite3
   images/no-body.sqlite3
   system/<表名>.sqlite3
@@ -51,8 +52,8 @@ db/
 
 ## 本籍規則（版 1）
 
-用語: 「試合の本籍」は `matches/<analysis_set>/<rule_raw>/<月>`。`analysis_set` と `rule_raw` は `match_classification` の値、月は `matches.detail_response_id` の `documents.json_text` の `$.playedTime` を日本時間にした年月。分類が無ければ `unclassified/no-rule`、playedTime が無ければ `unknown-month`（観測日時で埋めない）。
-「応答の本籍」は、その応答を `response_id` に持つ `documents` 行があれば、その試合の本籍（複数あれば (account, kind, match_key) が最小のもの）。無ければ `responses/<operation>/<期間>`（期間の粒度は実測で確定。下の未確定を参照）。
+用語: 「試合の本籍」は `matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`。`analysis_set` と `rule_raw` は `match_classification` の値、日付は `matches.detail_response_id` の `documents.json_text` の `$.playedTime` を日本時間にした年月と年月日。分類が無ければ `unclassified/no-rule`、playedTime が無ければ `matches/<analysis_set>/<rule_raw>/unknown-date.sqlite3`（観測日時で埋めない）。
+「応答の本籍」は、その応答を `response_id` に持つ `documents` 行があれば、その試合の本籍（複数あれば (account, kind, match_key) が最小のもの）。無ければ `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`（fetched_at の日本時間の日付）。ただし下の「ランキング系の operation」は 1 応答 1 部品で `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<response_id>.sqlite3`。
 
 | 正本の表 | 本籍 |
 | --- | --- |
@@ -109,7 +110,21 @@ db/
 
 各部品と目録に、同じ住所の xlsx を作る（`xlsx/` 以下）。セル上限を超える値は既存の無損失エンコード（`lossless_xlsx.py`）で順序付き断片に分ける。SQLite 部品の公開を xlsx の完了で待たせない。
 
+## 粒度の根拠（静止点 20261002T111654Z の実測、2026-10-05）
+
+- EventMatchRankingPeriodQuery: 応答839件、json_text 3.26GB・本文 3.30GB・entities 75.2万行 11.6GB・asset_refs 522万行。838件が 2026-09-22 の一日に取得。種類×月や種類×日では 1 部品が数 GB〜18GB になるため、1 応答 1 部品（1 件あたり約 20〜30MB）にする。
+- VsHistoryDetailQuery: 1試合の詳細は json_text 約19万字で、応答・本文・documents・sightings の4か所に同じ原文がある（正本の設計どおり。省略しない）。1試合あたり約1.4MB。モード×ルール×月ではオープン1ルールで 200〜350MB になり、遊んでいる間の再作成と再送が重いので、日ごとにする（1部品 10〜30MB 程度）。
+- 試合以外の多くの種類は 1 日 1〜数件で、種類×日なら 1 部品は数 MB。
+- 画像は png 4,782 件 467MB・jpeg 249 件 9MB。SHA 先頭2桁の 256 部品で 1 部品約 2MB。
+
+## ランキング系の operation（1 応答 1 部品。版 1 の固定一覧）
+
+EventMatchRankingPeriodQuery, EventMatchRankingSeasonPaginationQuery, EventMatchRankingQuery, RankingHoldersFestTeamRankingHoldersPaginationQuery, WeaponRankingDetail_Ranking_RefetchQuery, WeaponRankingDetailQuery, XRankingDetailQuery, XRankingRefetchQuery, DetailRankingQuery, DetailTabViewWeaponTopsArRefetchQuery, DetailTabViewWeaponTopsClRefetchQuery, DetailTabViewWeaponTopsGlRefetchQuery, DetailTabViewWeaponTopsLfRefetchQuery, DetailTabViewXRankingArRefetchQuery, DetailTabViewXRankingClRefetchQuery, DetailTabViewXRankingGlRefetchQuery, DetailTabViewXRankingLfRefetchQuery。この一覧を変えたら規則の版を上げ、全部品を作り直す。
+
+## 毎周期の計算量（版 1 の実装要件）
+
+毎周期に全行（asset_refs だけで約650万行）の本籍を計算し直さない。試合の本籍（約千行）と応答の本籍（約八千行）は毎周期すべて計算して前回と比べ、本籍が変わった試合・応答に属する行と、変更追跡に現れた行だけについて、行ごとの本籍を計算し直す。初回と規則の版が変わったときだけ全行を計算する。
+
 ## 未確定
 
-- `responses/<operation>/<期間>` の期間の粒度（月か日か、ランキングは開催回ごとか）。静止点 20261002T111654Z の実測で決める。
 - 統合版の写しの更新頻度。
