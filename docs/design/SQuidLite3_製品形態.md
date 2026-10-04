@@ -28,6 +28,14 @@
 - 更新の配布（アプリが新しい版を確かめる先）。
 - 前田さん個人の外出先からの閲覧（例: NAS の画面を Cloudflare Tunnel と本人認証で `my.sql3.ink` などに出す）。
 
+## 技術の方針（Opus 5.5 の判断・2026-10-05。試作で確かめてから確定）
+
+実測: 取得の中核は Python 約5,000行（archive.py、store・collector・planner・classify・rates・records・gui など）と、nxapi を呼ぶ Node の橋渡し約160行。認証を担う nxapi は TypeScript 製で AGPL-3.0（本ツールと同じ）。
+
+1. **第一段（早く届ける）: Electron のデスクトップアプリ。** Electron は Node を内蔵するので nxapi がそのまま動く。Python の取得部は、単体で動く Python（python-build-standalone）を同梱して呼ぶ。利用者は何も入れずにダブルクリックで使える。画面は今の記録閲覧画面を NOAHS の方針で作り直したものを、アプリの窓の中に出す。
+2. **第二段（スマホへ）: 取得部を TypeScript に移す。** スマホでは Python も Node の子プロセスも動かせないので、取得の中核を nxapi と同じ TypeScript に書き直し、デスクトップとスマホで共有する。約5,000行で、テスト（公開サンプルと人工データ）をそのまま照合に使える。
+3. Tauri 2 は配布物が小さくスマホにも対応するが、Python と Node の両方を外付けで抱える必要があり、第一段の手間が大きい。第二段で TypeScript に移した後なら再検討の余地がある。
+
 ## 技術の選び方（次に決める）
 
 デスクトップとスマホを一つのコードで作れる枠組みを選ぶ。候補は Tauri 2 と Electron（＋スマホは別）。取得部は現在 Python と Node（nxapi）で書かれているため、同梱のしやすさ（Node を内蔵する Electron が有利）と、スマホまで同じコードで行けるか（Tauri 2 が有利）を、試作で測って決める。
