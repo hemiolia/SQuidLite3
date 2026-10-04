@@ -20,3 +20,9 @@ docs/operations/astra-continuation-20260925.md
 # Private Sol continuation and delegation instructions.
 docs/operations/sol-continuation-20261002.md
 docs/operations/sol-full-data-running.json
+
+# Google Drive の OAuth クライアント情報（秘密）。公開リポジトリへ入れない。
+config/Google Drive API Keys
+config/*API Key*
+config/*client_secret*
+config/google-drive-client*
