@@ -658,30 +658,398 @@ class TestLosslessXlsxTableFiltering(unittest.TestCase):
         finally:
             source.close()
 
-    def test_virtual_and_internal_stat_tables_fail_explicitly(self):
-        for kind in ("virtual", "stats"):
-            source = sqlite3.connect(":memory:")
+    def test_virtual_tables_still_fail_explicitly(self):
+        source = sqlite3.connect(":memory:")
+        try:
             try:
-                if kind == "virtual":
-                    try:
-                        source.execute("CREATE VIRTUAL TABLE search_docs USING fts5(content)")
-                    except sqlite3.OperationalError as exc:
-                        self.skipTest(f"SQLite FTS5 is unavailable: {exc}")
-                else:
-                    source.execute("CREATE TABLE analyzed (value TEXT)")
-                    source.execute("INSERT INTO analyzed VALUES ('value')")
-                    source.execute("ANALYZE")
+                source.execute("CREATE VIRTUAL TABLE search_docs USING fts5(content)")
+            except sqlite3.OperationalError as exc:
+                self.skipTest(f"SQLite FTS5 is unavailable: {exc}")
 
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    out_dir = Path(tmpdir)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_dir = Path(tmpdir)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "not supported by lossless XLSX reconstruction",
+                ):
+                    export_sqlite_tables(source, out_dir)
+                self.assertEqual(list(out_dir.iterdir()), [])
+        finally:
+            source.close()
+
+    def _assert_statistics_roundtrip(
+        self,
+        source: sqlite3.Connection,
+        expected_stat_tables: set[str],
+        *,
+        target_factory=None,
+    ) -> None:
+        source_schema = source.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        source_stat_rows = {}
+        source_stat_xinfo = {}
+        for table_name in sorted(expected_stat_tables):
+            source_stat_rows[table_name] = source.execute(
+                f'SELECT rowid, * FROM "{table_name}" ORDER BY rowid'
+            ).fetchall()
+            source_stat_xinfo[table_name] = source.execute(
+                f'PRAGMA table_xinfo("{table_name}")'
+            ).fetchall()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            manifest = export_sqlite_tables(source, out_dir)
+            self.assertEqual(
+                {name for name in manifest["tables"] if name.startswith("sqlite_stat")},
+                set(expected_stat_tables),
+            )
+            target = (
+                sqlite3.connect(":memory:")
+                if target_factory is None
+                else target_factory(":memory:")
+            )
+            try:
+                counts = reconstruct_sqlite_tables(out_dir, target)
+                for table_name in sorted(expected_stat_tables):
+                    actual_rows = target.execute(
+                        f'SELECT rowid, * FROM "{table_name}" ORDER BY rowid'
+                    ).fetchall()
+                    self.assertEqual(len(actual_rows), len(source_stat_rows[table_name]))
+                    for expected_row, actual_row in zip(
+                        source_stat_rows[table_name], actual_rows
+                    ):
+                        self.assertEqual(len(actual_row), len(expected_row))
+                        for expected_value, actual_value in zip(expected_row, actual_row):
+                            self.assertIs(type(actual_value), type(expected_value))
+                            self.assertEqual(actual_value, expected_value)
+                    self.assertEqual(
+                        target.execute(f'PRAGMA table_xinfo("{table_name}")').fetchall(),
+                        source_stat_xinfo[table_name],
+                    )
+                    self.assertEqual(
+                        counts[table_name], len(source_stat_rows[table_name])
+                    )
+
+                target_schema = target.execute(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+                ).fetchall()
+                self.assertEqual(target_schema, source_schema)
+                self.assertEqual(
+                    source.execute(
+                        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+                    ).fetchall(),
+                    source_schema,
+                )
+            finally:
+                target.close()
+
+    def _make_stat_source(self, *, empty: bool) -> sqlite3.Connection:
+        source = sqlite3.connect(":memory:")
+        source.execute(
+            "CREATE TABLE analyzed_items (row_key TEXT, ordinal INTEGER, payload BLOB)"
+        )
+        source.execute(
+            "CREATE INDEX analyzed_items_key_ordinal ON analyzed_items(row_key, ordinal)"
+        )
+        if not empty:
+            source.executemany(
+                "INSERT INTO analyzed_items VALUES (?, ?, ?)",
+                [
+                    (f"bucket-{index % 9}", index, bytes((index % 251, 0, index % 127)))
+                    for index in range(420)
+                ],
+            )
+        source.execute("PRAGMA analysis_limit = 0")
+        source.execute("ANALYZE")
+        return source
+
+    def test_sqlite_stat1_empty_and_nonempty_rows_roundtrip(self):
+        for empty in (True, False):
+            with self.subTest(empty=empty):
+                source = self._make_stat_source(empty=empty)
+                try:
+                    if source.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat4'"
+                    ).fetchone():
+                        source.execute("DROP TABLE sqlite_stat4")
+                    stat_names = {
+                        row[0]
+                        for row in source.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+                        )
+                    }
+                    self.assertEqual(stat_names, {"sqlite_stat1"})
+                    rows = source.execute(
+                        "SELECT rowid, * FROM sqlite_stat1 ORDER BY rowid"
+                    ).fetchall()
+                    self.assertEqual(bool(rows), not empty)
+                    self._assert_statistics_roundtrip(source, stat_names)
+                finally:
+                    source.close()
+
+    def test_sqlite_stat4_empty_and_native_samples_roundtrip_when_available(self):
+        for empty in (True, False):
+            with self.subTest(empty=empty):
+                source = self._make_stat_source(empty=empty)
+                try:
+                    stat_names = {
+                        row[0]
+                        for row in source.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+                        )
+                    }
+                    if "sqlite_stat4" not in stat_names:
+                        self.skipTest("SQLite STAT4 support is unavailable")
+                    stat4_count = source.execute(
+                        "SELECT COUNT(*) FROM sqlite_stat4"
+                    ).fetchone()[0]
+                    if empty:
+                        self.assertEqual(stat4_count, 0)
+                    else:
+                        self.assertGreater(stat4_count, 0)
+                        samples = source.execute(
+                            "SELECT sample FROM sqlite_stat4 ORDER BY rowid"
+                        ).fetchall()
+                        self.assertTrue(
+                            any(type(row[0]) is bytes and row[0] for row in samples)
+                        )
+                    self._assert_statistics_roundtrip(source, stat_names)
+                finally:
+                    source.close()
+
+    def test_custom_statistics_values_and_extreme_rowids_replace_target_generated_rows(self):
+        source = self._make_stat_source(empty=False)
+        try:
+            stat_names = {
+                row[0]
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+                )
+            }
+            if "sqlite_stat4" not in stat_names:
+                self.skipTest("SQLite STAT4 support is unavailable")
+
+            min_rowid = -(1 << 63)
+            max_rowid = (1 << 63) - 1
+            source.execute("DELETE FROM sqlite_stat1")
+            source.executemany(
+                "INSERT INTO sqlite_stat1(rowid, tbl, idx, stat) VALUES (?, ?, ?, ?)",
+                [
+                    (min_rowid, "analyzed_items", None, "source table statistics"),
+                    (
+                        max_rowid,
+                        "analyzed_items",
+                        "analyzed_items_key_ordinal",
+                        "source index statistics",
+                    ),
+                ],
+            )
+            source.execute("DELETE FROM sqlite_stat4")
+            source.executemany(
+                """INSERT INTO sqlite_stat4(
+                    rowid, tbl, idx, neq, nlt, ndlt, sample
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        min_rowid,
+                        "analyzed_items",
+                        "analyzed_items_key_ordinal",
+                        "420 47 5",
+                        "0 2 1",
+                        "0 2 1",
+                        b"source-low\x00\xff",
+                    ),
+                    (
+                        max_rowid,
+                        "analyzed_items",
+                        "analyzed_items_key_ordinal",
+                        "420 46 5",
+                        "419 417 9",
+                        "38 29 9",
+                        b"source-high\x00\xfe",
+                    ),
+                ],
+            )
+
+            injected_target_statistics = []
+            target_only_rowid = 1 << 62
+
+            class TargetOnlyStatisticsConnection(sqlite3.Connection):
+                def execute(self, sql, parameters=()):
+                    cursor = super().execute(sql, parameters)
+                    if sql.strip().upper() == "ANALYZE":
+                        super().execute(
+                            """INSERT INTO sqlite_stat1(
+                                rowid, tbl, idx, stat
+                            ) VALUES (?, ?, ?, ?)""",
+                            (
+                                target_only_rowid,
+                                "target-only-table",
+                                None,
+                                "must be removed before source restoration",
+                            ),
+                        )
+                        super().execute(
+                            """INSERT INTO sqlite_stat4(
+                                rowid, tbl, idx, neq, nlt, ndlt, sample
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                target_only_rowid,
+                                "target-only-table",
+                                "target-only-index",
+                                "9 8 7",
+                                "6 5 4",
+                                "3 2 1",
+                                b"target-only\x00sample",
+                            ),
+                        )
+                        injected_target_statistics.extend(("sqlite_stat1", "sqlite_stat4"))
+                    return cursor
+
+            def target_factory(database):
+                return sqlite3.connect(
+                    database, factory=TargetOnlyStatisticsConnection
+                )
+
+            self._assert_statistics_roundtrip(
+                source, stat_names, target_factory=target_factory
+            )
+            self.assertEqual(injected_target_statistics, ["sqlite_stat1", "sqlite_stat4"])
+        finally:
+            source.close()
+
+    def test_sqlite_stat4_only_schema_roundtrips_when_available(self):
+        source = self._make_stat_source(empty=False)
+        try:
+            stat_names = {
+                row[0]
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+                )
+            }
+            if "sqlite_stat4" not in stat_names:
+                self.skipTest("SQLite STAT4 support is unavailable")
+            source.execute("DROP TABLE sqlite_stat1")
+            stat_names = {
+                row[0]
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+                )
+            }
+            self.assertEqual(stat_names, {"sqlite_stat4"})
+            self._assert_statistics_roundtrip(source, stat_names)
+        finally:
+            source.close()
+
+    def test_target_missing_stat4_capability_fails_and_rolls_back_when_available(self):
+        source = self._make_stat_source(empty=False)
+        try:
+            stat_names = {
+                row[0]
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+                )
+            }
+            if "sqlite_stat4" not in stat_names:
+                self.skipTest("SQLite STAT4 support is unavailable")
+
+            class TargetWithoutStat4Connection(sqlite3.Connection):
+                def execute(self, sql, parameters=()):
+                    cursor = super().execute(sql, parameters)
+                    if sql.strip().upper() == "ANALYZE":
+                        super().execute("DROP TABLE sqlite_stat4")
+                    return cursor
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_dir = Path(tmpdir)
+                export_sqlite_tables(source, out_dir)
+                target = sqlite3.connect(
+                    ":memory:", factory=TargetWithoutStat4Connection
+                )
+                try:
                     with self.assertRaisesRegex(
                         ValueError,
-                        "not supported by lossless XLSX reconstruction",
+                        "Target SQLite build cannot recreate required statistics tables",
                     ):
-                        export_sqlite_tables(source, out_dir)
-                    self.assertEqual(list(out_dir.iterdir()), [])
-            finally:
-                source.close()
+                        reconstruct_sqlite_tables(out_dir, target)
+                    self.assertEqual(
+                        target.execute(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type IN ('table','index','view','trigger')"
+                        ).fetchall(),
+                        [],
+                    )
+                    self.assertFalse(target.in_transaction)
+                finally:
+                    target.close()
+        finally:
+            source.close()
+
+    def test_unsupported_reserved_table_metadata_fails_before_target_mutation(self):
+        source = sqlite3.connect(":memory:")
+        try:
+            source.execute("CREATE TABLE ordinary (value TEXT)")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                manifest = export_sqlite_tables(source, Path(tmpdir))
+                malformed = json.loads(json.dumps(manifest))
+                malformed["tables"]["sqlite_stat3"] = {
+                    "table": "sqlite_stat3",
+                    "ddl": "CREATE TABLE sqlite_stat3(value)",
+                    "table_ddl": "CREATE TABLE sqlite_stat3(value)",
+                    "pieces": [],
+                    "total_chunks": 0,
+                }
+                malformed["schema_objects"].append(
+                    {
+                        "name": "sqlite_stat3",
+                        "type": "table",
+                        "tbl_name": "sqlite_stat3",
+                        "sql": "CREATE TABLE sqlite_stat3(value)",
+                    }
+                )
+                target = sqlite3.connect(":memory:")
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError, "Unsupported internal SQLite table metadata"
+                    ):
+                        reconstruct_sqlite_tables(malformed, target)
+                    self.assertEqual(
+                        target.execute("SELECT name FROM sqlite_master").fetchall(), []
+                    )
+                finally:
+                    target.close()
+        finally:
+            source.close()
+
+    def test_statistics_xinfo_mismatch_rolls_back_generated_tables(self):
+        source = self._make_stat_source(empty=False)
+        try:
+            if source.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat4'"
+            ).fetchone():
+                source.execute("DROP TABLE sqlite_stat4")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                manifest = export_sqlite_tables(source, Path(tmpdir))
+                malformed = json.loads(json.dumps(manifest))
+                malformed["tables"]["sqlite_stat1"]["column_schema"][0]["name"] = "changed"
+                target = sqlite3.connect(":memory:")
+                try:
+                    with self.assertRaisesRegex(
+                        ValueError, "statistics table xinfo mismatch"
+                    ):
+                        reconstruct_sqlite_tables(malformed, target)
+                    self.assertEqual(
+                        target.execute(
+                            "SELECT name FROM sqlite_master WHERE type IN ('table','index','view','trigger')"
+                        ).fetchall(),
+                        [],
+                    )
+                    self.assertFalse(target.in_transaction)
+                finally:
+                    target.close()
+        finally:
+            source.close()
 
 
 class TestLosslessXlsxDeterminism(unittest.TestCase):

@@ -43,6 +43,8 @@ ROW_IDENTITY_FORMAT = "source_rowid_column_v1"
 _ROWID_ALIASES = ("_rowid_", "rowid", "oid")
 _MIN_ROWID = -(1 << 63)
 _MAX_ROWID = (1 << 63) - 1
+_SQLITE_STAT_TABLES = frozenset({"sqlite_stat1", "sqlite_stat4"})
+_SUPPORTED_INTERNAL_TABLES = frozenset({"sqlite_sequence"}) | _SQLITE_STAT_TABLES
 
 CONTENT_TYPES_XML = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="{NS_CT}">
@@ -627,7 +629,7 @@ def _get_target_tables(source: sqlite3.Connection) -> list[tuple[str, str]]:
         )
     results = []
     for name, sql in tables:
-        if name.startswith("sqlite_") and name != "sqlite_sequence":
+        if name.startswith("sqlite_") and name not in _SUPPORTED_INTERNAL_TABLES:
             raise ValueError(
                 "Internal SQLite table is not supported by lossless XLSX "
                 f"reconstruction; refusing to report a complete export: {name!r}"
@@ -1532,6 +1534,150 @@ def _schema_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def _validate_internal_table_metadata(
+    tables: dict[str, dict[str, Any]],
+    schema_objects: Optional[list[dict[str, Any]]],
+    *,
+    strict_v2: bool,
+) -> set[str]:
+    unsupported_tables = sorted(
+        name
+        for name in tables
+        if isinstance(name, str)
+        and name.startswith("sqlite_")
+        and name not in _SUPPORTED_INTERNAL_TABLES
+    )
+    if unsupported_tables:
+        raise ValueError(
+            "Unsupported internal SQLite table metadata: "
+            f"{unsupported_tables!r}"
+        )
+
+    schema_tables = [
+        item
+        for item in (schema_objects or [])
+        if item["type"] == "table" and item["name"].startswith("sqlite_")
+    ]
+    unsupported_schema_tables = sorted(
+        item["name"]
+        for item in schema_tables
+        if item["name"] not in _SUPPORTED_INTERNAL_TABLES
+    )
+    if unsupported_schema_tables:
+        raise ValueError(
+            "Unsupported internal SQLite schema table metadata: "
+            f"{unsupported_schema_tables!r}"
+        )
+
+    table_stats = {
+        name for name in tables if isinstance(name, str) and name in _SQLITE_STAT_TABLES
+    }
+    schema_stats = {
+        item["name"]: item
+        for item in schema_tables
+        if item["name"] in _SQLITE_STAT_TABLES
+    }
+    if table_stats != set(schema_stats):
+        raise ValueError(
+            "SQLite statistics table coverage mismatch: "
+            f"tables={sorted(table_stats)!r}, schema={sorted(schema_stats)!r}"
+        )
+    if table_stats and not strict_v2:
+        raise ValueError(
+            "SQLite statistics tables require version 2 schema metadata"
+        )
+
+    for table_name in sorted(table_stats):
+        table_info = tables[table_name]
+        schema_item = schema_stats[table_name]
+        if not isinstance(table_info, dict):
+            raise ValueError(
+                f"Invalid SQLite statistics table metadata for {table_name!r}"
+            )
+        ddl = table_info.get("ddl", table_info.get("table_ddl"))
+        if (
+            not isinstance(ddl, str)
+            or not ddl.strip()
+            or schema_item["sql"] != ddl
+            or (table_info.get("ddl") is not None and table_info.get("table_ddl", ddl) != ddl)
+        ):
+            raise ValueError(
+                f"SQLite statistics table DDL metadata mismatch for {table_name!r}"
+            )
+        if not isinstance(table_info.get("column_schema"), list):
+            raise ValueError(
+                f"SQLite statistics table xinfo metadata is missing for {table_name!r}"
+            )
+    return table_stats
+
+
+def _bootstrap_statistics_tables(
+    target_conn: sqlite3.Connection,
+    tables: dict[str, dict[str, Any]],
+    schema_objects: Optional[list[dict[str, Any]]],
+    expected_stats: set[str],
+) -> None:
+    """Generate SQLite-owned statistics schemas, then restore their exact rows."""
+    if not expected_stats:
+        return
+
+    target_conn.execute("ANALYZE")
+    generated_stats = {
+        row[0]
+        for row in target_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sqlite_stat%'"
+        )
+    }
+    missing_stats = expected_stats - generated_stats
+    if missing_stats:
+        raise ValueError(
+            "Target SQLite build cannot recreate required statistics tables: "
+            f"{sorted(missing_stats)!r}"
+        )
+    unsupported_generated = generated_stats - _SQLITE_STAT_TABLES
+    if unsupported_generated:
+        raise ValueError(
+            "Target SQLite generated unsupported statistics tables: "
+            f"{sorted(unsupported_generated)!r}"
+        )
+
+    for table_name in sorted(generated_stats - expected_stats):
+        target_conn.execute(f"DROP TABLE {_quote_identifier(table_name)}")
+
+    schema_stats = {
+        item["name"]: item
+        for item in (schema_objects or [])
+        if item["type"] == "table" and item["name"] in _SQLITE_STAT_TABLES
+    }
+    for table_name in sorted(expected_stats):
+        table_info = tables[table_name]
+        actual = target_conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        expected_ddl = table_info.get("ddl", table_info.get("table_ddl"))
+        if (
+            actual is None
+            or actual[0] != expected_ddl
+            or actual[0] != schema_stats[table_name]["sql"]
+        ):
+            raise ValueError(
+                f"SQLite-generated statistics table DDL mismatch for {table_name!r}"
+            )
+        target_xinfo = _get_table_xinfo(target_conn, table_name)
+        if target_xinfo != table_info["column_schema"]:
+            raise ValueError(
+                f"SQLite-generated statistics table xinfo mismatch for {table_name!r}"
+            )
+        columns = _get_table_columns(target_conn, table_name)
+        saved_columns = table_info.get("columns", table_info.get("column_names"))
+        if columns != saved_columns:
+            raise ValueError(
+                f"SQLite-generated statistics table columns mismatch for {table_name!r}"
+            )
+        target_conn.execute(f"DELETE FROM {_quote_identifier(table_name)}")
+
+
 def reconstruct_sqlite_tables(
     source_dir_or_index: Union[str, Path, dict],
     target_conn: sqlite3.Connection,
@@ -1576,6 +1722,10 @@ def reconstruct_sqlite_tables(
                 or (item["sql"] is not None and not isinstance(item["sql"], str))
             ):
                 raise ValueError(f"Invalid schema object metadata: {item!r}")
+
+    statistics_tables = _validate_internal_table_metadata(
+        tables, schema_objects, strict_v2=strict_v2
+    )
 
     piece_name_seen: set[str] = set()
     for table_name, table_info in tables.items():
@@ -1665,9 +1815,10 @@ def reconstruct_sqlite_tables(
 
     try:
         # Create tables first. sqlite_sequence is materialized automatically by
-        # AUTOINCREMENT tables and its saved rows are restored after user rows.
+        # AUTOINCREMENT tables. SQLite statistics tables are bootstrapped by
+        # ANALYZE below because their schemas are SQLite-owned.
         for table_name, table_info in tables.items():
-            if table_name == "sqlite_sequence":
+            if table_name == "sqlite_sequence" or table_name in _SQLITE_STAT_TABLES:
                 continue
             ddl = table_info.get("ddl", table_info.get("table_ddl"))
             if not isinstance(ddl, str) or not ddl.strip():
@@ -1680,13 +1831,12 @@ def reconstruct_sqlite_tables(
             if saved_xinfo is not None and saved_xinfo != target_xinfo:
                 raise ValueError(f"PRAGMA table_xinfo mismatch for table {table_name!r}")
 
-        # Internal ANALYZE tables are SQLite-owned and cannot be created with
-        # ordinary CREATE TABLE; ANALYZE recreates their schema after loading.
-        if any(
-            item["type"] == "table" and item["name"].startswith("sqlite_stat")
-            for item in (schema_objects or [])
-        ):
-            target_conn.execute("ANALYZE")
+        # SQLite owns the CREATE TABLE statements for statistics tables. Create
+        # their supported schemas, remove any generated tables absent from the
+        # source, and clear generated rows before restoring source bytes.
+        _bootstrap_statistics_tables(
+            target_conn, tables, schema_objects, statistics_tables
+        )
 
         counts: dict[str, int] = {}
         for table_name, table_info in tables.items():
