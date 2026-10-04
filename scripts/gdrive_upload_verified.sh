@@ -9,7 +9,7 @@ fi
 
 REMOTE_ENC_PATH="$1"
 REMOTE_MANIFEST_PATH="$2"
-RCLONE_REMOTE_DIR="${3:-gdrive_origin:イカリング3アーカイブ/backups}"
+RCLONE_REMOTE_DIR="${3:-gdrive_origin:SQuidLite3/backups}"
 NAS_HOST="${IKARING_NAS_HOST:-nas}"
 
 case "$REMOTE_ENC_PATH" in

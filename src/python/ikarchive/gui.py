@@ -487,7 +487,7 @@ def render(store, font_path=None):
 
     return f'''<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>イカリング3のレート</title>
+<title>SQuidLite3 レートの推移</title>
 <style>
 *, *::before, *::after {{ box-sizing: border-box; }}
 {font_face}

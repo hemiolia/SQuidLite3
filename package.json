@@ -1,5 +1,5 @@
 {
-  "name": "ikaring-archive",
+  "name": "squidlite3",
   "version": "0.2.0",
   "private": true,
   "type": "module",
@@ -20,6 +20,6 @@
   "description": "Lossless and audited SplatNet 3 archive with nxapi and SQLite",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hemiolia/ikaring-archive.git"
+    "url": "https://github.com/hemiolia/SQuidLite3.git"
   }
 }

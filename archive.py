@@ -46,7 +46,7 @@ def notify_auth_incident(code):
     stamp.write_text(code+'\n'+now(),encoding='utf8')
     if sys.platform!='darwin':return
     message='イカリング3の取得が認証で止まった。この間の戦績は保存されていない。ログインが必要。コード: '+code
-    subprocess.run(['osascript','-e','display notification '+json.dumps(message)+' with title "イカリング3アーカイブ"'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    subprocess.run(['osascript','-e','display notification '+json.dumps(message)+' with title "SQuidLite3"'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
 def apply_tag(store,args):
     if args.tag_action!='list':

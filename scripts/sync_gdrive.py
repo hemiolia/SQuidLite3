@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Google Drive (マイドライブ/イカリング3アーカイブ) とローカルのイカリング3アーカイブを双方向同期するスクリプト。
+Google Drive (マイドライブ/SQuidLite3) とローカルのイカリング3アーカイブを双方向同期するスクリプト。
 database/、secrets/、認証データ、rclone設定(rclone.conf/rclone-*.conf)、SQLite、暗号化ファイル、runtime、spool、.history、.git、backups等は除外されます。
 旧部分ブックの ``exports/分析.xlsx`` と ``exports/analysis.xlsx`` も、その正確な相対パスだけ除外されます。
 """
@@ -22,7 +22,7 @@ else:
     from sync_baseline import load_baseline, merged_baseline, save_baseline, sync_lock
     from data_root import client_mode, data_root
 
-DEFAULT_GDRIVE = Path.home() / 'Library/CloudStorage/GoogleDrive-originnatsumikanf@gmail.com/マイドライブ/イカリング3アーカイブ'
+DEFAULT_GDRIVE = Path.home() / 'Library/CloudStorage/GoogleDrive-originnatsumikanf@gmail.com/マイドライブ/SQuidLite3'
 
 IGNORE_PATTERNS = {'.DS_Store', '._.DS_Store'}
 IGNORE_SUFFIXES = {'.tmp', '.lock', '-wal', '-shm'}
