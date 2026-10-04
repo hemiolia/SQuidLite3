@@ -1,34 +1,25 @@
-# Google Drive 専用の認証 ID を作る（前田さんの操作）
+# 前田さん個人の Google Drive 連携の認証 ID（版 2・2026-10-05）
 
-## なぜ要るか
+この手順は、前田さんの NAS から前田さんの Google Drive へ記録を送る設定のためだけのもの。SQuidLite3 のほかの利用者は、Google の API 登録を一切しない（保存先にパソコンの Google ドライブ同期フォルダを選ぶだけで済む形にする。`docs/design/SQuidLite3_製品形態.md`）。
 
-NAS から Google Drive へ記録を送る仕組み（rclone）は、いま rclone が全利用者で共用している Google の認証 ID を使っている。rclone の案内によると、この共用 ID は 2026 年中に使えなくなる。使えなくなると、Drive への配信とバックアップがどちらも止まる。前田さん専用の ID を作れば止まらない。
+版 1 には誤りがあった（隠しフォルダを保存先に指定した。現在の Google の画面で確かめずに手順 5 以降を書いた）。版 1 と前田さんの書き込みは `.history/opus-20261005/google-drive-client-id.v1-with-maeda-note.md`、原文は開発ログにある。
 
-所要時間はおよそ 10 分。Google アカウントは、Drive のアカウント（originnatsumikanf@gmail.com）でも別のアカウントでもよい。
+## もう済んでいること
 
-## 手順
+- Google Cloud のプロジェクト作成、Google Drive API の有効化、OAuth クライアント（デスクトップ アプリ）の作成。クライアント ID とシークレットは `~/Developer/ikaring-archive/config/Google Drive API Keys` に保存済み（公開リポジトリの作業フォルダ内なので、Git に入らない設定を入れた）。
 
-1. ブラウザで Google API Console（https://console.developers.google.com/ ）を開く。
-2. 画面上部のプロジェクト選択から「新しいプロジェクト」を作る。名前は `SQuidLite3` などでよい。
-3. 「API とサービスを有効にする」で `Google Drive API` を検索し、「有効にする」を押す。
-4. 左の一覧の「認証情報」を開く（「認証情報を作成」の案内ではなく、左の一覧の項目）。
-5. 「同意画面を構成」を押し、次を入れて保存する。
-   - アプリ名: `SQuidLite3`
-   - サポートのメール: 自分のメールアドレス
-   - 対象: 「外部」
-   - スコープ: `https://www.googleapis.com/auth/drive` と `https://www.googleapis.com/auth/drive.metadata.readonly` と `https://www.googleapis.com/auth/docs`
-   - テストユーザー: Drive のアカウント（originnatsumikanf@gmail.com）
-6. 「OAuth クライアントを作成」を押し、種類は「デスクトップ アプリ」を選ぶ。表示される「クライアント ID」と「クライアント シークレット」を控える。
-7. 同意画面の公開状態を「アプリを公開」で本番にする。**テスト中のままだと認証が 1 週間で切れる。** 本番にすると、最初の認証のときに「確認されていないアプリ」という警告が出るが、自分で作ったアプリなので問題ない。個人用（100 人未満）は Google の審査は要らない。
+## なぜまだ使えないか
 
-## 終わったら
+いまのクライアントは「テスト中」なので、認証が 7 日で切れる。「本番」にするには、Google の決まりで、ホームページ・プライバシーポリシー・利用規約のリンクと、承認済みドメインが要る（Google 公式: 外部向けの本番アプリにはこれらのリンクが必須）。そのページを sql3.ink に置く（文案は `site/`、私が用意済み）。
 
-クライアント ID とクライアント シークレットを、チャットに貼らずに、Mac の次のファイルへ 2 行で保存して知らせてほしい（1 行目が ID、2 行目がシークレット）。
+## 残りの手順
 
-```
-~/Library/Application Support/ikaring-archive/client/config/google-drive-client.txt
-```
-
-そのあと、NAS の rclone 設定（配信用とバックアップ用）にこの ID を入れ、ブラウザでの認証を一度だけお願いする。認証の手順はそのときに案内する。
-
-出典: rclone 公式「Making your own client_id」https://rclone.org/drive/#making-your-own-client-id （2026-10-05 参照）
+1. 私が sql3.ink にページを公開する。前田さんにお願いするのは、運営者名と問い合わせ先を決めることと、Mac で一度だけ `npx wrangler login` を実行して Cloudflare にログインすることだけ。
+2. 公開できたら、Google Cloud の「Google Auth Platform」の「ブランディング」で、次を入れる。画面の項目名が違っていたら、その画面を見せてもらえれば、その場で合わせる。
+   - 承認済みドメイン: `sql3.ink`（先に入れる。Google の案内でも、リンクより先に入れることになっている）
+   - アプリケーションのホームページ: `https://sql3.ink/`
+   - プライバシーポリシーのリンク: `https://sql3.ink/privacy.html`
+   - 利用規約のリンク: `https://sql3.ink/terms.html`
+3. ドメインの所有確認を求められたら、Google Search Console で sql3.ink を確認する。sql3.ink は Cloudflare で管理しているので、Search Console の案内に従えば Cloudflare 経由で自動で済むことが多い。
+4. 「対象」で「アプリを公開」を押して本番にする。
+5. 最後に、NAS の rclone 設定にこのクライアントを入れ、ブラウザで一度だけ認証する。手順はそのときに案内する。
