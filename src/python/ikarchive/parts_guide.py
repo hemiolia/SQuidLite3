@@ -34,8 +34,8 @@ RECIPES: list[tuple[str, str, str]] = [
     ),
     (
         "あるモード・ルールの全試合の全プレイヤーのブキや成績を見たい",
-        "matches/<analysis_set>/<rule_raw>/ の下の月ごとの部品を開き、battle_players ビューを読む。"
-        "複数月は ATTACH して UNION ALL する。どの月の部品があるかは files 表の analysis_set・rule_raw・month で引く。",
+        "matches/<analysis_set>/<rule_raw>/ の下の日ごとの部品を開き、battle_players ビューを読む。"
+        "複数日は ATTACH して UNION ALL する。どの日の部品があるかは files 表の analysis_set・rule_raw・month・day で引く。",
         "SELECT match_key, team_index, is_my_team, name, weapon, paint, kills, assists, deaths, specials "
         "FROM battle_players ORDER BY match_key, team_index, player_index",
     ),
@@ -67,8 +67,8 @@ RECIPES: list[tuple[str, str, str]] = [
     ),
     (
         "試合以外の取得記録（ランキング、ステージ情報、ブキ記録、ヒーローモード など）を見たい",
-        "応答の種類（operation）ごとに responses/<operation>/ の下にある。どの種類があるかは files 表の operation、"
-        "個々の応答の住所は response_index。entities 表に応答から取り出した型と ID ごとの記録がある。",
+        "応答の種類（operation）ごとに responses/<operation>/ の下にある（日ごとの部品。ランキング系の種類は 1 応答 1 部品）。"
+        "どの種類があるかは files 表の operation、個々の応答の住所は response_index。entities 表に応答から取り出した型と ID ごとの記録がある。",
         "SELECT operation, count(*) FROM response_index GROUP BY operation ORDER BY 2 DESC",
     ),
     (
@@ -105,7 +105,14 @@ def _rows(catalog: sqlite3.Connection, sql: str) -> list[tuple]:
 
 def render_readme(catalog: sqlite3.Connection) -> str:
     """目録の内容から README_FOR_AI.md の本文を作る。"""
-    status = dict(_rows(catalog, "SELECT key, value FROM status"))
+    status_row = _rows(
+        catalog,
+        "SELECT through_event_id, built_at, published_at, last_audit_at, last_audit_result, rule_version FROM status",
+    )
+    status = {}
+    if status_row:
+        names = ("through_event_id", "built_at", "published_at", "last_audit_at", "last_audit_result", "rule_version")
+        status = {k: v for k, v in zip(names, status_row[0]) if v is not None}
     labels = _rows(catalog, "SELECT kind, code, ja FROM labels ORDER BY kind, code")
     homes = _rows(catalog, "SELECT table_name, rule_ja, path_pattern FROM table_homes ORDER BY table_name")
     sets = _rows(
@@ -128,14 +135,15 @@ def render_readme(catalog: sqlite3.Connection) -> str:
     add("")
     add("## 置き場所の規則（どの行も、この規則でただ一つの部品に決まる）")
     add("")
-    add("- `matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3`: 試合ごとのデータ。モード（分析セット）とルールと、試合日時（日本時間）の年月で分かれる。")
-    add("- `responses/<operation>/<期間>.sqlite3`: 試合に属さない取得記録。応答の種類ごと。")
+    add("- `matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`: 試合ごとのデータ。モード（分析セット）とルールと、試合日時（日本時間）の年月日で分かれる。")
+    add("- `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`: 試合に属さない取得記録。応答の種類ごと、取得日時（日本時間）の日ごと。"
+        "ランキング系の種類だけは 1 応答 1 部品で `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<response_id>.sqlite3`。")
     add("- `images/<SHA-256 の先頭2桁>.sqlite3`: 画像。")
     add("- `system/`: 取得キュー・収集の各回・監査・設定などの運用記録。`system/archive_change_feed/` は変更の記録。")
     add("- `unplaced/`: 上の規則で決まらなかった行（参照先の無い行など）。捨てずにここに置く。")
     add("- `xlsx/`: 上と同じ階層の xlsx 版。")
     add("")
-    add("値が無いときの名前: 分類なし `unclassified`、ルールなし `no-rule`、試合日時不明 `unknown-month`。"
+    add("値が無いときの名前: 分類なし `unclassified`、ルールなし `no-rule`、日時不明 `unknown-date`（試合は `matches/<analysis_set>/<rule_raw>/unknown-date.sqlite3`、応答は `responses/<operation>/unknown-date.sqlite3`、ランキング系は `responses/<operation>/unknown-date/<response_id>.sqlite3`）。"
         "英数字・`_`・`-` 以外の文字は `~` と16進2桁で書く。")
     add("")
     add("どの部品も正本と同じ表・索引・ビューを持つ。部品を一つ開けば、正本と同じ SQL（`battle_players` や `analysis_xmatch` などのビュー）がその範囲でそのまま動く。"

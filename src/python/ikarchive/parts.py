@@ -1,4 +1,4 @@
-"""SQuidLite3 データ配置（設計 0.2）の部品作成と監査。
+"""SQuidLite3 データ配置（設計 0.3）の部品作成と監査。
 
 正本の SQLite を読み取り専用で開き、同じ静止点から「本籍」ごとの小さな SQLite 部品
 （正本と同じ全表・全索引・全ビュー）と目録 catalog.sqlite3 を作る。
@@ -19,13 +19,36 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-HOME_RULE_VERSION = 1
+HOME_RULE_VERSION = 2
 CHANGE_TABLE = "archive_change_feed"
 PART_SUFFIX = ".sqlite3"
 CATALOG_NAME = "catalog.sqlite3"
 TMP_DIR_NAME = ".tmp-parts"
 
 _JST = timezone(timedelta(hours=9))
+
+# 1 応答 1 部品にする operation の固定一覧（設計書「ランキング系の operation」。ここ一か所だけで定義する）。
+# この一覧を変えたら HOME_RULE_VERSION を上げ、全部品を作り直す。
+RANKING_OPERATIONS = (
+    "EventMatchRankingPeriodQuery",
+    "EventMatchRankingSeasonPaginationQuery",
+    "EventMatchRankingQuery",
+    "RankingHoldersFestTeamRankingHoldersPaginationQuery",
+    "WeaponRankingDetail_Ranking_RefetchQuery",
+    "WeaponRankingDetailQuery",
+    "XRankingDetailQuery",
+    "XRankingRefetchQuery",
+    "DetailRankingQuery",
+    "DetailTabViewWeaponTopsArRefetchQuery",
+    "DetailTabViewWeaponTopsClRefetchQuery",
+    "DetailTabViewWeaponTopsGlRefetchQuery",
+    "DetailTabViewWeaponTopsLfRefetchQuery",
+    "DetailTabViewXRankingArRefetchQuery",
+    "DetailTabViewXRankingClRefetchQuery",
+    "DetailTabViewXRankingGlRefetchQuery",
+    "DetailTabViewXRankingLfRefetchQuery",
+)
+UNKNOWN_DATE = "unknown-date"
 
 SYSTEM_TABLES = (
     "runs",
@@ -39,24 +62,24 @@ SYSTEM_TABLES = (
 _BY_MATCH_TABLES = ("match_classification", "match_refs", "sightings", "documents")
 _BY_RESPONSE_TABLES = ("response_fetches", "asset_refs", "entities")
 
-# 目録 table_homes の内容（設計書「本籍規則（版 1）」の表）
+# 目録 table_homes の内容（設計書「本籍規則」の表。規則の版は HOME_RULE_VERSION）
 TABLE_HOMES = (
-    ("matches", "その試合の本籍", "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3"),
-    ("match_classification", "その試合の本籍", "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3"),
+    ("matches", "その試合の本籍", "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
+    ("match_classification", "その試合の本籍", "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
     ("match_refs", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3"),
+     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
     ("sightings", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3"),
+     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
     ("documents", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3"),
+     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
     ("match_tags", "(account, match_key) が一致する試合の本籍（vs 優先）。無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3"),
+     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
     ("rate_points", "match_key が fetch: で始まらなければその試合の本籍、fetch:<event_id> なら response_fetches.event_id の応答の本籍",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3 または responses/<operation>/<期間>.sqlite3"),
+     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3 または responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3（ランキング系は .../<YYYY-MM-DD>/<response_id>.sqlite3）"),
     ("jobs", "kind と match_key があればその試合の本籍。試合行が無い・無ければ system/jobs",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>.sqlite3 または system/jobs.sqlite3"),
-    ("responses", "応答の本籍（documents のある試合の本籍、無ければ operation と期間）",
-     "matches/... または responses/<operation>/<期間>.sqlite3"),
+     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3 または system/jobs.sqlite3"),
+    ("responses", "応答の本籍（documents のある試合の本籍、無ければ operation と fetched_at の日付。ランキング系の operation は 1 応答 1 部品）",
+     "matches/... または responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3（ランキング系は .../<YYYY-MM-DD>/<response_id>.sqlite3）"),
     ("response_fetches", "response_id の応答の本籍", "応答の本籍と同じ"),
     ("asset_refs", "response_id の応答の本籍", "応答の本籍と同じ"),
     ("entities", "response_id の応答の本籍", "応答の本籍と同じ"),
@@ -144,9 +167,17 @@ def jst_month(played_time: Any) -> str:
     return f"{parsed.year:04d}-{parsed.month:02d}"
 
 
+def jst_day_path(value: Any) -> str:
+    """ISO 8601 を Asia/Tokyo の `YYYY-MM/YYYY-MM-DD` にする。解析できなければ unknown-date（観測日時などで埋めない）。"""
+    parsed = _parse_iso_jst(value)
+    if parsed is None:
+        return UNKNOWN_DATE
+    return f"{parsed.year:04d}-{parsed.month:02d}/{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+
+
 def response_period(operation: str, fetched_at: str) -> str:
-    """応答の期間。当面は fetched_at を JST にした YYYY-MM。粒度を変えるときはこの関数だけを直す。"""
-    return jst_month(fetched_at)
+    """応答の日付区間。fetched_at の JST の `YYYY-MM/YYYY-MM-DD`、解析できなければ unknown-date。"""
+    return jst_day_path(fetched_at)
 
 
 def _feed_part_path(changed_at: Any) -> str:
@@ -165,8 +196,8 @@ def _sql_enc(value: Any) -> str:
     return encode_segment(value)
 
 
-def _sql_jst_month(value: Any) -> str:
-    return jst_month(value)
+def _sql_jst_day(value: Any) -> str:
+    return jst_day_path(value)
 
 
 def _sql_response_period(operation: Any, fetched_at: Any) -> str:
@@ -247,7 +278,7 @@ def _ro_uri(path: Path) -> str:
 
 def _register_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("enc", 1, _sql_enc, deterministic=True)
-    conn.create_function("jst_month", 1, _sql_jst_month, deterministic=True)
+    conn.create_function("jst_day", 1, _sql_jst_day, deterministic=True)
     conn.create_function("resp_period", 2, _sql_response_period, deterministic=True)
     conn.create_function("feed_part", 1, _sql_feed_part, deterministic=True)
 
@@ -307,23 +338,34 @@ class _Schema:
 # 本籍の SQL
 # ---------------------------------------------------------------------------
 
-def _hm_select(table: str) -> str:
-    """表の全行について (rid, part, role) を返す SELECT。match_home 等は作成済みであること。"""
+def _base(table: str, alias: str, restrict: bool) -> str:
+    """行の取り出し元。restrict なら cand_<表>（候補 rowid）から rowid で引く（全走査しない）。"""
     qt = f"src.{_q(table)}"
+    if restrict:
+        return f"{_q('cand_' + table)} c CROSS JOIN {qt} {alias} ON {alias}.rowid=c.rid"
+    return f"{qt} {alias}"
+
+
+def _hm_select(table: str, restrict: bool = False) -> str:
+    """表の行について (rid, part, role) を返す SELECT。match_home 等は作成済みであること。
+
+    restrict=True のときは cand_<表> に入れた rowid の行だけを、rowid の検索で引く。
+    """
     unplaced = _lit(f"unplaced/{encode_segment(table)}{PART_SUFFIX}")
     system = _lit(f"system/{encode_segment(table)}{PART_SUFFIX}")
     key_join = "mh.account=x.account AND mh.kind=x.kind AND mh.match_key=x.match_key"
+    base = _base(table, "x", restrict)
     if table == "matches":
-        return f"SELECT x.rowid, mh.part, 'home' FROM {qt} x JOIN match_home mh ON {key_join}"
+        return f"SELECT x.rowid, mh.part, 'home' FROM {base} JOIN match_home mh ON {key_join}"
     if table in _BY_MATCH_TABLES:
         return (
-            f"SELECT x.rowid, COALESCE(mh.part,{unplaced}), 'home' FROM {qt} x "
+            f"SELECT x.rowid, COALESCE(mh.part,{unplaced}), 'home' FROM {base} "
             f"LEFT JOIN match_home mh ON {key_join}"
         )
     if table == "match_tags":
         return (
             f"SELECT x.rowid, COALESCE((SELECT k.part FROM mk_home k WHERE k.account=x.account "
-            f"AND k.match_key=x.match_key),{unplaced}), 'home' FROM {qt} x"
+            f"AND k.match_key=x.match_key),{unplaced}), 'home' FROM {base}"
         )
     if table == "rate_points":
         return (
@@ -331,47 +373,54 @@ def _hm_select(table: str) -> str:
             "(SELECT rh.part FROM src.response_fetches f JOIN response_home rh ON rh.response_id=f.response_id "
             "WHERE f.event_id=substr(x.match_key,7)) "
             "ELSE (SELECT k.part FROM mk_home k WHERE k.account=x.account AND k.match_key=x.match_key) END,"
-            f"{unplaced}), 'home' FROM {qt} x"
+            f"{unplaced}), 'home' FROM {base}"
         )
     if table == "jobs":
         return (
             "SELECT x.rowid, COALESCE(CASE WHEN x.kind IS NOT NULL AND x.match_key IS NOT NULL THEN "
             "(SELECT mh.part FROM match_home mh WHERE mh.account=x.account AND mh.kind=x.kind "
-            f"AND mh.match_key=x.match_key) END,{system}), 'home' FROM {qt} x"
+            f"AND mh.match_key=x.match_key) END,{system}), 'home' FROM {base}"
         )
     if table == "responses":
-        return f"SELECT x.rowid, rh.part, 'home' FROM {qt} x JOIN response_home rh ON rh.response_id=x.id"
+        return f"SELECT x.rowid, rh.part, 'home' FROM {base} JOIN response_home rh ON rh.response_id=x.id"
     if table in _BY_RESPONSE_TABLES:
         return (
             f"SELECT x.rowid, COALESCE((SELECT rh.part FROM response_home rh WHERE rh.response_id=x.response_id),"
-            f"{unplaced}), 'home' FROM {qt} x"
+            f"{unplaced}), 'home' FROM {base}"
         )
     if table == "issues":
         return (
             f"SELECT x.rowid, CASE WHEN x.response_id IS NULL THEN {system} ELSE "
             f"COALESCE((SELECT rh.part FROM response_home rh WHERE rh.response_id=x.response_id),{unplaced}) END, "
-            f"'home' FROM {qt} x"
+            f"'home' FROM {base}"
         )
     if table == "assets":
         return (
             "SELECT x.rowid, CASE WHEN x.body_sha256 IS NULL OR x.body_sha256='' THEN "
             f"{_lit('images/no-body' + PART_SUFFIX)} ELSE "
             "'images/'||enc(CAST(substr(x.body_sha256,1,2) AS BLOB))||'.sqlite3' END, 'home' "
-            f"FROM {qt} x"
+            f"FROM {base}"
         )
     if table == "bodies":
-        return (
-            f"SELECT b.rowid, h.part, h.role FROM {qt} b JOIN body_homes h ON h.sha=b.sha256"
-        )
+        base_b = _base(table, "b", restrict)
+        return f"SELECT b.rowid, h.part, h.role FROM {base_b} JOIN body_homes h ON h.sha=b.sha256"
     if table in SYSTEM_TABLES:
-        return f"SELECT x.rowid, {system}, 'home' FROM {qt} x"
+        return f"SELECT x.rowid, {system}, 'home' FROM {base}"
     if table == CHANGE_TABLE:
-        return f"SELECT x.rowid, feed_part(CAST(x.changed_at AS BLOB)), 'home' FROM {qt} x"
-    return f"SELECT x.rowid, {unplaced}, 'home' FROM {qt} x"
+        return f"SELECT x.rowid, feed_part(CAST(x.changed_at AS BLOB)), 'home' FROM {base}"
+    return f"SELECT x.rowid, {unplaced}, 'home' FROM {base}"
 
 
-def _create_home_tables(conn: sqlite3.Connection, has_bodies: bool, has_responses: bool,
-                        has_assets: bool, tables: dict[str, Any]) -> None:
+# 同じ (account, match_key) に vs と他の kind があるとき vs を優先する mk_home の作り方
+_MK_SQL = (
+    "SELECT account,match_key,part FROM (SELECT account,match_key,part,"
+    "ROW_NUMBER() OVER (PARTITION BY account,match_key ORDER BY (kind<>'vs'),kind) rn FROM {src}) "
+    "WHERE rn=1"
+)
+
+
+def _create_home_tables(conn: sqlite3.Connection, tables: dict[str, Any]) -> None:
+    """試合の本籍・応答の本籍・(account, match_key) の本籍を全件計算する（毎周期。試合は約千行、応答は約八千行）。"""
     conn.execute("CREATE TABLE match_home(account,kind,match_key,part,PRIMARY KEY(account,kind,match_key))")
     conn.execute("CREATE TABLE response_home(response_id INTEGER PRIMARY KEY,part)")
     conn.execute("CREATE TABLE mk_home(account,match_key,part,PRIMARY KEY(account,match_key))")
@@ -389,19 +438,14 @@ def _create_home_tables(conn: sqlite3.Connection, has_bodies: bool, has_response
         )
         set_expr = _seg("c.analysis_set", "unclassified") if has_class else enc_default("unclassified")
         rule_expr = _seg("c.rule_raw", "no-rule") if has_class else enc_default("no-rule")
-        month_expr = f"jst_month(CAST({played} AS BLOB))" if has_docs else "'unknown-month'"
+        day_expr = f"jst_day(CAST({played} AS BLOB))" if has_docs else _lit(UNKNOWN_DATE)
         conn.execute(
             "INSERT INTO match_home(account,kind,match_key,part) "
-            f"SELECT m.account,m.kind,m.match_key,'matches/'||{set_expr}||'/'||{rule_expr}||'/'||{month_expr}||'.sqlite3' "
+            f"SELECT m.account,m.kind,m.match_key,'matches/'||{set_expr}||'/'||{rule_expr}||'/'||{day_expr}||'.sqlite3' "
             f"FROM src.matches m {class_join} {doc_join}"
         )
-        conn.execute(
-            "INSERT INTO mk_home(account,match_key,part) "
-            "SELECT account,match_key,part FROM (SELECT account,match_key,part,"
-            "ROW_NUMBER() OVER (PARTITION BY account,match_key ORDER BY (kind<>'vs'),kind) rn FROM match_home) "
-            "WHERE rn=1"
-        )
-    if has_responses:
+        conn.execute("INSERT INTO mk_home(account,match_key,part) " + _MK_SQL.format(src="match_home"))
+    if "responses" in tables:
         if "documents" in tables and "matches" in tables:
             doc_part = (
                 "(SELECT mh.part FROM src.documents d JOIN match_home mh ON mh.account=d.account "
@@ -411,40 +455,55 @@ def _create_home_tables(conn: sqlite3.Connection, has_bodies: bool, has_response
         else:
             doc_part = "NULL"
         op_seg = _seg("r.operation", "no-operation")
+        period = "resp_period(CAST(r.operation AS BLOB),CAST(r.fetched_at AS BLOB))"
+        ranking = ",".join(_lit(op) for op in RANKING_OPERATIONS)
+        own_part = (
+            f"CASE WHEN r.operation IN ({ranking}) THEN 'responses/'||{op_seg}||'/'||{period}||'/'||r.id||'.sqlite3' "
+            f"ELSE 'responses/'||{op_seg}||'/'||{period}||'.sqlite3' END"
+        )
         conn.execute(
             "INSERT INTO response_home(response_id,part) "
-            f"SELECT r.id, COALESCE({doc_part}, 'responses/'||{op_seg}||'/'||"
-            "resp_period(CAST(r.operation AS BLOB),CAST(r.fetched_at AS BLOB))||'.sqlite3') "
-            "FROM src.responses r"
+            f"SELECT r.id, COALESCE({doc_part}, {own_part}) FROM src.responses r"
         )
-    if has_bodies:
-        conn.execute("CREATE TABLE body_homes(sha,part,role)")
-        conn.execute("CREATE TEMP TABLE bh_img(sha PRIMARY KEY,part)")
-        if has_assets:
-            conn.execute(
-                "INSERT OR IGNORE INTO bh_img SELECT body_sha256,"
-                "'images/'||enc(CAST(substr(body_sha256,1,2) AS BLOB))||'.sqlite3' FROM src.assets "
-                "WHERE body_sha256 IS NOT NULL AND body_sha256<>''"
-            )
-        conn.execute("CREATE TEMP TABLE bh_resp(sha,part,min_id,overall_min)")
-        if has_responses:
-            conn.execute(
-                "INSERT INTO bh_resp SELECT sha,part,min_id,MIN(min_id) OVER (PARTITION BY sha) FROM ("
-                "SELECT r.body_sha256 sha, rh.part part, MIN(r.id) min_id FROM src.responses r "
-                "JOIN response_home rh ON rh.response_id=r.id GROUP BY r.body_sha256, rh.part)"
-            )
-        conn.execute("INSERT INTO body_homes SELECT sha,part,'home' FROM bh_img")
+
+
+def _create_body_homes(conn: sqlite3.Connection, tables: dict[str, Any], restrict: bool) -> None:
+    """bodies の本籍（画像は images、応答の本文は参照する各応答の本籍へ写し）。
+
+    restrict=True のときは cand_sha に入れた本文だけを作る（差分周期）。
+    """
+    has_responses = "responses" in tables
+    has_assets = "assets" in tables
+    conn.execute("CREATE TABLE body_homes(sha,part,role)")
+    conn.execute("CREATE TEMP TABLE bh_img(sha PRIMARY KEY,part)")
+    only_a = "AND body_sha256 IN (SELECT sha FROM cand_sha)" if restrict else ""
+    only_r = "WHERE r.body_sha256 IN (SELECT sha FROM cand_sha)" if restrict else ""
+    only_b = "AND b.sha256 IN (SELECT sha FROM cand_sha)" if restrict else ""
+    if has_assets:
         conn.execute(
-            "INSERT INTO body_homes SELECT sha,part,"
-            "CASE WHEN min_id=overall_min AND sha NOT IN (SELECT sha FROM bh_img) THEN 'home' ELSE 'copy' END "
-            "FROM bh_resp"
+            "INSERT OR IGNORE INTO bh_img SELECT body_sha256,"
+            "'images/'||enc(CAST(substr(body_sha256,1,2) AS BLOB))||'.sqlite3' FROM src.assets "
+            f"WHERE body_sha256 IS NOT NULL AND body_sha256<>'' {only_a}"
         )
+    conn.execute("CREATE TEMP TABLE bh_resp(sha,part,min_id,overall_min)")
+    if has_responses:
         conn.execute(
-            "INSERT INTO body_homes SELECT b.sha256,"
-            f"{_lit('unplaced/' + encode_segment('bodies') + PART_SUFFIX)},'home' FROM src.bodies b "
-            "WHERE b.sha256 NOT IN (SELECT sha FROM bh_img) AND b.sha256 NOT IN (SELECT sha FROM bh_resp)"
+            "INSERT INTO bh_resp SELECT sha,part,min_id,MIN(min_id) OVER (PARTITION BY sha) FROM ("
+            "SELECT r.body_sha256 sha, rh.part part, MIN(r.id) min_id FROM src.responses r "
+            f"JOIN response_home rh ON rh.response_id=r.id {only_r} GROUP BY r.body_sha256, rh.part)"
         )
-        conn.execute("CREATE INDEX body_homes_sha ON body_homes(sha)")
+    conn.execute("INSERT INTO body_homes SELECT sha,part,'home' FROM bh_img")
+    conn.execute(
+        "INSERT INTO body_homes SELECT sha,part,"
+        "CASE WHEN min_id=overall_min AND sha NOT IN (SELECT sha FROM bh_img) THEN 'home' ELSE 'copy' END "
+        "FROM bh_resp"
+    )
+    conn.execute(
+        "INSERT INTO body_homes SELECT b.sha256,"
+        f"{_lit('unplaced/' + encode_segment('bodies') + PART_SUFFIX)},'home' FROM src.bodies b "
+        f"WHERE b.sha256 NOT IN (SELECT sha FROM bh_img) AND b.sha256 NOT IN (SELECT sha FROM bh_resp) {only_b}"
+    )
+    conn.execute("CREATE INDEX body_homes_sha ON body_homes(sha)")
 
 
 def enc_default(text: str) -> str:
@@ -524,12 +583,220 @@ _STATE_DDL = (
     "CREATE TABLE IF NOT EXISTS state.meta(key TEXT PRIMARY KEY,value TEXT)",
     "CREATE TABLE IF NOT EXISTS state.part_files(path TEXT PRIMARY KEY,bytes INTEGER,sha256 TEXT,"
     "built_at TEXT,through_event_id INTEGER)",
+    # worker が Drive への送信と照合を確認した部品（部品の SHA-256 が part_files と同じなら送信済み）
+    "CREATE TABLE IF NOT EXISTS state.published(path TEXT PRIMARY KEY,sha256 TEXT,bytes INTEGER,published_at TEXT)",
 )
 
 
 def _meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
     row = conn.execute("SELECT value FROM state.meta WHERE key=?", (key,)).fetchone()
     return None if row is None else row[0]
+
+
+class _PlanConn(sqlite3.Connection):
+    """scan_log を設定すると、実行する各 SQL のバイトコード（EXPLAIN）を調べ、正本（src）の表・索引を
+    条件なしで頭から読む（Rewind/Last）ものを scan_log に (表名, SQL の先頭) で溜める（検査用）。
+
+    EXPLAIN QUERY PLAN の SCAN は別名の表を別名でしか示さないので、バイトコードで表を特定する。
+    """
+
+    scan_log: Optional[list] = None
+    _VERBS = {"SELECT", "INSERT", "DELETE", "UPDATE", "WITH", "REPLACE"}
+    _src_info: Optional[tuple] = None
+
+    def _src(self) -> tuple:
+        if self._src_info is None:
+            index = next(r[0] for r in super().execute("PRAGMA database_list") if r[1] == "src")
+            roots = {r[0]: r[1] for r in super().execute("SELECT rootpage,tbl_name FROM src.sqlite_master")}
+            self._src_info = (index, roots)
+        return self._src_info
+
+    def execute(self, sql, parameters=()):  # type: ignore[override]
+        log = self.scan_log
+        if log is not None:
+            words = sql.lstrip().split(None, 1)
+            if words and words[0].upper() in self._VERBS and self._attached():
+                index, roots = self._src()
+                cursors: dict[int, tuple] = {}
+                for _addr, opcode, p1, p2, p3, *_rest in super().execute("EXPLAIN " + sql, parameters):
+                    if opcode in ("OpenRead", "OpenWrite"):
+                        cursors[p1] = (p3, p2)
+                    elif opcode in ("Rewind", "Last") and cursors.get(p1, (None, None))[0] == index:
+                        table = roots.get(cursors[p1][1])
+                        if table is not None:
+                            log.append((table, " ".join(sql.split())[:120]))
+        return super().execute(sql, parameters)
+
+    def _attached(self) -> bool:
+        return any(r[1] == "src" for r in super().execute("PRAGMA database_list"))
+
+
+def _plan_delta(conn: sqlite3.Connection, tables: dict[str, Any], prev: int) -> None:
+    """差分周期の作り直す部品と、行ごとの本籍の再計算（設計書「毎周期の計算量」）。
+
+    全表を走査しない。行の本籍を計算し直すのは次の行だけ（cand_<表>）。
+      (b) 変更追跡（event_id > 前回 through）に現れた行（new_rowid の現在の行と old_rowid）。
+      (a) 本籍が変わった試合・応答に属する行。索引のある表は索引で引く（matches・match_classification・
+          match_tags は主キー、response_fetches・asset_refs・entities は response_id の索引）。
+          索引の無い表（documents・sightings・match_refs・jobs・rate_points・issues）は、状態 DB の
+          row_homes で「前回その試合・応答の旧本籍にあった行」と「unplaced・system/jobs・system/issues にある行」を
+          rowid で引いて再計算する。どれも作り直す部品に入る行なので、部品の大きさ以上の読みは生じない。
+    旧本籍と新本籍の差（row_homes との差）から作り直す部品を決める。
+    """
+    names = list(tables)
+    conn.execute("CREATE TABLE feed_ev(table_name TEXT, old_rid INTEGER, new_rid INTEGER)")
+    conn.execute(
+        "INSERT INTO feed_ev SELECT table_name,old_rowid,new_rowid "
+        f"FROM src.{_q(CHANGE_TABLE)} WHERE event_id>?", (prev,)
+    )
+    conn.execute("CREATE INDEX feed_ev_t ON feed_ev(table_name)")
+
+    # 本籍が変わった試合・応答・(account, match_key)（新規・削除・移動）
+    conn.execute("CREATE TABLE chg_match(account,kind,match_key,old_part,new_part)")
+    conn.execute(
+        "INSERT INTO chg_match SELECT h.account,h.kind,h.match_key,p.part,h.part FROM main.match_home h "
+        "LEFT JOIN state.match_home_prev p ON p.account=h.account AND p.kind=h.kind AND p.match_key=h.match_key "
+        "WHERE p.part IS NOT h.part"
+    )
+    conn.execute(
+        "INSERT INTO chg_match SELECT p.account,p.kind,p.match_key,p.part,NULL FROM state.match_home_prev p "
+        "LEFT JOIN main.match_home h ON h.account=p.account AND h.kind=p.kind AND h.match_key=p.match_key "
+        "WHERE h.part IS NULL"
+    )
+    conn.execute("CREATE TABLE mk_home_prev(account,match_key,part,PRIMARY KEY(account,match_key))")
+    conn.execute("INSERT INTO mk_home_prev " + _MK_SQL.format(src="state.match_home_prev"))
+    conn.execute("CREATE TABLE chg_mk(account,match_key,old_part,new_part)")
+    conn.execute(
+        "INSERT INTO chg_mk SELECT h.account,h.match_key,p.part,h.part FROM main.mk_home h "
+        "LEFT JOIN mk_home_prev p ON p.account=h.account AND p.match_key=h.match_key WHERE p.part IS NOT h.part"
+    )
+    conn.execute(
+        "INSERT INTO chg_mk SELECT p.account,p.match_key,p.part,NULL FROM mk_home_prev p "
+        "LEFT JOIN main.mk_home h ON h.account=p.account AND h.match_key=p.match_key WHERE h.part IS NULL"
+    )
+    conn.execute("CREATE TABLE chg_resp(response_id INTEGER,old_part,new_part)")
+    conn.execute(
+        "INSERT INTO chg_resp SELECT h.response_id,p.part,h.part FROM main.response_home h "
+        "LEFT JOIN state.response_home_prev p ON p.response_id=h.response_id WHERE p.part IS NOT h.part"
+    )
+    conn.execute(
+        "INSERT INTO chg_resp SELECT p.response_id,p.part,NULL FROM state.response_home_prev p "
+        "LEFT JOIN main.response_home h ON h.response_id=p.response_id WHERE h.part IS NULL"
+    )
+    entity_changed = any(
+        conn.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone() for t in ("chg_match", "chg_mk", "chg_resp")
+    )
+
+    # 変更追跡の old_rowid が前回あった部品（必ず作り直す）
+    conn.execute("CREATE TABLE feed_old_parts(part TEXT PRIMARY KEY)")
+    conn.execute(
+        "INSERT OR IGNORE INTO feed_old_parts SELECT h.part FROM feed_ev e "
+        "JOIN state.row_homes h ON h.table_name=e.table_name AND h.rowid=e.old_rid WHERE e.old_rid IS NOT NULL"
+    )
+    # 行を再計算する旧本籍の部品
+    conn.execute("CREATE TABLE tp(part TEXT PRIMARY KEY)")
+    conn.execute("INSERT OR IGNORE INTO tp SELECT part FROM feed_old_parts")
+    for table, column in (("chg_match", "old_part"), ("chg_mk", "old_part"), ("chg_resp", "old_part")):
+        conn.execute(f"INSERT OR IGNORE INTO tp SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
+    if entity_changed:
+        conn.execute(
+            "INSERT OR IGNORE INTO tp SELECT path FROM state.part_files "
+            "WHERE path LIKE 'unplaced/%' OR path IN (?,?)",
+            (f"system/{encode_segment('jobs')}{PART_SUFFIX}", f"system/{encode_segment('issues')}{PART_SUFFIX}"),
+        )
+
+    # 候補 rowid
+    for table in names:
+        cand = _q("cand_" + table)
+        conn.execute(f"CREATE TABLE {cand}(rid INTEGER PRIMARY KEY)")
+        if table == CHANGE_TABLE:
+            # 追記だけの表。前回の through より後の行がすべて新規
+            conn.execute(f"INSERT INTO {cand} SELECT event_id FROM src.{_q(CHANGE_TABLE)} WHERE event_id>?", (prev,))
+            continue
+        conn.execute(
+            f"INSERT OR IGNORE INTO {cand} SELECT old_rid FROM feed_ev WHERE table_name=? AND old_rid IS NOT NULL",
+            (table,),
+        )
+        conn.execute(
+            f"INSERT OR IGNORE INTO {cand} SELECT new_rid FROM feed_ev WHERE table_name=? AND new_rid IS NOT NULL",
+            (table,),
+        )
+        conn.execute(
+            f"INSERT OR IGNORE INTO {cand} SELECT h.rowid FROM tp CROSS JOIN state.row_homes h "
+            "INDEXED BY row_homes_part ON h.part=tp.part WHERE h.table_name=?",
+            (table,),
+        )
+    # 索引で引ける行（応答に属する行・試合に属する行）
+    if "responses" in tables:
+        conn.execute("INSERT OR IGNORE INTO cand_responses SELECT response_id FROM chg_resp")
+    for table in ("response_fetches", "asset_refs", "entities"):
+        if table in tables:
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_q('cand_' + table)} SELECT x.rowid FROM chg_resp c "
+                f"CROSS JOIN src.{_q(table)} x ON x.response_id=c.response_id"
+            )
+    for table in ("matches", "match_classification"):
+        if table in tables:
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_q('cand_' + table)} SELECT x.rowid FROM chg_match c "
+                f"CROSS JOIN src.{_q(table)} x ON x.account=c.account AND x.kind=c.kind AND x.match_key=c.match_key"
+            )
+    if "match_tags" in tables:
+        for table in ("chg_match", "chg_mk"):
+            conn.execute(
+                f"INSERT OR IGNORE INTO cand_match_tags SELECT x.rowid FROM {table} c "
+                "CROSS JOIN src.match_tags x ON x.account=c.account AND x.match_key=c.match_key"
+            )
+    # 本文: 候補の応答・資産・本文が指す本文を、sha で引いて候補にする
+    if "bodies" in tables:
+        conn.execute("CREATE TABLE cand_sha(sha TEXT PRIMARY KEY)")
+        conn.execute(
+            "INSERT OR IGNORE INTO cand_sha SELECT b.sha256 FROM cand_bodies c "
+            "CROSS JOIN src.bodies b ON b.rowid=c.rid"
+        )
+        if "responses" in tables:
+            conn.execute(
+                "INSERT OR IGNORE INTO cand_sha SELECT r.body_sha256 FROM cand_responses c "
+                "CROSS JOIN src.responses r ON r.rowid=c.rid WHERE r.body_sha256 IS NOT NULL"
+            )
+        if "assets" in tables:
+            conn.execute(
+                "INSERT OR IGNORE INTO cand_sha SELECT x.body_sha256 FROM cand_assets c "
+                "CROSS JOIN src.assets x ON x.rowid=c.rid WHERE x.body_sha256 IS NOT NULL AND x.body_sha256<>''"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO cand_bodies SELECT b.rowid FROM cand_sha s "
+            "CROSS JOIN src.bodies b ON b.sha256=s.sha"
+        )
+        _create_body_homes(conn, tables, restrict=True)
+
+    # 候補の行の新しい本籍
+    for table in names:
+        hm = _q("hm_" + table)
+        conn.execute(f"CREATE TABLE {hm}(rid INTEGER,part TEXT,role TEXT)")
+        conn.execute(f"INSERT INTO {hm} {_hm_select(table, True)}")
+
+    # 作り直す部品: 旧本籍との差、変更追跡の行の旧・新の部品
+    for table in names:
+        hm = _q("hm_" + table)
+        cand = _q("cand_" + table)
+        conn.execute(
+            f"INSERT OR IGNORE INTO rebuild SELECT part FROM (SELECT rid,part,role FROM {hm} "
+            f"EXCEPT SELECT h.rowid,h.part,h.role FROM {cand} c JOIN state.row_homes h "
+            "ON h.table_name=? AND h.rowid=c.rid)",
+            (table,),
+        )
+        conn.execute(
+            f"INSERT OR IGNORE INTO rebuild SELECT part FROM (SELECT h.rowid,h.part,h.role FROM {cand} c "
+            f"JOIN state.row_homes h ON h.table_name=? AND h.rowid=c.rid EXCEPT SELECT rid,part,role FROM {hm})",
+            (table,),
+        )
+        conn.execute(
+            f"INSERT OR IGNORE INTO rebuild SELECT h.part FROM feed_ev e JOIN {hm} h ON h.rid=e.new_rid "
+            "WHERE e.table_name=? AND e.new_rid IS NOT NULL",
+            (table,),
+        )
+    conn.execute("INSERT OR IGNORE INTO rebuild SELECT part FROM feed_old_parts")
 
 
 def build_parts(
@@ -539,10 +806,12 @@ def build_parts(
     work_dir: str | os.PathLike | None = None,
     *,
     after_snapshot: Optional[Callable[[], None]] = None,
+    scan_log: Optional[list] = None,
 ) -> dict[str, Any]:
     """一回分の作成。初回（または規則版・スキーマ変更・変更追跡なし）は全部品、以後は差分。
 
     after_snapshot はテスト用: 作業 DB への写しが済み、正本から離れた直後に呼ぶ。
+    scan_log はテスト用: リストを渡すと、正本の表を索引なしで全走査した SQL が (表名, SQL) で入る。
     """
     source = Path(source_path)
     out = Path(out_dir)
@@ -556,7 +825,8 @@ def build_parts(
     work_root = Path(tempfile.mkdtemp(prefix="parts-work-", dir=None if work_dir is None else str(work_dir)))
     work_file = work_root / "work.sqlite3"
     built_at = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(str(work_file), isolation_level=None, uri=True)
+    conn = sqlite3.connect(str(work_file), isolation_level=None, uri=True, factory=_PlanConn)
+    conn.scan_log = scan_log
     try:
         conn.execute("PRAGMA journal_mode=OFF")
         conn.execute("PRAGMA synchronous=OFF")
@@ -578,17 +848,9 @@ def build_parts(
                 through = 0 if value is None else int(value)
             schema = _Schema(conn)
             tables = schema.tables
-            _create_home_tables(
-                conn, "bodies" in tables, "responses" in tables, "assets" in tables, tables
-            )
-            for table in tables:
-                conn.execute(f"CREATE TABLE {_q('hm_' + table)}(rid INTEGER,part TEXT,role TEXT)")
-                conn.execute(f"INSERT INTO {_q('hm_' + table)} {_hm_select(table)}")
-                conn.execute(f"CREATE INDEX {_q('hm_' + table + '_part')} ON {_q('hm_' + table)}(part)")
-                conn.execute(f"CREATE INDEX {_q('hm_' + table + '_rid')} ON {_q('hm_' + table)}(rid)")
+            names = list(tables)
 
-            # ---- 作り直す部品の集合 ----
-            conn.execute("CREATE TABLE rebuild(path TEXT PRIMARY KEY)")
+            # ---- 全行の本籍を計算するか、差分だけにするか ----
             prev_through = _meta(conn, "through_event_id")
             full = (
                 through is None
@@ -598,70 +860,35 @@ def build_parts(
             )
             if not full:
                 prev = int(prev_through)
-                if conn.execute(
+                if through < prev:
+                    full = True
+                elif conn.execute(
                     f"SELECT 1 FROM src.{_q(CHANGE_TABLE)} WHERE event_id>? AND old_rowid IS NULL AND new_rowid IS NULL LIMIT 1",
                     (prev,),
                 ).fetchone():
                     full = True
-                feed_tables = [r[0] for r in conn.execute(
-                    f"SELECT DISTINCT table_name FROM src.{_q(CHANGE_TABLE)} WHERE event_id>?", (prev,))]
-                if any(t not in tables for t in feed_tables):
-                    full = True
+                else:
+                    feed_tables = [r[0] for r in conn.execute(
+                        f"SELECT DISTINCT table_name FROM src.{_q(CHANGE_TABLE)} WHERE event_id>?", (prev,))]
+                    if any(t not in tables for t in feed_tables if t != CHANGE_TABLE):
+                        full = True
+
+            _create_home_tables(conn, tables)
+            conn.execute("CREATE TABLE rebuild(path TEXT PRIMARY KEY)")
             if full:
-                for table in tables:
-                    conn.execute(f"INSERT OR IGNORE INTO rebuild SELECT DISTINCT part FROM {_q('hm_' + table)}")
+                if "bodies" in tables:
+                    _create_body_homes(conn, tables, restrict=False)
+                for table in names:
+                    hm = _q("hm_" + table)
+                    conn.execute(f"CREATE TABLE {hm}(rid INTEGER,part TEXT,role TEXT)")
+                    conn.execute(f"INSERT INTO {hm} {_hm_select(table, False)}")
+                    conn.execute(f"CREATE INDEX {_q('hm_' + table + '_part')} ON {hm}(part)")
+                    conn.execute(f"CREATE INDEX {_q('hm_' + table + '_rid')} ON {hm}(rid)")
+                    conn.execute(f"INSERT OR IGNORE INTO rebuild SELECT DISTINCT part FROM {hm}")
                 conn.execute("INSERT OR IGNORE INTO rebuild SELECT DISTINCT part FROM state.row_homes")
                 conn.execute("INSERT OR IGNORE INTO rebuild SELECT path FROM state.part_files")
             else:
-                # (b) 本籍が変わった試合・応答の旧本籍と新本籍
-                conn.execute(
-                    "INSERT OR IGNORE INTO rebuild SELECT h.part FROM main.match_home h "
-                    "LEFT JOIN state.match_home_prev p ON p.account=h.account AND p.kind=h.kind AND p.match_key=h.match_key "
-                    "WHERE p.part IS NOT h.part"
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO rebuild SELECT p.part FROM state.match_home_prev p "
-                    "LEFT JOIN main.match_home h ON p.account=h.account AND p.kind=h.kind AND p.match_key=h.match_key "
-                    "WHERE h.part IS NOT p.part"
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO rebuild SELECT h.part FROM main.response_home h "
-                    "LEFT JOIN state.response_home_prev p ON p.response_id=h.response_id WHERE p.part IS NOT h.part"
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO rebuild SELECT p.part FROM state.response_home_prev p "
-                    "LEFT JOIN main.response_home h ON p.response_id=h.response_id WHERE h.part IS NOT p.part"
-                )
-                # (c) 変更追跡: old_rowid は row_homes、new_rowid は現在の本籍（写しを含む）
-                conn.execute(
-                    f"INSERT OR IGNORE INTO rebuild SELECT h.part FROM src.{_q(CHANGE_TABLE)} f "
-                    "JOIN state.row_homes h ON h.table_name=f.table_name AND h.rowid=f.old_rowid WHERE f.event_id>?",
-                    (prev,),
-                )
-                for table in feed_tables:
-                    conn.execute(
-                        f"INSERT OR IGNORE INTO rebuild SELECT h.part FROM src.{_q(CHANGE_TABLE)} f "
-                        f"JOIN {_q('hm_' + table)} h ON h.rid=f.new_rowid WHERE f.event_id>? AND f.table_name=?",
-                        (prev, table),
-                    )
-                # (e) 行ごとの本籍の差（親の変化で行の本籍が動くものを拾う。設計書の手順への追加）
-                for table in tables:
-                    hm = _q("hm_" + table)
-                    conn.execute(
-                        f"INSERT OR IGNORE INTO rebuild SELECT part FROM (SELECT rid,part,role FROM {hm} "
-                        "EXCEPT SELECT rowid,part,role FROM state.row_homes WHERE table_name=?)",
-                        (table,),
-                    )
-                    conn.execute(
-                        f"INSERT OR IGNORE INTO rebuild SELECT part FROM (SELECT rowid,part,role FROM state.row_homes "
-                        f"WHERE table_name=? EXCEPT SELECT rid,part,role FROM {hm})",
-                        (table,),
-                    )
-                names = ",".join(_lit(t) for t in tables) or "''"
-                conn.execute(
-                    f"INSERT OR IGNORE INTO rebuild SELECT DISTINCT part FROM state.row_homes "
-                    f"WHERE table_name NOT IN ({names})"
-                )
+                _plan_delta(conn, tables, int(prev_through))
                 # 部品ファイルが無くなっていたら作り直す
                 for (path,) in conn.execute("SELECT path FROM state.part_files").fetchall():
                     if not (out / path).is_file():
@@ -671,14 +898,23 @@ def build_parts(
             for table, info in tables.items():
                 cols = ",".join(_q(c) for c in info["cols"])
                 xcols = ",".join("x." + _q(c) for c in info["cols"])
+                stg = _q("stg_" + table)
+                conn.execute(f"CREATE TABLE {stg}(_part,_rowid,_role,{cols})")
                 conn.execute(
-                    f"CREATE TABLE {_q('stg_' + table)}(_part,_rowid,_role,{cols})"
-                )
-                conn.execute(
-                    f"INSERT INTO {_q('stg_' + table)} SELECT h.part,h.rid,h.role,{xcols} "
+                    f"INSERT INTO {stg} SELECT h.part,h.rid,h.role,{xcols} "
                     f"FROM {_q('hm_' + table)} h JOIN src.{_q(table)} x ON x.rowid=h.rid "
                     "WHERE h.part IN (SELECT path FROM rebuild)"
                 )
+                if not full:
+                    # 作り直す部品にある、再計算しなかった行（前回の本籍のまま）
+                    conn.execute(
+                        f"INSERT INTO {stg} SELECT r.part,r.rowid,r.role,{xcols} "
+                        "FROM state.row_homes r INDEXED BY row_homes_part "
+                        "CROSS JOIN src." + _q(table) + " x ON x.rowid=r.rowid "
+                        "WHERE r.table_name=? AND r.part IN (SELECT path FROM rebuild) "
+                        f"AND r.rowid NOT IN (SELECT rid FROM {_q('cand_' + table)})",
+                        (table,),
+                    )
 
             # ---- 目録の材料 ----
             _stage_catalog_material(conn, schema, tables)
@@ -717,11 +953,18 @@ def build_parts(
         # ---- 状態 DB の更新（一つのトランザクション） ----
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute("DELETE FROM state.row_homes WHERE part IN (SELECT path FROM main.rebuild)")
-            for table in tables:
+            if full:
+                conn.execute("DELETE FROM state.row_homes")
+            for table in names:
+                if not full:
+                    conn.execute(
+                        "DELETE FROM state.row_homes WHERE table_name=? "
+                        f"AND rowid IN (SELECT rid FROM main.{_q('cand_' + table)})",
+                        (table,),
+                    )
                 conn.execute(
                     "INSERT OR REPLACE INTO state.row_homes(table_name,rowid,part,role) "
-                    f"SELECT {_lit(table)},_rowid,_part,_role FROM main.{_q('stg_' + table)}"
+                    f"SELECT {_lit(table)},rid,part,role FROM main.{_q('hm_' + table)}"
                 )
             conn.execute("DELETE FROM state.match_home_prev")
             conn.execute("INSERT INTO state.match_home_prev SELECT account,kind,match_key,part FROM main.match_home")
@@ -822,8 +1065,11 @@ def _stage_catalog_material(conn: sqlite3.Connection, schema: _Schema, tables: d
     conn.execute("CREATE TABLE cat_asset_index(url,state,body_sha256,content_type,part_path)")
     if "assets" in tables:
         conn.execute(
-            "INSERT INTO cat_asset_index SELECT x.url,x.state,x.body_sha256,x.content_type,h.part "
-            "FROM src.assets x JOIN hm_assets h ON h.rid=x.rowid"
+            "INSERT INTO cat_asset_index SELECT x.url,x.state,x.body_sha256,x.content_type,"
+            "CASE WHEN x.body_sha256 IS NULL OR x.body_sha256='' THEN "
+            f"{_lit('images/no-body' + PART_SUFFIX)} ELSE "
+            "'images/'||enc(CAST(substr(x.body_sha256,1,2) AS BLOB))||'.sqlite3' END "
+            "FROM src.assets x"
         )
     conn.execute("CREATE TABLE cat_labels(kind,code,ja)")
     if "analysis_genre" in tables:
@@ -849,8 +1095,9 @@ def _stage_catalog_material(conn: sqlite3.Connection, schema: _Schema, tables: d
 
 
 _CATALOG_DDL = (
-    "CREATE TABLE files(path TEXT PRIMARY KEY,domain TEXT,analysis_set TEXT,rule_raw TEXT,month TEXT,"
-    "operation TEXT,period TEXT,bytes INTEGER,sha256 TEXT,rows_json TEXT,built_through_event_id INTEGER,built_at TEXT)",
+    "CREATE TABLE files(path TEXT PRIMARY KEY,domain TEXT,analysis_set TEXT,rule_raw TEXT,month TEXT,day TEXT,"
+    "operation TEXT,period TEXT,response_id INTEGER,bytes INTEGER,sha256 TEXT,rows_json TEXT,"
+    "built_through_event_id INTEGER,built_at TEXT)",
     "CREATE TABLE match_index(account TEXT,kind TEXT,match_key TEXT,analysis_set TEXT,rule_raw TEXT,rule_name TEXT,"
     "played_time TEXT,stage TEXT,judgement TEXT,my_weapon TEXT,tags TEXT,detail_available INTEGER,part_path TEXT)",
     "CREATE TABLE response_index(response_id INTEGER,account TEXT,operation TEXT,fetched_at TEXT,"
@@ -867,16 +1114,29 @@ _CATALOG_DDL = (
 )
 
 
-def _path_fields(path: str) -> dict[str, Optional[str]]:
+def _path_fields(path: str) -> dict[str, Any]:
+    """部品の住所から files 表の列を作る（住所の規則は設計書「置き場所」）。"""
     segs = path[: -len(PART_SUFFIX)].split("/")
-    fields: dict[str, Optional[str]] = {
-        "domain": segs[0], "analysis_set": None, "rule_raw": None, "month": None,
-        "operation": None, "period": None,
+    fields: dict[str, Any] = {
+        "domain": segs[0], "analysis_set": None, "rule_raw": None, "month": None, "day": None,
+        "operation": None, "period": None, "response_id": None,
     }
-    if segs[0] == "matches" and len(segs) == 4:
-        fields.update(analysis_set=decode_segment(segs[1]), rule_raw=decode_segment(segs[2]), month=segs[3])
-    elif segs[0] == "responses" and len(segs) == 3:
-        fields.update(operation=decode_segment(segs[1]), period=segs[2])
+    if segs[0] == "matches" and len(segs) in (4, 5):
+        fields.update(analysis_set=decode_segment(segs[1]), rule_raw=decode_segment(segs[2]))
+        if len(segs) == 5:  # matches/<set>/<rule>/<YYYY-MM>/<YYYY-MM-DD>
+            fields.update(month=segs[3], day=segs[4])
+        else:  # matches/<set>/<rule>/unknown-date
+            fields.update(month=segs[3], day=segs[3])
+    elif segs[0] == "responses" and len(segs) >= 3:
+        fields.update(operation=decode_segment(segs[1]))
+        rest = segs[2:]
+        if len(rest) >= 2 and rest[-1].isdigit():  # ランキング系: .../<日付区間>/<response_id>
+            fields["response_id"] = int(rest[-1])
+            rest = rest[:-1]
+        if len(rest) == 2:  # <YYYY-MM>/<YYYY-MM-DD>
+            fields.update(month=rest[0], day=rest[1], period=rest[1])
+        else:  # unknown-date
+            fields.update(month=rest[0], day=rest[0], period=rest[0])
     return fields
 
 
@@ -905,9 +1165,9 @@ def _write_catalog(out: Path, state: Path, work_uri: str, through: Optional[int]
         ).fetchall():
             fields = _path_fields(path)
             conn.execute(
-                "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (path, fields["domain"], fields["analysis_set"], fields["rule_raw"], fields["month"],
-                 fields["operation"], fields["period"], nbytes, sha,
+                 fields["day"], fields["operation"], fields["period"], fields["response_id"], nbytes, sha,
                  json.dumps(counts.get(path, {}), ensure_ascii=False, sort_keys=True), part_through, part_built),
             )
         conn.execute("INSERT INTO match_index SELECT * FROM w.cat_match_index")

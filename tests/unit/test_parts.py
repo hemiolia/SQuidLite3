@@ -19,15 +19,19 @@ from ikarchive.parts import (
     build_parts,
     decode_segment,
     encode_segment,
+    jst_day_path,
     jst_month,
     response_period,
+    RANKING_OPERATIONS,
 )
 from ikarchive.store import Store
 from ikarchive.writer_guards import install_writer_guards
 
 import parts_build
 
-MATCH_PART = "matches/xmatch/AREA/2026-10.sqlite3"
+CONFIG_OCT = "responses/ConfigQuery/2026-10/2026-10-05.sqlite3"
+CONFIG_SEP = "responses/ConfigQuery/2026-09/2026-09-05.sqlite3"
+MATCH_PART = "matches/xmatch/AREA/2026-10/2026-10-05.sqlite3"
 
 
 def sha(data: bytes) -> str:
@@ -177,7 +181,10 @@ class PureFunctionTests(unittest.TestCase):
         self.assertEqual(jst_month("2026-10-01"), "unknown-month")
         self.assertEqual(jst_month("zzz"), "unknown-month")
         self.assertEqual(jst_month(None), "unknown-month")
-        self.assertEqual(response_period("Op", "2026-09-30T20:00:00+00:00"), "2026-10")
+        self.assertEqual(response_period("Op", "2026-09-30T20:00:00+00:00"), "2026-10/2026-10-01")
+        self.assertEqual(jst_day_path("2026-09-30T14:59:59Z"), "2026-09/2026-09-30")
+        self.assertEqual(jst_day_path("2026-10-01"), "unknown-date")
+        self.assertEqual(jst_day_path(None), "unknown-date")
 
 
 class FullBuildTests(PartsTestBase):
@@ -196,11 +203,11 @@ class FullBuildTests(PartsTestBase):
         # 住所
         paths = set(part_sha(self.out))
         self.assertIn(MATCH_PART, paths)
-        self.assertIn("matches/xmatch/GOAL/2026-10.sqlite3", paths)  # m3 は JST で 10 月
-        self.assertIn("matches/nawabari/TURF/2026-09.sqlite3", paths)
-        self.assertIn("matches/unclassified/no-rule/unknown-month.sqlite3", paths)
-        self.assertIn("responses/ConfigQuery/2026-10.sqlite3", paths)
-        self.assertIn("responses/ConfigQuery/2026-09.sqlite3", paths)
+        self.assertIn("matches/xmatch/GOAL/2026-10/2026-10-01.sqlite3", paths)  # m3 は JST で 10-01
+        self.assertIn("matches/nawabari/TURF/2026-09/2026-09-10.sqlite3", paths)
+        self.assertIn("matches/unclassified/no-rule/unknown-date.sqlite3", paths)
+        self.assertIn(CONFIG_OCT, paths)
+        self.assertIn(CONFIG_SEP, paths)
         self.assertIn("system/runs.sqlite3", paths)
         self.assertIn("system/jobs.sqlite3", paths)
         self.assertIn("system/issues.sqlite3", paths)
@@ -213,10 +220,10 @@ class FullBuildTests(PartsTestBase):
         self.assertEqual(rows(self.out / MATCH_PART, "SELECT count(*) FROM jobs")[0][0], 1)
         self.assertEqual(rows(self.out / "system/jobs.sqlite3", "SELECT count(*) FROM jobs")[0][0], 1)
         # 本文の写し: 共有本文は両方の応答部品にあり、写しとして記録される
-        for p in ("responses/ConfigQuery/2026-10.sqlite3", "responses/ConfigQuery/2026-09.sqlite3"):
+        for p in (CONFIG_OCT, CONFIG_SEP):
             self.assertEqual(rows(self.out / p, "SELECT count(*) FROM bodies")[0][0], 1)
         copies = [rows(self.out / p, "SELECT count(*) FROM _copies WHERE table_name='bodies'")[0][0]
-                  for p in ("responses/ConfigQuery/2026-10.sqlite3", "responses/ConfigQuery/2026-09.sqlite3")]
+                  for p in (CONFIG_OCT, CONFIG_SEP)]
         self.assertEqual(sorted(copies), [0, 1])
 
         # 表定義・索引・ビューは正本と同じ。解析ビューが実行できる
@@ -241,7 +248,7 @@ class FullBuildTests(PartsTestBase):
                        "FROM match_index WHERE match_key='m1'")[0]
         self.assertEqual(m1[:6], ("ステージ", "WIN", "ブキ", "タグ乙、タグ甲", 1, MATCH_PART))
         self.assertEqual(rows(cat, "SELECT analysis_set,rule_raw,part_path FROM match_index WHERE match_key='m5'"),
-                         [("unclassified", "no-rule", "matches/unclassified/no-rule/unknown-month.sqlite3")])
+                         [("unclassified", "no-rule", "matches/unclassified/no-rule/unknown-date.sqlite3")])
         self.assertEqual(rows(cat, "SELECT count(*) FROM response_index")[0][0], 7)
         self.assertEqual(rows(cat, "SELECT count(*) FROM asset_index")[0][0], 2)
         self.assertEqual(rows(cat, "SELECT through_event_id,rule_version FROM status"),
@@ -268,7 +275,7 @@ class FullBuildTests(PartsTestBase):
         # 本文の写しの改ざん
         self.build()
         copy_part = None
-        for p in ("responses/ConfigQuery/2026-10.sqlite3", "responses/ConfigQuery/2026-09.sqlite3"):
+        for p in (CONFIG_OCT, CONFIG_SEP):
             if rows(self.out / p, "SELECT count(*) FROM _copies")[0][0]:
                 copy_part = self.out / p
         conn = sqlite3.connect(copy_part)
@@ -336,7 +343,7 @@ class IncrementalTests(PartsTestBase):
         self.assertFalse(result["full_rebuild"])
         rebuilt = {r["path"] for r in result["rebuilt_parts"]}
         non_feed = {p for p in rebuilt if not p.startswith("system/archive_change_feed/")}
-        self.assertEqual(non_feed, {MATCH_PART, "responses/ConfigQuery/2026-10.sqlite3"})
+        self.assertEqual(non_feed, {MATCH_PART, "responses/ConfigQuery/2026-10/2026-10-06.sqlite3"})
         self.assertEqual(self.changed_parts(before), rebuilt)  # 作り直していない部品は SHA-256 が不変
         self.assertTrue(self.audit()["ok"])
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM match_index")[0][0], 6)
@@ -351,17 +358,17 @@ class IncrementalTests(PartsTestBase):
         self.src.execute("UPDATE match_classification SET rule_raw='GOAL',rule_name='GOAL' WHERE match_key='m2'")
         result = self.build()
         rebuilt = {r["path"] for r in result["rebuilt_parts"]}
+        goal = "matches/xmatch/GOAL/2026-10/2026-10-05.sqlite3"
         self.assertIn(MATCH_PART, rebuilt)
-        self.assertIn("matches/xmatch/GOAL/2026-10.sqlite3", rebuilt)
-        for p in (MATCH_PART,):
-            self.assertEqual(rows(self.out / p, "SELECT match_key FROM matches ORDER BY 1"), [("m1",)])
-        self.assertEqual(rows(self.out / "matches/xmatch/GOAL/2026-10.sqlite3",
-                              "SELECT match_key FROM matches ORDER BY 1"), [("m2",), ("m3",)])
+        self.assertIn(goal, rebuilt)
+        self.assertNotIn("matches/xmatch/GOAL/2026-10/2026-10-01.sqlite3", rebuilt)  # m3 の日は触れない
+        self.assertEqual(rows(self.out / MATCH_PART, "SELECT match_key FROM matches ORDER BY 1"), [("m1",)])
+        self.assertEqual(rows(self.out / goal, "SELECT match_key FROM matches ORDER BY 1"), [("m2",)])
         self.assertTrue(self.audit()["ok"])
         # 部品に残る最後の試合が動いたら、旧部品は削除されず空の部品になる
         self.src.execute("UPDATE match_classification SET rule_raw='X',rule_name='X' WHERE match_key='m4'")
         self.build()
-        old = self.out / "matches/nawabari/TURF/2026-09.sqlite3"
+        old = self.out / "matches/nawabari/TURF/2026-09/2026-09-10.sqlite3"
         self.assertTrue(old.is_file())
         for table in ("matches", "documents", "match_classification", "responses", "bodies"):
             self.assertEqual(rows(old, f"SELECT count(*) FROM {table}")[0][0], 0, table)
@@ -401,7 +408,7 @@ class IncrementalTests(PartsTestBase):
         rebuilt = {r["path"] for r in result["rebuilt_parts"]}
         self.assertIn("unplaced/match_tags.sqlite3", rebuilt)
         self.assertEqual(rows(self.out / "unplaced/match_tags.sqlite3", "SELECT count(*) FROM match_tags")[0][0], 0)
-        self.assertEqual(rows(self.out / "matches/nawabari/TURF/2026-08.sqlite3", "SELECT tag FROM match_tags"),
+        self.assertEqual(rows(self.out / "matches/nawabari/TURF/2026-08/2026-08-01.sqlite3", "SELECT tag FROM match_tags"),
                          [("孤児",)])
         self.assertTrue(self.audit()["ok"])
 
@@ -430,6 +437,209 @@ class IncrementalTests(PartsTestBase):
         self.build()
         self.assertTrue(self.audit()["ok"])
         self.assertEqual(rows(self.out / MATCH_PART, "SELECT count(*) FROM matches WHERE match_key='late'")[0][0], 1)
+
+
+def dump_parts(out: Path) -> dict:
+    """部品ごとの全表の全行（_part は作成時刻が入るので除く）。空の表と空の部品は含めない。"""
+    result = {}
+    for p in sorted(out.rglob("*.sqlite3")):
+        rel = p.relative_to(out).as_posix()
+        if rel == "catalog.sqlite3":
+            continue
+        conn = sqlite3.connect(f"{p.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            tables = {}
+            for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name<>'_part' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+            ).fetchall():
+                found = conn.execute(f'SELECT rowid,* FROM "{name}" ORDER BY rowid').fetchall()
+                if found:
+                    tables[name] = found
+        finally:
+            conn.close()
+        if tables:
+            result[rel] = tables
+    return result
+
+
+RANK = "EventMatchRankingPeriodQuery"
+
+
+class GranularityTests(PartsTestBase):
+    def test_ranking_one_response_one_part_and_unknown_date(self):
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 500
+            a = self.src.response(conn, RANK, "2026-10-05T02:00:00+00:00", b'{"a":1}')
+            b = self.src.response(conn, RANK, "2026-10-05T03:00:00+00:00", b'{"b":1}')
+            c = self.src.response(conn, RANK, "zzz", b'{"c":1}')
+            d = self.src.response(conn, "ConfigQuery", "zzz", b'{"d":1}')
+            e = self.src.response(conn, "XRankingDetailQuery", "2026-09-30T20:00:00+00:00", b'{"e":1}')
+            f = self.src.response(conn, "ConfigQuery", "2026-10-05T04:00:00+00:00", b'{"f":1}')
+            conn.execute("INSERT INTO entities VALUES('acc','T','ea',?,'{}')", (a,))
+            conn.execute("INSERT INTO entities VALUES('acc','T','eb',?,'{}')", (b,))
+            conn.execute("INSERT INTO asset_refs VALUES(?,?,?)", (a, "u1", "$.i"))
+        conn.close()
+        self.build()
+        self.assertTrue(self.audit()["ok"])
+        paths = set(part_sha(self.out))
+        self.assertIn(f"responses/{RANK}/2026-10/2026-10-05/{a}.sqlite3", paths)
+        self.assertIn(f"responses/{RANK}/2026-10/2026-10-05/{b}.sqlite3", paths)  # 同じ日でも別部品
+        self.assertIn(f"responses/{RANK}/unknown-date/{c}.sqlite3", paths)
+        self.assertIn("responses/ConfigQuery/unknown-date.sqlite3", paths)
+        self.assertIn(f"responses/XRankingDetailQuery/2026-10/2026-10-01/{e}.sqlite3", paths)  # JST で 10-01
+        self.assertNotIn(f"responses/{RANK}/2026-10/2026-10-05.sqlite3", paths)
+        # 通常の operation は同じ日の応答が一つの部品に入る（f と、seed の ConfigQuery r1 は同じ日）
+        day = self.out / CONFIG_OCT
+        self.assertIn(f, [r[0] for r in rows(day, "SELECT id FROM responses")])
+        self.assertEqual(len(rows(day, "SELECT id FROM responses")), 2)
+        # ランキング系の部品にはその応答の行だけが入る
+        part_a = self.out / f"responses/{RANK}/2026-10/2026-10-05/{a}.sqlite3"
+        self.assertEqual(rows(part_a, "SELECT id FROM responses"), [(a,)])
+        self.assertEqual(rows(part_a, "SELECT entity_id FROM entities"), [("ea",)])
+        self.assertEqual(rows(part_a, "SELECT count(*) FROM asset_refs")[0][0], 1)
+        self.assertEqual(rows(part_a, "SELECT count(*) FROM bodies")[0][0], 1)
+        # 目録の files 表と response_index
+        cat = self.out / "catalog.sqlite3"
+        self.assertEqual(
+            rows(cat, "SELECT domain,operation,month,day,period,response_id FROM files WHERE path=?",
+                 (f"responses/{RANK}/2026-10/2026-10-05/{a}.sqlite3",)),
+            [("responses", RANK, "2026-10", "2026-10-05", "2026-10-05", a)])
+        self.assertEqual(
+            rows(cat, "SELECT month,day,response_id FROM files WHERE path=?",
+                 (f"responses/{RANK}/unknown-date/{c}.sqlite3",)),
+            [("unknown-date", "unknown-date", c)])
+        self.assertEqual(
+            rows(cat, "SELECT operation,month,day,response_id FROM files WHERE path=?", (CONFIG_OCT,)),
+            [("ConfigQuery", "2026-10", "2026-10-05", None)])
+        self.assertEqual(
+            rows(cat, "SELECT analysis_set,rule_raw,month,day FROM files WHERE path=?", (MATCH_PART,)),
+            [("xmatch", "AREA", "2026-10", "2026-10-05")])
+        self.assertEqual(
+            rows(cat, "SELECT month,day FROM files WHERE path=?", ("matches/unclassified/no-rule/unknown-date.sqlite3",)),
+            [("unknown-date", "unknown-date")])
+        self.assertEqual(
+            rows(cat, "SELECT part_path FROM response_index WHERE response_id=?", (b,)),
+            [(f"responses/{RANK}/2026-10/2026-10-05/{b}.sqlite3",)])
+
+    def test_ranking_list_is_defined_once(self):
+        self.assertEqual(len(RANKING_OPERATIONS), 17)
+        self.assertEqual(len(set(RANKING_OPERATIONS)), 17)
+        self.assertIn(RANK, RANKING_OPERATIONS)
+        self.assertEqual(HOME_RULE_VERSION, 2)
+
+    def test_match_with_ranking_name_response_stays_with_match(self):
+        # 試合の詳細に紐づく応答は operation がランキング系でも試合の本籍に入る
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 600
+            rid = self.src.match(conn, "mr")
+            conn.execute("UPDATE responses SET operation=? WHERE id=?", (RANK, rid))
+        conn.close()
+        self.build()
+        self.assertTrue(self.audit()["ok"])
+        self.assertEqual(rows(self.out / MATCH_PART, "SELECT count(*) FROM responses WHERE id=?", (rid,))[0][0], 1)
+        self.assertFalse(any(p.startswith(f"responses/{RANK}/") for p in part_sha(self.out)))
+
+    def test_rule_version_change_rebuilds_everything(self):
+        self.build()
+        import ikarchive.parts as parts_module
+        old = parts_module.HOME_RULE_VERSION
+        parts_module.HOME_RULE_VERSION = old + 1
+        try:
+            result = self.build()
+        finally:
+            parts_module.HOME_RULE_VERSION = old
+        self.assertTrue(result["full_rebuild"])
+
+
+BIG_TABLES = {"asset_refs", "entities", "sightings"}
+# 差分周期で走査してよいのは小さな表だけ（試合・応答・資産の数千行以下）。それ以外の全走査は出ない
+SMALL_TABLES = {"matches", "match_classification", "responses", "assets", "analysis_genre", "archive_change_feed"}
+
+
+class DeltaCycleCostTests(PartsTestBase):
+    def change_everything(self):
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 700
+            self.src.match(conn, "m6")
+            r = self.src.response(conn, RANK, "2026-10-06T02:00:00+00:00", b'{"rank":1}')
+            conn.execute("INSERT INTO entities VALUES('acc','T','e9',?,'{}')", (r,))
+            conn.execute("INSERT INTO asset_refs VALUES(?,?,?)", (r, "u1", "$.z"))
+            conn.execute("UPDATE match_classification SET rule_raw='GOAL',rule_name='GOAL' WHERE match_key='m2'")
+            conn.execute("DELETE FROM match_tags WHERE tag='タグ甲'")
+            conn.execute("UPDATE jobs SET attempts=attempts+1")
+        conn.close()
+
+    def test_full_build_scans_big_tables_but_delta_does_not(self):
+        control: list = []
+        self.build(scan_log=control)
+        self.assertTrue(BIG_TABLES <= {t for t, _ in control}, control)  # 負の対照: 初回は全行を読む
+        self.change_everything()
+        log: list = []
+        result = self.build(scan_log=log)
+        self.assertFalse(result["full_rebuild"])
+        scanned = {t for t, _ in log}
+        self.assertFalse(scanned & BIG_TABLES, [x for x in log if x[0] in BIG_TABLES])
+        self.assertTrue(scanned <= SMALL_TABLES, sorted(scanned - SMALL_TABLES))
+        self.assertTrue(self.audit()["ok"])
+
+    def test_idle_cycle_reads_nothing_big(self):
+        self.build()
+        log: list = []
+        result = self.build(scan_log=log)
+        self.assertEqual(result["rebuilt_parts"], [])
+        self.assertFalse({t for t, _ in log} & BIG_TABLES)
+
+    def test_delta_equals_fresh_full_build(self):
+        self.build()
+        shared_sha = sha(b'{"shared":true}')
+        steps = []
+
+        def add_everything():
+            self.change_everything()
+
+        def asset_takes_shared_body():
+            self.src.execute("UPDATE assets SET state='done',body_sha256=?,content_type='image/png' WHERE url='u2'",
+                             (shared_sha,))
+
+        def adopt_orphan_tag():
+            conn = self.src.connect()
+            with conn:
+                self.src.next_id = 800
+                self.src.match(conn, "nomatch", played="2026-08-01T00:00:00Z", analysis_set="nawabari", rule="TURF")
+            conn.close()
+
+        def asset_loses_body():
+            self.src.execute("UPDATE assets SET state='pending',body_sha256=NULL WHERE url='u2'")
+
+        def delete_response():
+            conn = self.src.connect()
+            with conn:
+                conn.execute("DELETE FROM issues WHERE response_id IS NOT NULL")
+                conn.execute("DELETE FROM response_fetches WHERE response_id IN "
+                             "(SELECT id FROM responses WHERE fetched_at LIKE '2026-09-05%')")
+                conn.execute("DELETE FROM responses WHERE fetched_at LIKE '2026-09-05%'")
+            conn.close()
+
+        def move_match_day():
+            conn = self.src.connect()
+            with conn:
+                conn.execute("UPDATE documents SET json_text=replace(json_text,'2026-10-05T01:00:00Z','2026-11-20T01:00:00Z') "
+                             "WHERE match_key='m1'")
+            conn.close()
+
+        for step in (add_everything, asset_takes_shared_body, adopt_orphan_tag, asset_loses_body,
+                     delete_response, move_match_day):
+            step()
+            result = self.build()
+            self.assertFalse(result["full_rebuild"], step.__name__)
+            self.assertTrue(self.audit()["ok"], step.__name__)
+            fresh_out = Path(self.tmp.name) / ("fresh-" + step.__name__)
+            build_parts(self.src.path, fresh_out, Path(self.tmp.name) / ("fresh-" + step.__name__ + ".state"))
+            self.assertEqual(dump_parts(self.out), dump_parts(fresh_out), step.__name__)
+        self.assertIn("matches/xmatch/AREA/2026-11/2026-11-20.sqlite3", part_sha(self.out))
 
 
 class NoFeedTests(PartsTestBase):
