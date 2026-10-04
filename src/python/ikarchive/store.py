@@ -12,7 +12,13 @@ def js(value):return json.dumps(value,ensure_ascii=False,separators=(',',':'),so
 def digest(body):return hashlib.sha256(body).hexdigest()
 
 def _immutable_uri(path):
-    return f'{Path(path).resolve().as_uri()}?mode=ro&immutable=1'
+    # immutable=1 は WAL を読まない。WAL ファイルがある稼働中の DB では、未反映の変更（スキーマを含む）を
+    # 見落として本体ファイルの途中状態を読み、「malformed database schema」と誤判定する（2026-10-05 の収集停止）。
+    # WAL がある間は mode=ro で WAL を含めて読む。WAL が無い静止ファイルだけ immutable=1 で開く。
+    path=Path(path).resolve()
+    if Path(str(path)+'-wal').exists():
+        return f'{path.as_uri()}?mode=ro'
+    return f'{path.as_uri()}?mode=ro&immutable=1'
 
 def _close_preserving_active_exception(connection):
     """Try cleanup without replacing the exception that caused the cleanup."""
