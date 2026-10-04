@@ -26,3 +26,7 @@ config/Google Drive API Keys
 config/*API Key*
 config/*client_secret*
 config/google-drive-client*
+
+desktop/node_modules/
+desktop/out/
+desktop/dist/
