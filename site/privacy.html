@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>プライバシーポリシー | SQuidLite3</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">本文へ移動</a>
+<header><div class="wrap">
+  <a class="mark" href="./">SQuidLite3</a>
+  <nav aria-label="ページ">
+    <a href="./">はじめに</a>
+    <a href="privacy.html" aria-current="page">プライバシーポリシー</a>
+    <a href="terms.html">利用規約</a>
+    <a href="https://github.com/hemiolia/SQuidLite3">ソースコード</a>
+  </nav>
+</div></header>
+<main id="main">
+  <h1>プライバシーポリシー</h1>
+  <p class="meta">制定日: 2026年10月（公開日に確定します） ・ 運営者: <!-- 運営者名は前田さんに伺って確定する -->SQuidLite3 開発者</p>
+
+  <h2>1. 基本の考え方</h2>
+  <p>SQuidLite3（以下「本ツール」）は、記録の取得・保存・計算をすべて利用者の端末の中で行います。運営者はサーバーを持たず、利用者の記録、任天堂のアカウント情報、認証のための情報を受け取りません。</p>
+
+  <h2>2. 本ツールが端末の中で扱う情報</h2>
+  <ul>
+    <li>イカリング3から取得した対戦・バイト・各種記録と、その画像。</li>
+    <li>任天堂のサービスに接続するための認証情報（セッショントークンなど）。パスワードは本ツールに入力しません。ログインは任天堂の画面で行います。</li>
+    <li>利用者が付けたタグやメモ。</li>
+  </ul>
+  <p>これらは、利用者が選んだ保存先フォルダ（または端末の中）に保存されます。保存先がクラウドの同期フォルダ（Google ドライブ、iCloud Drive、OneDrive など）の場合、その内容はそのクラウドの運営会社の規約とプライバシーポリシーに従って扱われます。</p>
+
+  <h2>3. 本ツールが通信する先</h2>
+  <ul>
+    <li><strong>任天堂のサーバー</strong>: 記録の取得と認証のため。</li>
+    <li><strong>認証を助ける第三者のサービス</strong>: 本ツールは認証に nxapi というオープンソースの部品を使います。nxapi は、任天堂のアプリへ接続するときに必要な一時的な値を作るため、nxapi の設定で選ばれる第三者のサービス（imink など）へ、認証の途中で使う情報の一部を送ります。どのサービスを使うかは nxapi の設定で決まります。</li>
+    <li><strong>画像の配信元</strong>: 記録に含まれる画像を、任天堂のドメイン（およびアルバム写真の配信元）から取得します。</li>
+    <li>運営者のサーバーへは通信しません。利用状況の計測（アクセス解析）も行いません。</li>
+  </ul>
+
+  <h2>4. このウェブサイト（sql3.ink）</h2>
+  <p>このサイトは Cloudflare のサービスで配信しています。配信のため、Cloudflare がアクセスの記録（IP アドレスなど）を処理することがあります。運営者はアクセス解析やクッキーによる追跡を行いません。</p>
+
+  <h2>5. Google のサービスとの連携</h2>
+  <p>本ツールには、利用者自身の Google ドライブへ記録を書き出す機能があります。この機能は、利用者が自分で許可した場合にだけ、利用者自身の Google ドライブの中で、本ツールが作るフォルダとファイルの読み書きのために Google の API を使います。Google から受け取った情報を、運営者や第三者に送ることはありません。広告や分析にも使いません。</p>
+  <p lang="en">SQuidLite3's use and transfer of information received from Google APIs to any other app will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements. Data accessed through Google APIs stays in the user's own Google Drive and on the user's own device, and is never transmitted to the developer or any third party.</p>
+
+  <h2>6. 情報の削除</h2>
+  <p>本ツールが保存した情報は、利用者の端末と保存先フォルダにだけあります。保存先フォルダを削除すれば、すべて消えます。運営者の手元には残りません。</p>
+
+  <h2>7. 改定</h2>
+  <p>このポリシーを変えるときは、このページで知らせます。</p>
+
+  <h2>8. 問い合わせ</h2>
+  <p><!-- 問い合わせ先は前田さんに伺って確定する -->GitHub の <a href="https://github.com/hemiolia/SQuidLite3/issues">Issues</a> で受け付けます。</p>
+</main>
+<footer><div class="wrap">SQuidLite3 ・ <a href="./">はじめに</a> ・ <a href="terms.html">利用規約</a></div></footer>
+</body>
+</html>

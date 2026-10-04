@@ -1,0 +1,38 @@
+/* sql3.ink 公開ページ。配色は NOAHS のトークンに合わせる。
+   筑紫書体はライセンス上ここでは配信しない（会員限定の自己ホストのみ許諾）。閲覧者の端末の書体を使う。 */
+:root{
+  --field:#2a0063;      /* 大辻ブルー */
+  --on-field:#fffff5;   /* 乳白（純白は使わない） */
+  --muted-field:#c9bdf0;
+  --paper:#fbf5ec;
+  --ink:#241a33;
+  --ink-muted:#5c5070;
+  --line:rgba(40,20,60,.14);
+  --link:#5b3bb0;
+  --gold:#bd9a45;
+  --sans:"Futura","Hiragino Kaku Gothic ProN","Hiragino Sans","Yu Gothic","Meiryo",system-ui,sans-serif;
+  --body:"Hiragino Mincho ProN","Yu Mincho","Noto Serif JP",serif;
+}
+*{box-sizing:border-box}
+html{background:var(--field)}
+body{margin:0;color:var(--ink);background:var(--field);font-family:var(--body);line-height:1.85;font-size:17px}
+a{color:var(--link);text-underline-offset:.2em}
+a:focus-visible{outline:3px solid var(--gold);outline-offset:3px;border-radius:4px}
+.skip{position:absolute;left:-9999px}
+.skip:focus{left:16px;top:16px;background:var(--on-field);color:var(--ink);padding:8px 12px;z-index:10}
+header{color:var(--on-field);padding:28px 16px 20px}
+header .wrap{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:12px}
+.mark{font-family:var(--sans);font-size:28px;letter-spacing:.04em;color:var(--on-field);text-decoration:none;font-weight:600}
+nav{font-family:var(--sans);font-size:15px;display:flex;gap:18px;flex-wrap:wrap}
+nav a{color:var(--on-field)}
+nav a[aria-current="page"]{text-decoration-color:var(--gold);text-decoration-thickness:2px}
+.wrap{max-width:860px;margin:0 auto}
+main{background:var(--paper);border-radius:14px;max-width:860px;margin:0 16px 32px;padding:28px 22px}
+@media(min-width:892px){main{margin:0 auto 40px;padding:40px 48px}}
+h1{font-family:var(--sans);font-size:26px;line-height:1.4;margin:0 0 8px}
+h2{font-family:var(--sans);font-size:19px;margin:32px 0 6px;padding-top:12px;border-top:1px solid var(--line)}
+.lead{font-size:18px}
+.meta{color:var(--ink-muted);font-size:15px;font-family:var(--sans)}
+.notice{border-left:4px solid var(--gold);padding:8px 14px;background:rgba(189,154,69,.10)}
+footer{color:var(--muted-field);font-family:var(--sans);font-size:14px;padding:0 16px 32px}
+footer a{color:var(--on-field)}
