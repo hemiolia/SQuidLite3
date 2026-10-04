@@ -338,6 +338,52 @@ class MemoryRemote:
         self.objects[remote_path] = raw
 
 
+class PostcopyVisibilityRemote(MemoryRemote):
+    """Sequential fake for a copied object that becomes visible after delay."""
+
+    def __init__(self, postcopy_states, *, copy_mutation=None, postcopy_error=None,
+                 copy_error=None):
+        super().__init__()
+        self.postcopy_states = list(postcopy_states)
+        self.copy_mutation = copy_mutation
+        self.postcopy_error = postcopy_error
+        self.copy_error = copy_error
+        self.uploaded = False
+        self.directory_binding_checks = 0
+        self.stat_states = []
+
+    def verify_directory_bindings(self):
+        self.directory_binding_checks += 1
+
+    def stat(self, remote_path):
+        self.stat_counts[remote_path] = self.stat_counts.get(remote_path, 0) + 1
+        if not self.uploaded:
+            self.stat_states.append("missing-before-copy")
+            return None
+        state = self.postcopy_states.pop(0) if self.postcopy_states else "visible"
+        self.stat_states.append(state)
+        if state == "missing":
+            return None
+        if state == "error":
+            raise self.postcopy_error
+        raw = self.objects.get(remote_path)
+        if raw is None:
+            return None
+        return {"IsDir": False, "Size": len(raw)}
+
+    def copyto(self, source, remote_path, *, immutable):
+        self.copy_calls.append((remote_path, immutable))
+        raw = Path(source).read_bytes()
+        if self.copy_mutation == "wrong-size":
+            raw += b"!"
+        elif self.copy_mutation == "wrong-sha":
+            raw = (b"!" + raw[1:]) if raw else b"!"
+        self.objects[remote_path] = raw
+        self.uploaded = True
+        if self.copy_error is not None:
+            raise self.copy_error
+
+
 class FullDataPublishTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -362,6 +408,153 @@ class FullDataPublishTests(unittest.TestCase):
 
     def remote_path(self, relative, generation_id=GENERATION):
         return f"mock:database/{relative}" if relative == "latest.json" else f"mock:database/{relative}"
+
+    def _single_publish_item(self):
+        raw = b"post-copy visibility fixture"
+        local = "xlsx/visibility-artifact.xlsx"
+        path = self.root / local
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return {
+            "local": local,
+            "remote": publisher._expected_remote(GENERATION, local),
+            "bytes": len(raw),
+            "sha256": digest(raw),
+        }, raw
+
+    def _visibility_progress(self, name):
+        return {
+            "path": self.state / f"{name}.progress.json",
+            "remote": "mock:database",
+            "receipts": {},
+        }
+
+    def test_publish_file_waits_for_postcopy_visibility_before_full_readback_receipt(self):
+        item, raw = self._single_publish_item()
+        remote_path = f"mock:database/{item['remote']}"
+        remote = PostcopyVisibilityRemote(["missing", "missing", "visible"])
+        progress = self._visibility_progress("visible")
+
+        with patch.object(publisher.time, "sleep") as sleep:
+            publisher._publish_file(remote, self.root, self.state, item, progress)
+
+        self.assertEqual(remote.copy_calls, [(remote_path, True)])
+        self.assertEqual(remote.stat_states, [
+            "missing-before-copy", "missing", "missing", "visible",
+        ])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60])
+        self.assertEqual(remote.directory_binding_checks, 2)
+        self.assertEqual(remote.readback_calls, [remote_path])
+        self.assertEqual(remote.objects[remote_path], raw)
+        self.assertEqual(progress["receipts"], {
+            item["local"]: {"bytes": len(raw), "sha256": digest(raw), "verified": True},
+        })
+        self.assertEqual(json.loads(progress["path"].read_text())["receipts"], progress["receipts"])
+
+    def test_immutable_control_upload_uses_the_same_postcopy_visibility_retry(self):
+        raw = b"immutable control visibility fixture"
+        remote_path = f"mock:database/generations/{GENERATION}/index.json"
+        remote = PostcopyVisibilityRemote(["missing", "missing", "visible"])
+        progress = self._visibility_progress("immutable-control")
+
+        with patch.object(publisher.time, "sleep") as sleep:
+            publisher._ensure_immutable_bytes(
+                remote, self.state, remote_path, raw, digest(raw),
+                progress=progress, receipt_key="generation_index",
+            )
+
+        self.assertEqual(remote.copy_calls, [(remote_path, True)])
+        self.assertEqual(remote.stat_states, [
+            "missing-before-copy", "missing", "missing", "visible",
+        ])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60])
+        self.assertEqual(remote.directory_binding_checks, 3)
+        self.assertEqual(remote.readback_calls, [remote_path])
+        self.assertEqual(remote.objects[remote_path], raw)
+        self.assertEqual(progress["receipts"], {
+            "generation_index": {"bytes": len(raw), "sha256": digest(raw), "verified": True},
+        })
+
+    def test_known_completed_immutable_copy_still_uses_visibility_retry_without_reupload(self):
+        raw = b"ambiguous immutable upload completed remotely"
+        remote_path = f"mock:database/generations/{GENERATION}/index.json"
+        remote = PostcopyVisibilityRemote(
+            ["visible", "missing", "missing", "visible"],
+            copy_error=publisher.TemporaryRemoteError("REMOTE_TEMPORARY"),
+        )
+        progress = self._visibility_progress("ambiguous-completed")
+
+        with patch.object(publisher.time, "sleep") as sleep:
+            publisher._ensure_immutable_bytes(
+                remote, self.state, remote_path, raw, digest(raw),
+                progress=progress, receipt_key="generation_index",
+            )
+
+        self.assertEqual(remote.copy_calls, [(remote_path, True)])
+        self.assertEqual(remote.stat_states, [
+            "missing-before-copy", "visible", "missing", "missing", "visible",
+        ])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60])
+        self.assertEqual(remote.readback_calls, [remote_path, remote_path])
+        self.assertEqual(progress["receipts"], {
+            "generation_index": {"bytes": len(raw), "sha256": digest(raw), "verified": True},
+        })
+
+    def test_permanently_missing_postcopy_object_is_bounded_and_unreceipted(self):
+        item, _raw = self._single_publish_item()
+        remote = PostcopyVisibilityRemote(["missing"] * (publisher.RETRY_LIMIT + 1))
+        progress = self._visibility_progress("still-missing")
+
+        with patch.object(publisher.time, "sleep") as sleep:
+            with self.assertRaises(publisher.PublishError) as caught:
+                publisher._publish_file(remote, self.root, self.state, item, progress)
+
+        self.assertEqual(caught.exception.category, "REMOTE_OBJECT_MISSING")
+        self.assertEqual(remote.copy_calls, [(f"mock:database/{item['remote']}", True)])
+        self.assertEqual(len(remote.stat_states), 2 + publisher.RETRY_LIMIT)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60, 90, 120, 150])
+        self.assertEqual(remote.directory_binding_checks, publisher.RETRY_LIMIT)
+        self.assertEqual(remote.readback_calls, [])
+        self.assertEqual(progress["receipts"], {})
+        self.assertFalse(progress["path"].exists())
+
+    def test_postcopy_wrong_size_hash_and_remote_error_fail_without_visibility_retry(self):
+        cases = (
+            ("wrong-size", "visible", None, "REMOTE_SIZE_MISMATCH"),
+            ("wrong-sha", "visible", None, "REMOTE_READBACK_MISMATCH"),
+            (None, "error", publisher.TemporaryRemoteError("REMOTE_TEMPORARY"), "REMOTE_TEMPORARY"),
+        )
+        for index, (mutation, state, remote_error, category) in enumerate(cases):
+            with self.subTest(category=category):
+                item, _raw = self._single_publish_item()
+                remote = PostcopyVisibilityRemote(
+                    [state], copy_mutation=mutation, postcopy_error=remote_error,
+                )
+                progress = self._visibility_progress(f"immediate-{index}")
+                with patch.object(publisher.time, "sleep") as sleep:
+                    with self.assertRaises(publisher.PublishError) as caught:
+                        publisher._publish_file(remote, self.root, self.state, item, progress)
+                self.assertEqual(caught.exception.category, category)
+                self.assertEqual(len(remote.copy_calls), 1)
+                sleep.assert_not_called()
+                self.assertEqual(progress["receipts"], {})
+
+    def test_verify_remote_bytes_default_missing_behavior_remains_immediate(self):
+        remote = PostcopyVisibilityRemote([])
+        with patch.object(publisher.time, "sleep") as sleep:
+            with self.assertRaises(publisher.PublishError) as caught:
+                publisher.verify_remote_bytes(remote, "mock:database/missing", 1, digest(b"x"))
+        self.assertEqual(caught.exception.category, "REMOTE_OBJECT_MISSING")
+        self.assertEqual(remote.stat_states, ["missing-before-copy"])
+        self.assertEqual(remote.directory_binding_checks, 0)
+        sleep.assert_not_called()
+
+        with self.assertRaises(publisher.PublishError) as invalid_option:
+            publisher.verify_remote_bytes(
+                remote, "mock:database/missing", 1, digest(b"x"), allow_missing_retry=1,
+            )
+        self.assertEqual(invalid_option.exception.category, "REMOTE_VERIFY_OPTION_INVALID")
+        self.assertEqual(len(remote.stat_states), 1)
 
     def test_publishes_old36_new76_and_variable_xlsx_piece_counts(self):
         for generation_id, modes, rules, populated_modes, pieces in (

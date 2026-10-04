@@ -1376,10 +1376,21 @@ def remote_object_state(client, remote_path, expected_bytes, expected_sha):
     return True
 
 
-def verify_remote_bytes(client, remote_path, expected_bytes, expected_sha):
+def verify_remote_bytes(client, remote_path, expected_bytes, expected_sha, *, allow_missing_retry=False):
+    if type(allow_missing_retry) is not bool:
+        raise PublishError("REMOTE_VERIFY_OPTION_INVALID")
     metadata = client.stat(remote_path)
     if metadata is None:
-        raise PublishError("REMOTE_OBJECT_MISSING")
+        if not allow_missing_retry:
+            raise PublishError("REMOTE_OBJECT_MISSING")
+        for attempt in range(RETRY_LIMIT):
+            verify_remote_directories(client)
+            time.sleep(30 * (attempt + 1))
+            metadata = client.stat(remote_path)
+            if metadata is not None:
+                break
+        if metadata is None:
+            raise PublishError("REMOTE_OBJECT_MISSING")
     if metadata.get("Size") != expected_bytes:
         raise PublishError("REMOTE_SIZE_MISMATCH")
     if client.readback(remote_path) != (expected_bytes, expected_sha):
@@ -1781,7 +1792,7 @@ def _ensure_immutable_bytes(client, state_dir, remote_path, raw, expected_sha, *
                         and remote_object_state(client, remote_path, *expected)):
                     break
                 raise
-        verify_remote_bytes(client, remote_path, *expected)
+        verify_remote_bytes(client, remote_path, *expected, allow_missing_retry=True)
         _record_file_receipt(progress, receipt_key, {"bytes": expected[0], "sha256": expected_sha})
     finally:
         try:
@@ -1813,7 +1824,9 @@ def _publish_file(client, root, state_dir, item, progress):
                     and remote_object_state(client, remote_path, item["bytes"], item["sha256"])):
                 break
             raise
-    verify_remote_bytes(client, remote_path, item["bytes"], item["sha256"])
+    verify_remote_bytes(
+        client, remote_path, item["bytes"], item["sha256"], allow_missing_retry=True,
+    )
     _record_file_receipt(progress, item["local"], item)
 
 
