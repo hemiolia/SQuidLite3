@@ -287,6 +287,60 @@ class FullBuildTests(PartsTestBase):
         self.assertEqual(report["copies"]["mismatched"], 1)
 
 
+class AuditThroughTests(PartsTestBase):
+    def test_changes_after_build_are_explained(self):
+        self.build()
+        base = self.audit()
+        self.assertTrue(base["ok"], base)
+        through = base["through_event_id"]
+        self.assertIsNotNone(through)
+        for info in base["tables"].values():
+            self.assertEqual((info["changed_after_build"], info["unexplained"]), (0, 0))
+        # 部品作成後に、変更追跡つきで追加・更新・削除する
+        conn = self.src.connect()
+        with conn:
+            self.src.match(conn, "late")
+            conn.execute("UPDATE match_tags SET note='後' WHERE tag='タグ甲'")
+            conn.execute("DELETE FROM jobs WHERE operation='op2'")
+        conn.close()
+        report = self.audit()
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["through_event_id"], through)
+        for table in ("matches", "match_tags", "jobs", "archive_change_feed"):
+            info = report["tables"][table]
+            self.assertGreater(info["changed_after_build"], 0, table)
+            self.assertEqual(info["unexplained"], 0, table)
+        self.assertGreater(report["tables"]["matches"]["mismatched"], 0)
+
+    def test_untracked_tampering_is_unexplained(self):
+        self.build()
+        conn = self.src.connect()
+        with conn:
+            self.src.match(conn, "late")  # 追跡つきの正当な変化が併存しても区別できる
+        conn.close()
+        conn = sqlite3.connect(self.out / MATCH_PART)
+        conn.execute("UPDATE matches SET last_seen='改ざん' WHERE match_key='m1'")
+        conn.commit()
+        conn.close()
+        report = self.audit()
+        self.assertFalse(report["ok"])
+        info = report["tables"]["matches"]
+        self.assertEqual(info["unexplained"], 1)
+        self.assertEqual(len(info["first_unexplained_rowids"]), 1)
+        self.assertGreater(info["changed_after_build"], 0)
+
+    def test_no_catalog_behaves_as_before(self):
+        self.build()
+        (self.out / "catalog.sqlite3").unlink()
+        report = self.audit()
+        self.assertIsNone(report["through_event_id"])
+        self.assertTrue(report["ok"], report)
+        self.src.execute("INSERT INTO issues(code,context,created_at) VALUES('n','{}','t')")
+        report = self.audit()
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["tables"]["issues"]["changed_after_build"], 0)
+
+
 class WeirdValueTests(PartsTestBase):
     def test_type_and_value_fidelity(self):
         conn = self.src.connect()

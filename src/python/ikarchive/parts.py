@@ -1231,14 +1231,48 @@ def _visible_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return cols
 
 
+def _catalog_through(parts_root: Path) -> Optional[int]:
+    """目録 status の through_event_id。目録・表・値のどれかが無ければ None。"""
+    catalog = parts_root / CATALOG_NAME
+    if not catalog.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(_ro_uri(catalog), uri=True)
+        try:
+            row = conn.execute("SELECT through_event_id FROM status LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return row[0] if row and isinstance(row[0], int) else None
+
+
 def audit(source_path: str | os.PathLike, parts_dir: str | os.PathLike) -> dict[str, Any]:
-    """正本と全部品の本籍行の和を、表ごとに (rowid, 各列の typeof と値) の SHA-256 で照合する。"""
+    """正本と全部品の本籍行の和を、表ごとに (rowid, 各列の typeof と値) の SHA-256 で照合する。
+
+    目録に through_event_id があれば、それより後の変更追跡に現れる (表, rowid) の不一致は
+    作成後の変化（changed_after_build）として、現れない不一致（unexplained）と分けて数える。
+    ok は全表で unexplained が 0 のときに真。
+    """
     parts_root = Path(parts_dir)
+    through = _catalog_through(parts_root)
+    changed: set[tuple[str, int]] = set()
     src = sqlite3.connect(_ro_uri(Path(source_path)), uri=True, isolation_level=None)
     src_digests: dict[str, dict[int, bytes]] = {}
     columns: dict[str, list[str]] = {}
     try:
         src.execute("BEGIN")
+        has_feed = src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (CHANGE_TABLE,)
+        ).fetchone() is not None
+        if through is not None and has_feed:
+            for table_name, old_rowid, new_rowid in src.execute(
+                f"SELECT table_name,old_rowid,new_rowid FROM {_q(CHANGE_TABLE)} WHERE event_id>?", (through,)
+            ):
+                if old_rowid is not None:
+                    changed.add((table_name, old_rowid))
+                if new_rowid is not None:
+                    changed.add((table_name, new_rowid))
         names = [
             r[0] for r in src.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
@@ -1251,6 +1285,8 @@ def audit(source_path: str | os.PathLike, parts_dir: str | os.PathLike) -> dict[
             for rowid, rep in src.execute(_digest_query(table, columns[table])):
                 digests[rowid] = _digest(rowid, rep)
             src_digests[table] = digests
+            if table == CHANGE_TABLE and through is not None:
+                changed.update((CHANGE_TABLE, rid) for rid in digests if rid > through)
         src.execute("COMMIT")
     finally:
         src.close()
@@ -1296,25 +1332,38 @@ def audit(source_path: str | os.PathLike, parts_dir: str | os.PathLike) -> dict[
                 bad.append(rowid)
         bad.extend(rowid for rowid in parts if rowid not in source)
         bad.sort()
+        after = [rid for rid in bad if (table, rid) in changed]
+        unexplained = [rid for rid in bad if (table, rid) not in changed]
         tables_result[table] = {
             "source_rows": len(source),
             "part_rows": sum(len(v) for v in parts.values()),
             "mismatched": len(bad),
             "first_mismatch_rowids": bad[:10],
+            "changed_after_build": len(after),
+            "unexplained": len(unexplained),
+            "first_unexplained_rowids": unexplained[:10],
         }
-        if bad or len(source) != sum(len(v) for v in parts.values()):
+        if unexplained:
             all_ok = False
+        elif not bad and len(source) != sum(len(v) for v in parts.values()):
+            all_ok = False  # 行数だけが合わない（重複など）
     copy_bad = []
+    copy_after = 0
     for table, rowid, digest, rel in copies:
         homes = part_digests.get(table, {}).get(rowid)
         if not homes or homes[0] != digest:
-            copy_bad.append([table, rowid, rel])
+            if (table, rowid) in changed:
+                copy_after += 1
+            else:
+                copy_bad.append([table, rowid, rel])
     if copy_bad:
         all_ok = False
     return {
         "ok": all_ok,
+        "through_event_id": through,
         "tables": tables_result,
-        "copies": {"checked": len(copies), "mismatched": len(copy_bad), "first_mismatch": copy_bad[:10]},
+        "copies": {"checked": len(copies), "mismatched": len(copy_bad), "first_mismatch": copy_bad[:10],
+                   "changed_after_build": copy_after},
         "part_files": len(part_paths),
         "errors": errors,
     }
