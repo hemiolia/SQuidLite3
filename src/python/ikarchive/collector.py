@@ -85,8 +85,6 @@ def sync(store,account=None,data_path=None,budget=250,delay=1.5):
                 store.queue(account,op,v)
                 # Roots with cursor pagination are scanned again daily, histories on each pass.
                 store.db.execute("UPDATE jobs SET state='pending',next_attempt=0 WHERE account=? AND operation=? AND variables_json=? AND state='done' AND (? OR next_attempt<=?)",(account,op,js(v),int(op in HISTORIES),time.time()))
-            # Refresh successful detail/record jobs daily; failure state is never reset to success.
-            store.db.execute("UPDATE jobs SET state='pending' WHERE account=? AND state='done' AND next_attempt<=?",(account,time.time()))
             # A repeated-page guard applies to a crawl epoch, not to last day's identical content.
             store.db.execute('DELETE FROM page_fingerprints WHERE account=?',(account,))
         apply_scope(store,account)

@@ -9,7 +9,8 @@
 (3) XRankingDetailRefetchQuery は一度も送られない (superseded)。
     (負例: 終了済みシーズンの XRankingDetailQuery は送信される)
 (4) 終了後に取得済みの done_final ジョブが翌日 sync でも再要求されない。
-    (負例: 通常の done ジョブは次回 sync で期限到来時に再要求される)
+    (負例: 未取得 (pending) の詳細の仕事は送信される。成功済み (done) の詳細の仕事は、期限が過ぎても
+     pending に戻らず再要求されない。2026-10-06 前田さんの判断: 取得に成功した試合詳細を取り直すこと自体が誤り)
 (5) BankaraBattleHistoriesQuery と VsHistoryDetailQuery は対象外 (unrestricted) として送信可能。
     (負例: 同一実行内にある不適格なスコープ対象操作は遮断される)
 """
@@ -441,7 +442,8 @@ class RankingIntegrationTests(unittest.TestCase):
 
     def test_4_done_final_job_not_re_requested_on_next_day_sync(self):
         """(4) 終了後に取得済みのdone_finalジョブが翌日syncでも再要求されない。
-        負例: 通常のdoneジョブ (next_attempt到来) は翌日syncでpendingに戻り再要求される。
+        負例: 未取得 (pending) の詳細の仕事は要求される。成功済み (done) の詳細の仕事は、next_attempt が
+        過ぎても翌日syncでpendingに戻らず再要求されない (取得に成功した試合詳細を取り直さない)。
         """
         account = 'acc-synthetic-4'
         manifest = make_manifest(['XRankingDetailQuery', 'VsHistoryDetailQuery'])
@@ -476,12 +478,14 @@ class RankingIntegrationTests(unittest.TestCase):
             (rid_detail, account),
         )
 
-        # 負例: 通常の done ジョブ (VsHistoryDetailQuery) を配置 (next_attempt=0)
+        # 負例: 成功済みの done ジョブ (VsHistoryDetailQuery) を配置 (next_attempt=0)。再要求されない。
         self.store.queue(account, 'VsHistoryDetailQuery', {'vsResultId': 'vs-test-normal'})
         self.store.db.execute(
             "UPDATE jobs SET state='done', next_attempt=0 WHERE account=? AND operation='VsHistoryDetailQuery'",
             (account,),
         )
+        # 負例 (空振りの防止): 未取得の pending ジョブ (VsHistoryDetailQuery) を配置。こちらは要求される。
+        self.store.queue(account, 'VsHistoryDetailQuery', {'vsResultId': 'vs-test-pending'})
         self.store.db.commit()
 
         seen_queries = []
@@ -516,8 +520,15 @@ class RankingIntegrationTests(unittest.TestCase):
         # 検証 (4): 終了後取得済みの done_final ジョブは翌日 sync でも再要求されない
         self.assertNotIn('XRankingDetailQuery', seen_ops, 'done_finalジョブが翌日syncで再要求されてはならない')
 
-        # 負例: 通常の done ジョブは次回 sync で pending に復帰して再要求される
-        self.assertIn('VsHistoryDetailQuery', seen_ops, '通常のdoneジョブは翌日syncで再要求されなければならない')
+        # 負例: 未取得 (pending) の詳細の仕事だけが要求される。成功済み (done) の詳細の仕事は pending に戻らず再要求されない
+        self.assertIn('VsHistoryDetailQuery', seen_ops, '未取得のpendingジョブはsyncで要求されなければならない')
+        requested = [v for op, v in seen_queries if op == 'VsHistoryDetailQuery']
+        self.assertEqual(requested, [{'vsResultId': 'vs-test-pending'}], '成功済みのdoneジョブは翌日syncで再要求されてはならない')
+        normal_job = self.store.db.execute(
+            "SELECT state FROM jobs WHERE account=? AND operation='VsHistoryDetailQuery' AND variables_json=?",
+            (account, js({'vsResultId': 'vs-test-normal'})),
+        ).fetchone()
+        self.assertEqual(normal_job['state'], 'done')
 
         # ジョブ状態の確認
         final_job = self.store.db.execute(

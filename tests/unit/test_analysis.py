@@ -128,6 +128,11 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT analysis_set FROM match_classification").fetchone()[0], 'private_two_vs_two')
         self.store.queue('account-a', 'PrivateBattleHistoriesQuery', {})
         self.store.db.execute("UPDATE jobs SET state='done' WHERE operation='PrivateBattleHistoriesQuery'")
+        # 詳細が保存済みの試合の詳細の仕事と、一覧ではない履歴（名前に History を含む）の仕事は、遡りで戻さない
+        key = self.store.db.execute('SELECT match_key FROM matches').fetchone()[0]
+        self.store.queue('account-a', 'VsHistoryDetailQuery', {'vsResultId': 'saved-detail'}, 'vs', key)
+        self.store.queue('account-a', 'HeroHistoryQuery', {})
+        self.store.db.execute("UPDATE jobs SET state='done' WHERE operation IN ('VsHistoryDetailQuery','HeroHistoryQuery')")
         self.store.db.commit()
         expiry = (datetime.now(timezone.utc) + timedelta(days=700)).timestamp() * 1000
         self.store.remember_auth({'session_iat': 100, 'session_expires_at': expiry})
@@ -136,6 +141,8 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(self.store.auth_status()['backfill_armed'])
         self.assertGreaterEqual(self.store.apply_backfill('account-a'), 1)
         self.assertEqual(self.store.db.execute("SELECT state FROM jobs WHERE operation='PrivateBattleHistoriesQuery'").fetchone()[0], 'pending')
+        self.assertEqual(self.store.db.execute("SELECT state FROM jobs WHERE operation='VsHistoryDetailQuery'").fetchone()[0], 'done')
+        self.assertEqual(self.store.db.execute("SELECT state FROM jobs WHERE operation='HeroHistoryQuery'").fetchone()[0], 'done')
         self.assertEqual(self.store.apply_backfill('account-a'), 0)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM matches').fetchone()[0], 1)
 

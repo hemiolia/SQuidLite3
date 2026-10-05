@@ -46,6 +46,8 @@ DETAIL_ROOTS={
     'VsHistoryDetailQuery':'vsHistoryDetail',
     'CoopHistoryDetailQuery':'coopHistoryDetail',
 }
+# 試合の種類（matches.kind）から、その試合の詳細を取得する operation を引く。
+DETAIL_OPERATIONS={'vs':'VsHistoryDetailQuery','coop':'CoopHistoryDetailQuery'}
 EXPECTED_NULL_ROOTS={
     'useCurrentFestQuery':'currentFest',
 }
@@ -164,6 +166,13 @@ class Store:
                          (run,response,code,serialized,now()))
     def queue(self,account,operation,variables,kind=None,key=None):
         self.db.execute('INSERT OR IGNORE INTO jobs(account,operation,variables_json,kind,match_key) VALUES(?,?,?,?,?)',(account,operation,js(variables),kind,key))
+    def _detail_job_needed(self,account,kind,key):
+        # 前田さんの判断（2026-10-06）: 取得に成功した試合詳細を取り直すこと自体が誤り。重複を作らない。
+        # 一覧ごとに ID の文字列は違う（…:PRIVATE:… と …:RECENT:…）が、試合を指す match_key は同じ。
+        # 詳細が保存済み、または同じ試合の詳細取得の仕事がすでに jobs にあるなら、新しい仕事は作らない。
+        # 既存の仕事の state は問わない（再試行・unavailable の扱いは、その仕事が従来どおり持つ）。
+        if self.db.execute('SELECT 1 FROM matches WHERE account=? AND kind=? AND match_key=? AND detail_response_id IS NOT NULL',(account,kind,key)).fetchone():return False
+        return self.db.execute('SELECT 1 FROM jobs WHERE account=? AND operation=? AND match_key=?',(account,DETAIL_OPERATIONS[kind],key)).fetchone() is None
     def record(self,e,run=None):
         raw=base64.b64decode(e['body_base64'],validate=True);sha=digest(raw);text=None;error=None
         try:
@@ -249,6 +258,9 @@ class Store:
                             if eid:self.db.execute('INSERT INTO entities VALUES(?,?,?,?,?) ON CONFLICT(account,typename,entity_id) DO UPDATE SET response_id=excluded.response_id,json_text=excluded.json_text WHERE entities.json_text IS NOT excluded.json_text',(account,a,eid,rid,js(b)))
                             for q,v in planner.related(a,b,country):
                                 ident=identity(eid) if eid else None
+                                # 試合の詳細取得は _matches と同じ判定を通す。ここでも無条件に作ると、
+                                # 別の一覧の ID 文字列ごとに、同じ試合の二つ目の仕事ができる。
+                                if ident and q==DETAIL_OPERATIONS[ident[0]] and not self._detail_job_needed(account,*ident):continue
                                 self.queue(account,q,v,*(ident or (None,None)))
                         elif event in ('next','page'):
                             if event=='page':
@@ -347,7 +359,19 @@ class Store:
                     else:
                         self.db.execute('UPDATE jobs SET state=?,attempts=attempts+1,next_attempt=?,last_response_id=? WHERE account=? AND operation=? AND variables_json=?',
                             (outcome,time.time()+(86400 if outcome in ('done','unavailable') else 300),r['id'],r['account'],r['operation'],r['variables_json']))
+                        # 詳細が取れたら、同じ試合の同じ詳細 operation で未処理の仕事（別の一覧の ID 文字列で
+                        # 作られた分）は不要になる。同じトランザクションで superseded にする。
+                        if outcome=='done' and r['operation'] in DETAIL_ROOTS:
+                            self._supersede_detail_jobs(r,data)
                 self.db.execute('UPDATE response_fetches SET acknowledged=1 WHERE event_id=?',(fetched['event_id'],))
+    def _supersede_detail_jobs(self,r,data):
+        # 取れた詳細の試合（応答の根の id から求める）について、同じ詳細 operation のほかの仕事のうち、
+        # まだ取っていないもの（pending・retry）だけを superseded にする。done・unavailable などは触らない。
+        detail=data.get(DETAIL_ROOTS[r['operation']]) if isinstance(data,dict) else None
+        ident=identity(detail.get('id')) if isinstance(detail,dict) else None
+        if ident:
+            self.db.execute("UPDATE jobs SET state='superseded' WHERE account=? AND operation=? AND match_key=? AND variables_json!=? AND state IN ('pending','retry')",
+                (r['account'],r['operation'],ident[1],r['variables_json']))
     def _write_weapon_snapshots(self,r,data,fetched_at,event_id):
         for item in weapon_snapshots(data):
             self.db.execute('''INSERT INTO rate_points(account,series_id,label,genre,rule_raw,match_key,played_time,value,source,priority)
@@ -370,7 +394,8 @@ class Store:
             else:
                 self.db.execute('INSERT INTO matches VALUES(?,?,?,?,?,NULL) ON CONFLICT(account,kind,match_key) DO UPDATE SET last_seen=MAX(last_seen,excluded.last_seen),first_seen=MIN(first_seen,excluded.first_seen) WHERE excluded.last_seen > matches.last_seen OR excluded.first_seen < matches.first_seen',(a,kind,key,t,t))
             self.db.execute('INSERT OR IGNORE INTO match_refs VALUES(?,?,?,?)',(a,kind,v['id'],key))
-            self.queue(a,'VsHistoryDetailQuery' if kind=='vs' else 'CoopHistoryDetailQuery',{'vsResultId' if kind=='vs' else 'coopHistoryDetailId':v['id']},kind,key)
+            if self._detail_job_needed(a,kind,key):
+                self.queue(a,DETAIL_OPERATIONS[kind],{'vsResultId' if kind=='vs' else 'coopHistoryDetailId':v['id']},kind,key)
             self.db.execute('INSERT OR IGNORE INTO sightings VALUES(?,?,?,?,?,?)',(r['id'],a,kind,key,js(path),js(v)))
             # Only a full detail operation can replace the canonical detail projection.
             full=(r['operation']=='VsHistoryDetailQuery' and kind=='vs' and len(path)==1) or (r['operation']=='CoopHistoryDetailQuery' and kind=='coop' and len(path)==1)
@@ -515,16 +540,21 @@ class Store:
             'session_expires_soon':remaining is not None and remaining<14*86400,
             'backfill_armed':self._control('backfill_armed')=='1',
         }
+    # 再認証後に遡って見直す戦績の一覧（collector.HISTORIES と同じ7種）。部分一致（'%Histor%'）は
+    # 試合詳細・ヒーロー・ブキの履歴なども拾い、保存済みの詳細を取り直させていた（2026-10-06 修正）。
+    BACKFILL_HISTORY_OPS=('LatestBattleHistoriesQuery','RegularBattleHistoriesQuery','BankaraBattleHistoriesQuery','XBattleHistoriesQuery','EventBattleHistoriesQuery','PrivateBattleHistoriesQuery','CoopHistoryQuery')
     def apply_backfill(self,account):
         """After re-authentication, walk saved history pages again once. Do not delete rows."""
         if self._control('backfill_armed')!='1' or self._control('backfill_reset_done')=='1':return 0
         with self.db:
             self._control('backfill_reset_done','1')
-            cur=self.db.execute('''UPDATE jobs SET state='pending',next_attempt=0 WHERE account=? AND state IN ('done','unavailable') AND (operation LIKE '%Histor%' OR operation='CoopHistoryQuery' OR (operation IN ('VsHistoryDetailQuery','CoopHistoryDetailQuery') AND match_key IN (SELECT match_key FROM matches WHERE account=? AND detail_response_id IS NULL)))''',(account,account))
+            ops=','.join('?'*len(self.BACKFILL_HISTORY_OPS))
+            cur=self.db.execute(f'''UPDATE jobs SET state='pending',next_attempt=0 WHERE account=? AND state IN ('done','unavailable') AND (operation IN ({ops}) OR (operation IN ('VsHistoryDetailQuery','CoopHistoryDetailQuery') AND match_key IN (SELECT match_key FROM matches WHERE account=? AND detail_response_id IS NULL)))''',(account,*self.BACKFILL_HISTORY_OPS,account))
             return cur.rowcount
     def finish_backfill(self,account):
         if self._control('backfill_armed')!='1':return
-        pending=self.db.execute("SELECT count(*) FROM jobs WHERE account=? AND state IN ('pending','retry') AND (operation LIKE '%Histor%' OR operation='CoopHistoryQuery')",(account,)).fetchone()[0]
+        ops=','.join('?'*len(self.BACKFILL_HISTORY_OPS))
+        pending=self.db.execute(f"SELECT count(*) FROM jobs WHERE account=? AND state IN ('pending','retry') AND operation IN ({ops})",(account,*self.BACKFILL_HISTORY_OPS)).fetchone()[0]
         if pending==0:
             with self.db:self.db.execute("DELETE FROM control WHERE key IN ('backfill_armed','backfill_reset_done')")
     def _reclassify(self):
