@@ -18,8 +18,8 @@
 2. 公開できたら、Google Cloud の「Google Auth Platform」の「ブランディング」で、次を入れる。画面の項目名が違っていたら、その画面を見せてもらえれば、その場で合わせる。
    - 承認済みドメイン: `sql3.ink`（先に入れる。Google の案内でも、リンクより先に入れることになっている）
    - アプリケーションのホームページ: `https://sql3.ink/`
-   - プライバシーポリシーのリンク: `https://sql3.ink/privacy.html`
-   - 利用規約のリンク: `https://sql3.ink/terms.html`
+   - プライバシーポリシーのリンク: `https://sql3.ink/privacy`
+   - 利用規約のリンク: `https://sql3.ink/terms`
 3. ドメインの所有確認を求められたら、Google Search Console で sql3.ink を確認する。sql3.ink は Cloudflare で管理しているので、Search Console の案内に従えば Cloudflare 経由で自動で済むことが多い。
 4. 「対象」で「アプリを公開」を押して本番にする。
 5. 最後に、NAS の rclone 設定にこのクライアントを入れ、ブラウザで一度だけ認証する。手順はそのときに案内する。

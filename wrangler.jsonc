@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "squidlite3",
+  "compatibility_date": "2026-10-01",
+  "observability": {
+    "enabled": true
+  },
+  // 配信するのは site/ だけ（公式ページ・プライバシーポリシー・利用規約）。記録やリポジトリの他のファイルは配信しない。
+  "assets": {
+    "directory": "site"
+  },
+  "routes": [
+    { "pattern": "sql3.ink", "custom_domain": true }
+  ]
+}
