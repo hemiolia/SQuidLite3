@@ -1,4 +1,4 @@
-# SQuidLite3 データ配置（設計 0.3・2026-10-05 Opus 5.5）
+# SQuidLite3 データ配置（設計 0.4・2026-10-05 Opus 5.5）
 
 ## この設計が満たす前田さんの指示（要点。全文は開発ログの原文）
 
@@ -26,6 +26,28 @@
 4. **目録が一枚ある。** `catalog.sqlite3` に、全部品の住所・バイト数・SHA-256・表ごとの行数、全試合の一覧、応答と画像の住所録、本籍規則、日本語名の対応、分析の手引きを置く。たいていの集計は目録だけで済む。目録は公開の確定点であり、最後に置く。
 5. **更新は変わった部品だけ。** 正本の変更追跡 `archive_change_feed`（表名・旧 rowid・新 rowid・旧キー・新キー）と、状態 DB に持つ前回の本籍 `row_homes` から、変わった行の移動元と移動先の部品を求め、その部品だけを作り直す。
 6. **完全性は部品の和で検査する。** 全表について、本籍部品の行（写しを除く）の和が正本の行全体と一致すること（`rowid` と全列の値のハッシュで照合）を検査し、結果を目録に記録する。
+
+
+## 版 3 の改定（設計 0.4、2026-10-05 23時の実測にもとづく）
+
+実測（版 2、NAS 試運転）: 追いついた後のふだんの1周期が 531秒・48部品・1,206MB。1日1モード1ルールの部品が最大 141.9MB。原因は、(1) 同じ応答の取り直しのたびに収集が一覧に載る全試合の `matches.last_seen` を書き換えていた（store.py の再観測の経路）、(2) 一覧の目撃記録 `sightings` と取り直しの記録 `response_fetches` が古い部品に住所を持ち、古い部品を毎回作り直させていた、(3) 試合の部品が日単位で大きかった。
+
+前田さんの判断（2026-10-05）: 同じ内容の再観測では書き換えない。
+
+### 収集側の変更（正本）
+
+- 同じ応答の取り直し（再観測）では、`matches` の行を書き換えない。新しい内容の応答でも、値が変わらない更新はしない。
+- `entities` は JSON が変わったときだけ書き換える（`response_id` は、その内容を最初に観測した応答を指す）。
+- 正本にビュー `match_observations(account, kind, match_key, first_observed_at, last_observed_at, observing_responses)` を足す。`last_observed_at` は、その試合を載せた応答の最新の取得時刻（取り直しを含む）。2026-10-05 の実測で、変更前の `matches.last_seen` と全992試合で一致する式（`first_observed_at` も `first_seen` と全件一致）。以後の `matches.last_seen` は「その試合を載せた新しい内容の応答を最後に保存した時刻」になる。
+
+### 本籍規則 版 3
+
+- 試合は1試合1部品: `matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>.sqlite3`（日時不明は `matches/<analysis_set>/<rule_raw>/unknown-date/<match_key>.sqlite3`）。
+- 試合詳細でない応答: `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<HH>.sqlite3`（fetched_at の日本時間の時）。ランキング系は従来どおり1応答1部品。
+- `sightings` は、その応答（response_id）の本籍に置く（一覧の目撃記録は一覧の応答の部品へ、詳細の目撃記録は試合の部品へ）。
+- `response_fetches` は、自身の fetched_at の日本時間の日付で `fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`。
+- そのほかは版 2 と同じ。
+- 規則の版が変わったときは、空の出力先に全部品を作る（古い版の部品を同じ場所に混ぜない）。
 
 ## 置き場所
 
