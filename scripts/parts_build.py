@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""SQuidLite3 データ配置の部品作成と監査の CLI（設計 0.2）。
+"""SQuidLite3 データ配置の部品作成と監査の CLI（設計 0.4・本籍規則 版 3）。
 
   build  --source 正本 --out 出力ディレクトリ --state 状態DB [--work-dir 作業ディレクトリ]
   audit  --source 正本 --out 出力ディレクトリ
 
 正本へは書き込まない（読み取りは mode=ro）。結果は JSON を標準出力へ出す。
+build は、規則の版が状態 DB の記録と違う（または記録が無い）のに出力先が空でないとき、何も書かずに
+標準エラーへ QUESTION: で始まる説明を出して終了コード 2 で終わる（古い版の部品を同じ場所に混ぜない）。
 """
 
 from __future__ import annotations

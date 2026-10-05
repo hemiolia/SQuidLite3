@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SQuidLite3 の部品を作り、Google Drive（rclone）へ送って SHA-256 で照合する常駐 worker（設計 0.3）。
+"""SQuidLite3 の部品を作り、Google Drive（rclone）へ送って SHA-256 で照合する常駐 worker（設計 0.4・本籍規則 版 3）。
 
   parts_worker.py --source DB --out DIR --state PATH --work-dir DIR --remote REMOTE:db \\
                   --rclone BIN --rclone-config CONF [--interval 60] [--once]
@@ -11,6 +11,8 @@
   4. 全部品が published と一致したときだけ、README_FOR_AI.md と catalog.sqlite3（公開の確定点）を同じ方法で送って照合する。
      目録は送る直前に status.published_at を書き、書いた後の SHA-256 で照合する。
 一周期ごとに JSON を一行、標準出力へ出す。例外は握りつぶさずログ（標準エラー）に出して次の周期へ進む。
+規則の版が状態 DB の記録と違うのに出力先が空でないときは、build_parts が何も書かずに PartsQuestion
+（QUESTION: で始まるメッセージ）で止まる。worker はそれをログに出し、何も送らずに次の周期へ進む。
 二重起動は状態 DB と同じ場所のロックファイル（fcntl.flock、非ブロック）で防ぐ。
 rclone は run_rclone 一つから呼ぶ（シェルを使わない）。
 """

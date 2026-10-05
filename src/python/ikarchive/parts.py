@@ -1,10 +1,10 @@
-"""SQuidLite3 データ配置（設計 0.3）の部品作成と監査。
+"""SQuidLite3 データ配置（設計 0.4・本籍規則 版 3）の部品作成と監査。
 
 正本の SQLite を読み取り専用で開き、同じ静止点から「本籍」ごとの小さな SQLite 部品
 （正本と同じ全表・全索引・全ビュー）と目録 catalog.sqlite3 を作る。
 正本へは書き込まない。純粋なライブラリで、ネットワークにも Drive にも触れない。
 
-設計書: docs/design/SQuidLite3_データ配置.md
+設計書: docs/design/SQuidLite3_データ配置.md（「版 3 の改定」の「本籍規則 版 3」）
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-HOME_RULE_VERSION = 2
+HOME_RULE_VERSION = 3
 CHANGE_TABLE = "archive_change_feed"
 PART_SUFFIX = ".sqlite3"
 CATALOG_NAME = "catalog.sqlite3"
@@ -59,30 +59,45 @@ SYSTEM_TABLES = (
     "schema_version",
     "analysis_genre",
 )
-_BY_MATCH_TABLES = ("match_classification", "match_refs", "sightings", "documents")
-_BY_RESPONSE_TABLES = ("response_fetches", "asset_refs", "entities")
+_BY_MATCH_TABLES = ("match_classification", "match_refs", "documents")
+# response_id の応答の本籍に置く表（版 3 で sightings を試合から応答へ移し、response_fetches は自身の日付へ移した）
+_BY_RESPONSE_TABLES = ("sightings", "asset_refs", "entities")
 
-# 目録 table_homes の内容（設計書「本籍規則」の表。規則の版は HOME_RULE_VERSION）
+# 目録 table_homes の内容（設計書「本籍規則 版 3」。規則の版は HOME_RULE_VERSION）。
+# <match_key> は encode_segment した値（英数字・_・- 以外は ~ と16進2桁）。
+_MATCH_PATTERN = (
+    "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>.sqlite3"
+    "（日時不明は matches/<analysis_set>/<rule_raw>/unknown-date/<match_key>.sqlite3）"
+)
+_RESPONSE_PATTERN = (
+    "responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<HH>.sqlite3"
+    "（HH は fetched_at の日本時間の時。日時不明は responses/<operation>/unknown-date.sqlite3。"
+    "ランキング系の operation は responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<response_id>.sqlite3、"
+    "日時不明は responses/<operation>/unknown-date/<response_id>.sqlite3）"
+)
+_FETCH_PATTERN = (
+    "fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"
+    "（日付は行自身の fetched_at の日本時間。日時不明は fetches/unknown-date.sqlite3）"
+)
 TABLE_HOMES = (
-    ("matches", "その試合の本籍", "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
-    ("match_classification", "その試合の本籍", "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
-    ("match_refs", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
-    ("sightings", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
-    ("documents", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
-    ("match_tags", "(account, match_key) が一致する試合の本籍（vs 優先）。無ければ unplaced",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3"),
+    ("matches", "その試合の本籍（1 試合 1 ファイル）", _MATCH_PATTERN),
+    ("match_classification", "その試合の本籍（1 試合 1 ファイル）", _MATCH_PATTERN),
+    ("match_refs", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced", _MATCH_PATTERN),
+    ("sightings",
+     "その行の response_id の応答の本籍（一覧の目撃記録は一覧の応答の部品、詳細の目撃記録は試合の部品）。応答が無ければ unplaced",
+     "応答の本籍と同じ（responses の行と同じ部品）"),
+    ("documents", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced", _MATCH_PATTERN),
+    ("match_tags", "(account, match_key) が一致する試合の本籍（vs 優先）。無ければ unplaced", _MATCH_PATTERN),
     ("rate_points", "match_key が fetch: で始まらなければその試合の本籍、fetch:<event_id> なら response_fetches.event_id の応答の本籍",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3 または responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3（ランキング系は .../<YYYY-MM-DD>/<response_id>.sqlite3）"),
-    ("jobs", "kind と match_key があればその試合の本籍。試合行が無い・無ければ system/jobs",
-     "matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3 または system/jobs.sqlite3"),
-    ("responses", "応答の本籍（documents のある試合の本籍、無ければ operation と fetched_at の日付。ランキング系の operation は 1 応答 1 部品）",
-     "matches/... または responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3（ランキング系は .../<YYYY-MM-DD>/<response_id>.sqlite3）"),
-    ("response_fetches", "response_id の応答の本籍", "応答の本籍と同じ"),
-    ("asset_refs", "response_id の応答の本籍", "応答の本籍と同じ"),
-    ("entities", "response_id の応答の本籍", "応答の本籍と同じ"),
+     _MATCH_PATTERN + " または 応答の本籍と同じ（responses の行と同じ部品）"),
+    ("jobs", "kind と match_key があり、その試合行があればその試合の本籍。それ以外は system/jobs",
+     _MATCH_PATTERN + " または system/jobs.sqlite3"),
+    ("responses",
+     "応答の本籍（documents のある試合ならその試合の本籍。無ければ operation と fetched_at の日本時間の時。ランキング系の operation は 1 応答 1 部品）",
+     _MATCH_PATTERN + " または " + _RESPONSE_PATTERN),
+    ("response_fetches", "その行自身の fetched_at の日本時間の日付（応答の本籍とは無関係）", _FETCH_PATTERN),
+    ("asset_refs", "response_id の応答の本籍", "応答の本籍と同じ（responses の行と同じ部品）"),
+    ("entities", "response_id の応答の本籍", "応答の本籍と同じ（responses の行と同じ部品）"),
     ("issues", "response_id があればその応答の本籍、無ければ system/issues",
      "応答の本籍 または system/issues.sqlite3"),
     ("bodies", "応答の本文は参照する各応答の本籍（写しを含む）。画像の本文と assets は images",
@@ -175,9 +190,32 @@ def jst_day_path(value: Any) -> str:
     return f"{parsed.year:04d}-{parsed.month:02d}/{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
 
 
+def jst_hour_path(value: Any) -> str:
+    """ISO 8601 を Asia/Tokyo の `YYYY-MM/YYYY-MM-DD/HH`（HH は 2 桁）にする。解析できなければ unknown-date。"""
+    parsed = _parse_iso_jst(value)
+    if parsed is None:
+        return UNKNOWN_DATE
+    return (
+        f"{parsed.year:04d}-{parsed.month:02d}/{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}/"
+        f"{parsed.hour:02d}"
+    )
+
+
 def response_period(operation: str, fetched_at: str) -> str:
-    """応答の日付区間。fetched_at の JST の `YYYY-MM/YYYY-MM-DD`、解析できなければ unknown-date。"""
-    return jst_day_path(fetched_at)
+    """応答の部品の日付区間（`responses/<operation>/` の下の道筋、拡張子と response_id を除く）。
+
+    ランキング系の operation は 1 応答 1 部品なので日までの `YYYY-MM/YYYY-MM-DD`、
+    それ以外は fetched_at の JST の時までの `YYYY-MM/YYYY-MM-DD/HH`。解析できなければ unknown-date。
+    """
+    if operation in RANKING_OPERATIONS:
+        return jst_day_path(fetched_at)
+    return jst_hour_path(fetched_at)
+
+
+def fetch_part_path(fetched_at: Any) -> str:
+    """response_fetches の行の本籍。その行自身の fetched_at の JST の日付 `fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`。
+    解析できなければ `fetches/unknown-date.sqlite3`（観測日時などで埋めない）。"""
+    return f"fetches/{jst_day_path(fetched_at)}{PART_SUFFIX}"
 
 
 def _feed_part_path(changed_at: Any) -> str:
@@ -210,6 +248,12 @@ def _sql_response_period(operation: Any, fetched_at: Any) -> str:
 
 def _sql_feed_part(changed_at: Any) -> str:
     return _feed_part_path(changed_at)
+
+
+def _sql_fetch_part(fetched_at: Any) -> str:
+    if isinstance(fetched_at, (bytes, bytearray)):
+        fetched_at = bytes(fetched_at).decode("utf-8", "replace")
+    return fetch_part_path(fetched_at)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +325,7 @@ def _register_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("jst_day", 1, _sql_jst_day, deterministic=True)
     conn.create_function("resp_period", 2, _sql_response_period, deterministic=True)
     conn.create_function("feed_part", 1, _sql_feed_part, deterministic=True)
+    conn.create_function("fetch_part", 1, _sql_fetch_part, deterministic=True)
 
 
 def _part_rank(kind: str) -> int:
@@ -383,6 +428,9 @@ def _hm_select(table: str, restrict: bool = False) -> str:
         )
     if table == "responses":
         return f"SELECT x.rowid, rh.part, 'home' FROM {base} JOIN response_home rh ON rh.response_id=x.id"
+    if table == "response_fetches":
+        # 版 3: 応答の本籍とは無関係に、その行自身の fetched_at の JST の日付
+        return f"SELECT x.rowid, fetch_part(CAST(x.fetched_at AS BLOB)), 'home' FROM {base}"
     if table in _BY_RESPONSE_TABLES:
         return (
             f"SELECT x.rowid, COALESCE((SELECT rh.part FROM response_home rh WHERE rh.response_id=x.response_id),"
@@ -420,7 +468,12 @@ _MK_SQL = (
 
 
 def _create_home_tables(conn: sqlite3.Connection, tables: dict[str, Any]) -> None:
-    """試合の本籍・応答の本籍・(account, match_key) の本籍を全件計算する（毎周期。試合は約千行、応答は約八千行）。"""
+    """試合の本籍・応答の本籍・(account, match_key) の本籍を全件計算する（毎周期。試合は約千行、応答は約八千行）。
+
+    版 3: 試合は 1 試合 1 部品（matches/<set>/<rule>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>、日時不明は
+    matches/<set>/<rule>/unknown-date/<match_key>）。試合詳細でない応答は時単位（responses/<operation>/<YYYY-MM>/
+    <YYYY-MM-DD>/<HH>、日時不明は responses/<operation>/unknown-date）、ランキング系は 1 応答 1 部品。
+    """
     conn.execute("CREATE TABLE match_home(account,kind,match_key,part,PRIMARY KEY(account,kind,match_key))")
     conn.execute("CREATE TABLE response_home(response_id INTEGER PRIMARY KEY,part)")
     conn.execute("CREATE TABLE mk_home(account,match_key,part,PRIMARY KEY(account,match_key))")
@@ -439,9 +492,11 @@ def _create_home_tables(conn: sqlite3.Connection, tables: dict[str, Any]) -> Non
         set_expr = _seg("c.analysis_set", "unclassified") if has_class else enc_default("unclassified")
         rule_expr = _seg("c.rule_raw", "no-rule") if has_class else enc_default("no-rule")
         day_expr = f"jst_day(CAST({played} AS BLOB))" if has_docs else _lit(UNKNOWN_DATE)
+        key_expr = _seg("m.match_key", "no-match-key")
         conn.execute(
             "INSERT INTO match_home(account,kind,match_key,part) "
-            f"SELECT m.account,m.kind,m.match_key,'matches/'||{set_expr}||'/'||{rule_expr}||'/'||{day_expr}||'.sqlite3' "
+            f"SELECT m.account,m.kind,m.match_key,'matches/'||{set_expr}||'/'||{rule_expr}||'/'||{day_expr}"
+            f"||'/'||{key_expr}||'.sqlite3' "
             f"FROM src.matches m {class_join} {doc_join}"
         )
         conn.execute("INSERT INTO mk_home(account,match_key,part) " + _MK_SQL.format(src="match_home"))
@@ -585,12 +640,57 @@ _STATE_DDL = (
     "built_at TEXT,through_event_id INTEGER)",
     # worker が Drive への送信と照合を確認した部品（部品の SHA-256 が part_files と同じなら送信済み）
     "CREATE TABLE IF NOT EXISTS state.published(path TEXT PRIMARY KEY,sha256 TEXT,bytes INTEGER,published_at TEXT)",
+    # 目録 match_index の前回の行（毎周期、全試合の JSON から作り直さないため）。列に型を付けない
+    # （作業表 cat_match_index と同じ値の型のまま持ち、全件計算と同じ結果を保つ）。
+    # match_index の列や式を変えたら HOME_RULE_VERSION を上げる（古い行を再利用しないため）。
+    "CREATE TABLE IF NOT EXISTS state.match_index_prev(account,kind,match_key,analysis_set,rule_raw,rule_name,"
+    "played_time,stage,judgement,my_weapon,tags,detail_available,part_path,PRIMARY KEY(account,kind,match_key))",
+)
+# 規則の版が変わった（または状態 DB に記録が無い）とき、出力先が空なら状態を白紙に戻す表
+_STATE_TABLES = (
+    "row_homes", "match_home_prev", "response_home_prev", "match_index_prev", "meta", "part_files", "published",
 )
 
 
 def _meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
     row = conn.execute("SELECT value FROM state.meta WHERE key=?", (key,)).fetchone()
     return None if row is None else row[0]
+
+
+def _out_entries(out: Path) -> list[str]:
+    """出力先にある名前（作成中の一時ディレクトリ .tmp-parts を除く）。空なら部品を混ぜる恐れが無い。"""
+    return sorted(p.name for p in out.iterdir() if p.name != TMP_DIR_NAME)
+
+
+def _guard_rule_version(conn: sqlite3.Connection, out: Path) -> None:
+    """規則の版が状態 DB の記録と違う（または記録が無い）ときの安全装置（設計書「本籍規則 版 3」）。
+
+    出力先が空でなければ PartsQuestion で止める（古い版の部品を同じ場所に混ぜない）。何も書き換えずに止まる。
+    空なら、前の出力に属する状態（部品の一覧・送信済みの記録・前回の本籍）を白紙に戻して全部品を作り直せるようにする。
+    """
+    recorded = _meta(conn, "rule_version")
+    if recorded == str(HOME_RULE_VERSION):
+        return
+    entries = _out_entries(out)
+    if entries:
+        seen = "、".join(entries[:5]) + (" ほか" if len(entries) > 5 else "")
+        was = "記録なし（状態 DB が無い、または初回）" if recorded is None else f"版 {recorded}"
+        raise PartsQuestion(
+            f"QUESTION: 規則の版が違う（状態 DB は {was}、この実装は版 {HOME_RULE_VERSION}）のに、"
+            f"出力先 {out} が空でない（{seen}）。古い版の部品を同じ場所に混ぜないため、何も書かずに止めた。"
+            "空の出力先と新しい状態 DB で作り直すこと。"
+        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table in _STATE_TABLES:
+            conn.execute(f"DELETE FROM state.{table}")
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 
 class _PlanConn(sqlite3.Connection):
@@ -637,10 +737,12 @@ def _plan_delta(conn: sqlite3.Connection, tables: dict[str, Any], prev: int) -> 
     全表を走査しない。行の本籍を計算し直すのは次の行だけ（cand_<表>）。
       (b) 変更追跡（event_id > 前回 through）に現れた行（new_rowid の現在の行と old_rowid）。
       (a) 本籍が変わった試合・応答に属する行。索引のある表は索引で引く（matches・match_classification・
-          match_tags は主キー、response_fetches・asset_refs・entities は response_id の索引）。
-          索引の無い表（documents・sightings・match_refs・jobs・rate_points・issues）は、状態 DB の
+          match_tags は主キー、sightings・asset_refs・entities は response_id の先頭を持つ主キーまたは索引）。
+          索引の無い表（documents・match_refs・jobs・rate_points・issues）は、状態 DB の
           row_homes で「前回その試合・応答の旧本籍にあった行」と「unplaced・system/jobs・system/issues にある行」を
           rowid で引いて再計算する。どれも作り直す部品に入る行なので、部品の大きさ以上の読みは生じない。
+      response_fetches の本籍は行自身の fetched_at だけで決まる（版 3）ので、(a) の対象にならない。
+          変更追跡に現れた行と、その行が前回あった日付の部品の行だけを再計算する。
     旧本籍と新本籍の差（row_homes との差）から作り直す部品を決める。
     """
     names = list(tables)
@@ -729,7 +831,7 @@ def _plan_delta(conn: sqlite3.Connection, tables: dict[str, Any], prev: int) -> 
     # 索引で引ける行（応答に属する行・試合に属する行）
     if "responses" in tables:
         conn.execute("INSERT OR IGNORE INTO cand_responses SELECT response_id FROM chg_resp")
-    for table in ("response_fetches", "asset_refs", "entities"):
+    for table in _BY_RESPONSE_TABLES:
         if table in tables:
             conn.execute(
                 f"INSERT OR IGNORE INTO {_q('cand_' + table)} SELECT x.rowid FROM chg_resp c "
@@ -810,6 +912,11 @@ def build_parts(
 ) -> dict[str, Any]:
     """一回分の作成。初回（または規則版・スキーマ変更・変更追跡なし）は全部品、以後は差分。
 
+    規則の版が状態 DB の記録と違う（または記録が無い）のに出力先が空でなければ、何も書かずに PartsQuestion で止める
+    （古い版の部品を同じ場所に混ぜない）。出力先が空なら状態を白紙に戻して全部品を作る。
+    目録 match_index は、差分周期では前回の行を使い、作り直した試合部品に属する試合と本籍が変わった試合だけ計算し直す
+    （戻り値の match_index に mode・recomputed・reused が入る）。
+
     after_snapshot はテスト用: 作業 DB への写しが済み、正本から離れた直後に呼ぶ。
     scan_log はテスト用: リストを渡すと、正本の表を索引なしで全走査した SQL が (表名, SQL) で入る。
     """
@@ -835,6 +942,8 @@ def build_parts(
         conn.execute("ATTACH ? AS state", (str(state),))
         for ddl in _STATE_DDL:
             conn.execute(ddl)
+        # 規則の版が違う（または記録が無い）のに出力先が空でなければ、何も書かずに止める
+        _guard_rule_version(conn, out)
 
         # ---- 同じ静止点（ここから COMMIT まで正本の読み取り一つ） ----
         conn.execute("BEGIN")
@@ -872,6 +981,13 @@ def build_parts(
                         f"SELECT DISTINCT table_name FROM src.{_q(CHANGE_TABLE)} WHERE event_id>?", (prev,))]
                     if any(t not in tables for t in feed_tables if t != CHANGE_TABLE):
                         full = True
+
+            # 目録 match_index を前回の行からの差分で作れるか。初回・規則の版の変更・全件計算の周期、
+            # および前回の行が揃っていないとき（試合の数と合わない）は全件を計算する。
+            mi_incremental = (not full) and (
+                conn.execute("SELECT count(*) FROM state.match_index_prev").fetchone()[0]
+                == conn.execute("SELECT count(*) FROM state.match_home_prev").fetchone()[0]
+            )
 
             _create_home_tables(conn, tables)
             conn.execute("CREATE TABLE rebuild(path TEXT PRIMARY KEY)")
@@ -917,7 +1033,7 @@ def build_parts(
                     )
 
             # ---- 目録の材料 ----
-            _stage_catalog_material(conn, schema, tables)
+            mi_stats = _stage_catalog_material(conn, schema, tables, incremental=mi_incremental)
             rebuilt = [r[0] for r in conn.execute("SELECT path FROM rebuild ORDER BY path")]
             conn.execute("COMMIT")
         except BaseException:
@@ -970,6 +1086,14 @@ def build_parts(
             conn.execute("INSERT INTO state.match_home_prev SELECT account,kind,match_key,part FROM main.match_home")
             conn.execute("DELETE FROM state.response_home_prev")
             conn.execute("INSERT INTO state.response_home_prev SELECT response_id,part FROM main.response_home")
+            if mi_stats["mode"] == "full":
+                conn.execute("DELETE FROM state.match_index_prev")
+            else:
+                conn.execute(
+                    "DELETE FROM state.match_index_prev WHERE (account,kind,match_key) IN "
+                    "(SELECT account,kind,match_key FROM main.mi_dirty)"
+                )
+            conn.execute("INSERT INTO state.match_index_prev SELECT * FROM main.mi_fresh")
             for res in results:
                 conn.execute(
                     "INSERT OR REPLACE INTO state.part_files VALUES(?,?,?,?,?)",
@@ -995,6 +1119,8 @@ def build_parts(
             "full_rebuild": full,
             "rebuilt_parts": results,
             "catalog": catalog,
+            # 目録 match_index の行を、この周期に JSON から計算し直した数（recomputed）と前回の行を使った数（reused）
+            "match_index": {key: mi_stats[key] for key in ("mode", "recomputed", "reused")},
             "built_at": built_at,
         }
     finally:
@@ -1009,12 +1135,28 @@ def build_parts(
 # 目録
 # ---------------------------------------------------------------------------
 
-def _stage_catalog_material(conn: sqlite3.Connection, schema: _Schema, tables: dict[str, Any]) -> None:
-    """目録のうち、正本の静止点から取らねばならない表を作業 DB に作る（BEGIN の中で呼ぶ）。"""
-    conn.execute(
-        "CREATE TABLE cat_match_index(account,kind,match_key,analysis_set,rule_raw,rule_name,played_time,"
-        "stage,judgement,my_weapon,tags,detail_available,part_path)"
-    )
+_MATCH_INDEX_COLUMNS = (
+    "account,kind,match_key,analysis_set,rule_raw,rule_name,played_time,stage,judgement,my_weapon,tags,"
+    "detail_available,part_path"
+)
+
+
+def _stage_match_index(conn: sqlite3.Connection, tables: dict[str, Any], incremental: bool) -> dict[str, Any]:
+    """目録 match_index の行を作業 DB に作る（BEGIN の中で呼ぶ）。
+
+    全件（incremental=False）: 全試合の詳細 JSON から計算する。初回・規則の版の変更・全件計算の周期・前回の行が揃っていないとき。
+    差分（incremental=True）: 状態 DB の前回の行（state.match_index_prev）を使い、次の試合だけ計算し直して差し替える。
+      (1) この周期に作り直す部品（rebuild）に属する試合
+      (2) 本籍が変わった試合（chg_match。新規・移動）
+      (3) 上のどれかと同じ (account, match_key) を持つ別の kind の試合（tags は account と match_key だけで引くため）
+      (4) 前回の行が無い、または前回の part_path が今の本籍と違う試合（安全網）
+    消えた試合（前回の行はあるが今は無い）は前回の行を捨てる。計算式は全件と差分で同じ文を使う。
+    作る表: cat_match_index（今回の目録の全行）、mi_fresh（この周期に計算した行）、mi_dirty（前回の行を捨てる鍵）。
+    """
+    conn.execute(f"CREATE TABLE cat_match_index({_MATCH_INDEX_COLUMNS})")
+    conn.execute(f"CREATE TABLE mi_fresh({_MATCH_INDEX_COLUMNS})")
+    conn.execute("CREATE TABLE mi_dirty(account,kind,match_key,PRIMARY KEY(account,kind,match_key))")
+    mode = "delta" if (incremental and "matches" in tables) else "full"
     if "matches" in tables:
         has_class = "match_classification" in tables
         has_docs = "documents" in tables
@@ -1047,13 +1189,58 @@ def _stage_catalog_material(conn: sqlite3.Connection, schema: _Schema, tables: d
         name_expr = "c.rule_name" if has_class else null
         played = _played_expr("d") if has_docs else null
         avail = "CASE WHEN d.response_id IS NOT NULL THEN 1 ELSE 0 END" if has_docs else "0"
+        if mode == "delta":
+            conn.execute(
+                "INSERT OR IGNORE INTO mi_dirty SELECT h.account,h.kind,h.match_key FROM match_home h "
+                "WHERE h.part IN (SELECT path FROM rebuild)"
+            )
+            conn.execute("INSERT OR IGNORE INTO mi_dirty SELECT account,kind,match_key FROM chg_match")
+            conn.execute(
+                "INSERT OR IGNORE INTO mi_dirty SELECT h.account,h.kind,h.match_key FROM match_home h "
+                "LEFT JOIN state.match_index_prev p ON p.account=h.account AND p.kind=h.kind "
+                "AND p.match_key=h.match_key WHERE p.account IS NULL OR p.part_path IS NOT h.part"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO mi_dirty SELECT h.account,h.kind,h.match_key FROM match_home h "
+                "WHERE (h.account,h.match_key) IN (SELECT account,match_key FROM mi_dirty)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO mi_dirty SELECT p.account,p.kind,p.match_key FROM state.match_index_prev p "
+                "WHERE NOT EXISTS (SELECT 1 FROM match_home h WHERE h.account=p.account AND h.kind=p.kind "
+                "AND h.match_key=p.match_key)"
+            )
+            source = (
+                "mi_dirty r CROSS JOIN src.matches m ON m.account=r.account AND m.kind=r.kind "
+                "AND m.match_key=r.match_key"
+            )
+        else:
+            source = "src.matches m"
         conn.execute(
-            "INSERT INTO cat_match_index "
+            "INSERT INTO mi_fresh "
             f"SELECT m.account,m.kind,m.match_key,{set_expr},{rule_expr},{name_expr},"
             f"{played},{stage},{judgement},{weapon},{tags},{avail},mh.part "
-            "FROM src.matches m JOIN match_home mh ON mh.account=m.account AND mh.kind=m.kind "
+            f"FROM {source} JOIN match_home mh ON mh.account=m.account AND mh.kind=m.kind "
             f"AND mh.match_key=m.match_key {class_join} {doc_join}"
         )
+        conn.execute("INSERT INTO cat_match_index SELECT * FROM mi_fresh")
+        if mode == "delta":
+            conn.execute(
+                "INSERT INTO cat_match_index SELECT p.* FROM state.match_index_prev p "
+                "JOIN match_home h ON h.account=p.account AND h.kind=p.kind AND h.match_key=p.match_key "
+                "WHERE NOT EXISTS (SELECT 1 FROM mi_dirty d WHERE d.account=p.account AND d.kind=p.kind "
+                "AND d.match_key=p.match_key)"
+            )
+    recomputed = conn.execute("SELECT count(*) FROM mi_fresh").fetchone()[0]
+    total = conn.execute("SELECT count(*) FROM cat_match_index").fetchone()[0]
+    return {"mode": mode, "recomputed": recomputed, "reused": total - recomputed}
+
+
+def _stage_catalog_material(
+    conn: sqlite3.Connection, schema: _Schema, tables: dict[str, Any], incremental: bool = False
+) -> dict[str, Any]:
+    """目録のうち、正本の静止点から取らねばならない表を作業 DB に作る（BEGIN の中で呼ぶ）。
+    match_index の計算結果の件数（_stage_match_index の戻り値）を返す。"""
+    stats = _stage_match_index(conn, tables, incremental)
     conn.execute(
         "CREATE TABLE cat_response_index(response_id,account,operation,fetched_at,http_status,part_path)"
     )
@@ -1092,12 +1279,13 @@ def _stage_catalog_material(conn: sqlite3.Connection, schema: _Schema, tables: d
                 f"INSERT INTO cat_internal SELECT {_lit(name)},x.rowid,{index},{_lit(col)},x.{_q(col)} "
                 f"FROM src.{_q(name)} x"
             )
+    return stats
 
 
 _CATALOG_DDL = (
     "CREATE TABLE files(path TEXT PRIMARY KEY,domain TEXT,analysis_set TEXT,rule_raw TEXT,month TEXT,day TEXT,"
-    "operation TEXT,period TEXT,response_id INTEGER,bytes INTEGER,sha256 TEXT,rows_json TEXT,"
-    "built_through_event_id INTEGER,built_at TEXT)",
+    "operation TEXT,period TEXT,response_id INTEGER,match_key TEXT,hour TEXT,bytes INTEGER,sha256 TEXT,"
+    "rows_json TEXT,built_through_event_id INTEGER,built_at TEXT)",
     "CREATE TABLE match_index(account TEXT,kind TEXT,match_key TEXT,analysis_set TEXT,rule_raw TEXT,rule_name TEXT,"
     "played_time TEXT,stage TEXT,judgement TEXT,my_weapon TEXT,tags TEXT,detail_available INTEGER,part_path TEXT)",
     "CREATE TABLE response_index(response_id INTEGER,account TEXT,operation TEXT,fetched_at TEXT,"
@@ -1115,28 +1303,49 @@ _CATALOG_DDL = (
 
 
 def _path_fields(path: str) -> dict[str, Any]:
-    """部品の住所から files 表の列を作る（住所の規則は設計書「置き場所」）。"""
+    """部品の住所から files 表の列を作る（住所の規則は設計書「置き場所」「本籍規則 版 3」）。
+
+      matches/<set>/<rule>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>   → analysis_set, rule_raw, month, day, match_key
+      matches/<set>/<rule>/unknown-date/<match_key>             → 同上（month と day は unknown-date）
+      responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<HH>         → operation, month, day, period（=day）, hour
+      responses/<operation>/unknown-date                        → operation, month・day・period が unknown-date
+      responses/<ランキング系>/<YYYY-MM>/<YYYY-MM-DD>/<response_id> と .../unknown-date/<response_id>
+                                                                → operation, month, day, period, response_id
+      fetches/<YYYY-MM>/<YYYY-MM-DD> と fetches/unknown-date    → month, day
+    該当しない列は NULL。ランキング系かどうかは operation で決める（最後の数字が時か response_id かは住所だけでは分からない）。
+    """
     segs = path[: -len(PART_SUFFIX)].split("/")
     fields: dict[str, Any] = {
         "domain": segs[0], "analysis_set": None, "rule_raw": None, "month": None, "day": None,
-        "operation": None, "period": None, "response_id": None,
+        "operation": None, "period": None, "response_id": None, "match_key": None, "hour": None,
     }
-    if segs[0] == "matches" and len(segs) in (4, 5):
-        fields.update(analysis_set=decode_segment(segs[1]), rule_raw=decode_segment(segs[2]))
-        if len(segs) == 5:  # matches/<set>/<rule>/<YYYY-MM>/<YYYY-MM-DD>
+    if segs[0] == "matches" and len(segs) in (5, 6):
+        fields.update(analysis_set=decode_segment(segs[1]), rule_raw=decode_segment(segs[2]),
+                      match_key=decode_segment(segs[-1]))
+        if len(segs) == 6:  # matches/<set>/<rule>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>
             fields.update(month=segs[3], day=segs[4])
-        else:  # matches/<set>/<rule>/unknown-date
+        else:  # matches/<set>/<rule>/unknown-date/<match_key>
             fields.update(month=segs[3], day=segs[3])
     elif segs[0] == "responses" and len(segs) >= 3:
-        fields.update(operation=decode_segment(segs[1]))
+        operation = decode_segment(segs[1])
+        fields.update(operation=operation)
         rest = segs[2:]
-        if len(rest) >= 2 and rest[-1].isdigit():  # ランキング系: .../<日付区間>/<response_id>
-            fields["response_id"] = int(rest[-1])
+        if operation in RANKING_OPERATIONS and len(rest) >= 2:  # .../<日付区間>/<response_id>
+            if rest[-1].isdigit():
+                fields["response_id"] = int(rest[-1])
             rest = rest[:-1]
+        elif operation not in RANKING_OPERATIONS and len(rest) == 3:  # <YYYY-MM>/<YYYY-MM-DD>/<HH>
+            fields["hour"] = rest[2]
+            rest = rest[:2]
         if len(rest) == 2:  # <YYYY-MM>/<YYYY-MM-DD>
             fields.update(month=rest[0], day=rest[1], period=rest[1])
         else:  # unknown-date
             fields.update(month=rest[0], day=rest[0], period=rest[0])
+    elif segs[0] == "fetches" and len(segs) in (2, 3):
+        if len(segs) == 3:  # fetches/<YYYY-MM>/<YYYY-MM-DD>
+            fields.update(month=segs[1], day=segs[2])
+        else:  # fetches/unknown-date
+            fields.update(month=segs[1], day=segs[1])
     return fields
 
 
@@ -1165,12 +1374,15 @@ def _write_catalog(out: Path, state: Path, work_uri: str, through: Optional[int]
         ).fetchall():
             fields = _path_fields(path)
             conn.execute(
-                "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO files(path,domain,analysis_set,rule_raw,month,day,operation,period,response_id,"
+                "match_key,hour,bytes,sha256,rows_json,built_through_event_id,built_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (path, fields["domain"], fields["analysis_set"], fields["rule_raw"], fields["month"],
-                 fields["day"], fields["operation"], fields["period"], fields["response_id"], nbytes, sha,
+                 fields["day"], fields["operation"], fields["period"], fields["response_id"],
+                 fields["match_key"], fields["hour"], nbytes, sha,
                  json.dumps(counts.get(path, {}), ensure_ascii=False, sort_keys=True), part_through, part_built),
             )
-        conn.execute("INSERT INTO match_index SELECT * FROM w.cat_match_index")
+        conn.execute("INSERT INTO match_index SELECT * FROM w.cat_match_index ORDER BY account,kind,match_key")
         conn.execute("INSERT INTO response_index SELECT * FROM w.cat_response_index")
         conn.execute("INSERT INTO asset_index SELECT * FROM w.cat_asset_index")
         conn.execute("INSERT INTO labels SELECT * FROM w.cat_labels")

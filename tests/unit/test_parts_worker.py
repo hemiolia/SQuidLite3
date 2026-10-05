@@ -19,9 +19,13 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "src/python"))
 sys.path.insert(0, str(HERE.parents[1] / "scripts"))
 
-from test_parts import MATCH_PART, Source  # noqa: E402
+import ikarchive.parts as parts_module  # noqa: E402
+from ikarchive.parts import PartsQuestion, audit  # noqa: E402
+from test_parts import Source, assert_audit_clean, match_path  # noqa: E402
 
 import parts_worker  # noqa: E402
+
+M6_PART = match_path("m6")  # 版 3: 試合は 1 試合 1 ファイル
 
 
 class FakeRclone:
@@ -168,11 +172,30 @@ class CycleTests(WorkerTestBase):
         self.assertLess(summary["uploaded"], len(self.part_files()))
         self.assertEqual(summary["uploaded"], summary["rebuilt"])
         self.assertTrue(summary["catalog_published"])
-        remote_match = sqlite3.connect(f"{(self.remote / MATCH_PART).resolve().as_uri()}?mode=ro", uri=True)
+        remote_match = sqlite3.connect(f"{(self.remote / M6_PART).resolve().as_uri()}?mode=ro", uri=True)
         try:
             self.assertEqual(remote_match.execute("SELECT count(*) FROM matches WHERE match_key='m6'").fetchone()[0], 1)
         finally:
             remote_match.close()
+        assert_audit_clean(self, audit(self.src.path, self.root / "parts"))
+
+    def test_refetch_cycle_sends_only_the_fetch_day_and_system_parts(self):
+        # 同じ応答の取り直し（response_fetches の行が一つ増えるだけ）は、fetches/<日> と system 系しか作り直さず送らない
+        parts_worker.run_cycle(self.opts)
+        conn = self.src.connect()
+        with conn:
+            self.src.refetch(conn, self.src.detail_id["m1"], "2026-10-07T01:00:00+00:00")
+        conn.close()
+        self.fake.calls.clear()
+        self.fake.copied_order.clear()
+        summary = parts_worker.run_cycle(self.opts)
+        sent = [p for p in self.fake.copied_order if p not in ("README_FOR_AI.md", "catalog.sqlite3")]
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["uploaded"], len(sent))
+        self.assertTrue(summary["catalog_published"])
+        self.assertIn("fetches/2026-10/2026-10-07.sqlite3", sent)
+        self.assertEqual({p for p in sent if not p.startswith(("fetches/", "system/"))}, set())
+        assert_audit_clean(self, audit(self.src.path, self.root / "parts"))
 
     def test_partial_verification_failure_withholds_catalog_and_resends(self):
         # 一つの部品が壊れて届く。目録は送らない
@@ -223,6 +246,19 @@ class CycleTests(WorkerTestBase):
         self.assertTrue(summary["catalog_published"])  # 部品が変わっていなくても目録は再送される
 
 
+class RuleVersionTests(WorkerTestBase):
+    def test_other_rule_version_stops_the_cycle_before_sending_anything(self):
+        parts_worker.run_cycle(self.opts)
+        before = self.part_files()
+        self.fake.calls.clear()
+        with mock.patch.object(parts_module, "HOME_RULE_VERSION", parts_module.HOME_RULE_VERSION + 1):
+            with self.assertRaises(PartsQuestion) as ctx:
+                parts_worker.run_cycle(self.opts)
+        self.assertTrue(str(ctx.exception).startswith("QUESTION:"))
+        self.assertEqual(self.fake.calls, [])  # 古い版の出力先に何も足さず、何も送らない
+        self.assertEqual(self.part_files(), before)
+
+
 class MainTests(WorkerTestBase):
     def argv(self):
         o = self.opts
@@ -269,6 +305,16 @@ class MainTests(WorkerTestBase):
         code, text = self.run_main(argv)
         self.assertEqual(code, 1)
         self.assertEqual(text, "")
+
+    def test_other_rule_version_makes_once_exit_one_and_logs_question(self):
+        self.run_main(self.argv())
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(parts_module, "HOME_RULE_VERSION", parts_module.HOME_RULE_VERSION + 1):
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                code = parts_worker.main(self.argv())
+        self.assertEqual(code, 1)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertTrue(err.getvalue().startswith("QUESTION:"), err.getvalue())
 
     def test_verification_failure_makes_once_exit_one(self):
         self.fake.corrupt = {"system/runs.sqlite3"}
