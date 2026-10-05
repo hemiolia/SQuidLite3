@@ -245,7 +245,8 @@ class Store:
                                     self.db.execute('INSERT OR IGNORE INTO assets(url) VALUES(?)',(u,))
                                     self.db.execute('INSERT OR IGNORE INTO asset_refs VALUES(?,?,?)',(rid,u,js(p+('url',))))
                             eid=b.get('id')
-                            if eid:self.db.execute('INSERT INTO entities VALUES(?,?,?,?,?) ON CONFLICT(account,typename,entity_id) DO UPDATE SET response_id=excluded.response_id,json_text=excluded.json_text',(account,a,eid,rid,js(b)))
+                            # JSON が同じなら書き換えない（response_id も動かさない）。変わったときだけ更新する。
+                            if eid:self.db.execute('INSERT INTO entities VALUES(?,?,?,?,?) ON CONFLICT(account,typename,entity_id) DO UPDATE SET response_id=excluded.response_id,json_text=excluded.json_text WHERE entities.json_text IS NOT excluded.json_text',(account,a,eid,rid,js(b)))
                             for q,v in planner.related(a,b,country):
                                 ident=identity(eid) if eid else None
                                 self.queue(account,q,v,*(ident or (None,None)))
@@ -330,7 +331,8 @@ class Store:
                     if okay and r['projected']:
                         # A -> B -> A is a new observation of an old body. It must become
                         # current again without losing B or duplicating the match.
-                        self._matches({**dict(r),'fetched_at':fetched['fetched_at']},data,True)
+                        # 同じ応答の取り直し（再観測）なので、試合の行は書き換えない。
+                        self._matches({**dict(r),'fetched_at':fetched['fetched_at']},data,True,reobserve=True)
                     if okay:self._advance_endpoint_head(r,fetched['fetched_at'])
                     if r['operation'] in RELATED_EMPTY_ROOTS:
                         job=self.db.execute('SELECT empty_retries FROM jobs WHERE account=? AND operation=? AND variables_json=?',
@@ -352,13 +354,21 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account,series_id,match_key) DO UPDATE SET label=excluded.label,value=excluded.value
                 WHERE rate_points.label IS NOT excluded.label OR rate_points.value IS NOT excluded.value''',
                 (r['account'],item['series_id'],item['label'],item['genre'],item['rule_raw'],'fetch:'+event_id,fetched_at,item['value'],'api_snapshot','primary'))
-    def _matches(self,r,data,okay):
+    def _matches(self,r,data,okay,reobserve=False):
+        # reobserve=True: すでに投影済みの応答を取り直した（再観測）。matches の行は無ければ作るだけで、
+        #   既存の行は書き換えない。取り直しの時刻は response_fetches が持ち、取り直しを含む最新の観測時刻は
+        #   ビュー match_observations が与える。
+        # reobserve=False: 新しい内容の応答の投影。first_seen/last_seen の値が変わらないときは更新しない。
+        #   したがって matches.last_seen は「その試合を載せた新しい内容の応答を最後に保存した時刻」である。
         for path,v in walk(data):
             if not isinstance(v,dict) or not isinstance(v.get('id'),str):continue
             ident=identity(v['id'])
             if not ident:continue
             kind,key=ident;a=r['account'];t=r['fetched_at']
-            self.db.execute('INSERT INTO matches VALUES(?,?,?,?,?,NULL) ON CONFLICT(account,kind,match_key) DO UPDATE SET last_seen=MAX(last_seen,excluded.last_seen),first_seen=MIN(first_seen,excluded.first_seen)',(a,kind,key,t,t))
+            if reobserve:
+                self.db.execute('INSERT INTO matches VALUES(?,?,?,?,?,NULL) ON CONFLICT(account,kind,match_key) DO NOTHING',(a,kind,key,t,t))
+            else:
+                self.db.execute('INSERT INTO matches VALUES(?,?,?,?,?,NULL) ON CONFLICT(account,kind,match_key) DO UPDATE SET last_seen=MAX(last_seen,excluded.last_seen),first_seen=MIN(first_seen,excluded.first_seen) WHERE excluded.last_seen > matches.last_seen OR excluded.first_seen < matches.first_seen',(a,kind,key,t,t))
             self.db.execute('INSERT OR IGNORE INTO match_refs VALUES(?,?,?,?)',(a,kind,v['id'],key))
             self.queue(a,'VsHistoryDetailQuery' if kind=='vs' else 'CoopHistoryDetailQuery',{'vsResultId' if kind=='vs' else 'coopHistoryDetailId':v['id']},kind,key)
             self.db.execute('INSERT OR IGNORE INTO sightings VALUES(?,?,?,?,?,?)',(r['id'],a,kind,key,js(path),js(v)))
@@ -366,9 +376,10 @@ class Store:
             full=(r['operation']=='VsHistoryDetailQuery' and kind=='vs' and len(path)==1) or (r['operation']=='CoopHistoryDetailQuery' and kind=='coop' and len(path)==1)
             if full:
                 self.db.execute('INSERT OR IGNORE INTO documents VALUES(?,?,?,?,?)',(r['id'],a,kind,key,js(v)))
-                if okay:self.db.execute('''UPDATE matches SET detail_response_id=? WHERE account=? AND kind=? AND match_key=? AND
+                # detail_response_id が同じ応答のままなら書き換えない（同じ詳細応答の取り直しで matches の更新を出さない）。
+                if okay:self.db.execute('''UPDATE matches SET detail_response_id=? WHERE account=? AND kind=? AND match_key=? AND detail_response_id IS NOT ? AND
                     (detail_response_id IS NULL OR COALESCE((SELECT MAX(julianday(fetched_at)) FROM response_fetches WHERE response_id=detail_response_id),
-                    (SELECT julianday(fetched_at) FROM responses WHERE id=detail_response_id))<=julianday(?))''',(r['id'],a,kind,key,r['fetched_at']))
+                    (SELECT julianday(fetched_at) FROM responses WHERE id=detail_response_id))<=julianday(?))''',(r['id'],a,kind,key,r['id'],r['fetched_at']))
                 if kind in ('vs','coop'):
                     self._write_classification(a,kind,key)
                     self._write_rates(a,kind,key)

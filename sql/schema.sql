@@ -114,6 +114,15 @@ CREATE TABLE IF NOT EXISTS response_fetches(
 CREATE INDEX IF NOT EXISTS response_fetches_response ON response_fetches(response_id,fetched_at);
 INSERT OR IGNORE INTO response_fetches(event_id,response_id,run_id,fetched_at,headers_json,acknowledged)
  SELECT event_id,id,run_id,fetched_at,headers_json,projected FROM responses;
+-- matches.last_seen は、その試合を載せた新しい内容の応答を最後に保存した時刻。取り直し（再観測）を含む観測時刻はこのビューで求める。
+DROP VIEW IF EXISTS match_observations;
+CREATE VIEW match_observations AS
+ SELECT s.account,s.kind,s.match_key,
+ MIN(r.fetched_at) AS first_observed_at,
+ MAX(COALESCE((SELECT MAX(f.fetched_at) FROM response_fetches f WHERE f.response_id=r.id),r.fetched_at)) AS last_observed_at,
+ COUNT(DISTINCT s.response_id) AS observing_responses
+ FROM sightings s JOIN responses r ON r.id=s.response_id
+ GROUP BY s.account,s.kind,s.match_key;
 DROP VIEW IF EXISTS analysis_private_four_vs_four_tags;
 DROP VIEW IF EXISTS analysis_private_one_vs_one_tags;
 DROP VIEW IF EXISTS analysis_private_other_tags;

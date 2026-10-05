@@ -89,4 +89,6 @@ class FetchReceiptTests(unittest.TestCase):
         self.assertNotEqual(ids[0],ids[1])
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM matches').fetchone()[0],1)
         self.assertEqual(self.store.db.execute('SELECT detail_response_id FROM matches').fetchone()[0],ids[0])
-        self.assertEqual(self.store.db.execute('SELECT last_seen FROM matches').fetchone()[0],'2026-09-22T00:00:00Z')
+        # last_seen は「その試合を載せた新しい内容の応答を最後に保存した時刻」(B の 09-21)。A の取り直し(09-22)では進めない。
+        # 取り直しを含む最新の観測時刻 09-22 は match_observations.last_observed_at が持つ(test_store_reobserve.py)。
+        self.assertEqual(self.store.db.execute('SELECT last_seen FROM matches').fetchone()[0],'2026-09-21T00:00:00Z')
