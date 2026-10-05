@@ -317,6 +317,30 @@ class PartsTestBase(unittest.TestCase):
     def paths(result):
         return {r["path"] for r in result["rebuilt_parts"]}
 
+    def assert_part_gone(self, path):
+        """行が一つも無くなった部品が、出力先・状態 DB（part_files・row_homes）・目録の files のどこにも残っていない。"""
+        self.assertFalse((self.out / path).exists(), path)
+        self.assertEqual(rows(self.state, "SELECT count(*) FROM part_files WHERE path=?", (path,))[0][0], 0, path)
+        self.assertEqual(rows(self.state, "SELECT count(*) FROM row_homes WHERE part=?", (path,))[0][0], 0, path)
+        self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM files WHERE path=?", (path,))[0][0],
+                         0, path)
+
+    def assert_no_empty_part(self):
+        """出力先のどの部品にも、行が一つ以上ある。目録の files の rows_json にも空のものは無い。"""
+        for rel, tables in dump_parts(self.out).items():
+            self.assertTrue(tables, f"行が一つも無い部品が残っている: {rel}")
+        self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM files WHERE rows_json='{}'")[0][0], 0)
+
+    def assert_same_as_fresh_build(self, label=""):
+        """差分更新した出力先の部品（空の部品が無いことを含む）と目録が、新しい出力先への全件作成と同じ。"""
+        work = Path(tempfile.mkdtemp(prefix="fresh-", dir=self.tmp.name))
+        fresh = work / "parts"
+        build_parts(self.src.path, fresh, work / "state.sqlite3")
+        self.assertEqual(set(part_sha(self.out)), set(part_sha(fresh)), label)
+        self.assertEqual(dump_parts(self.out), dump_parts(fresh), label)
+        self.assertEqual(dump_catalog(self.out), dump_catalog(fresh), label)
+        shutil.rmtree(work)
+
     @staticmethod
     def non_feed(paths):
         return {p for p in paths if not p.startswith(FEED_PREFIX)}
@@ -404,8 +428,10 @@ class FullBuildTests(PartsTestBase):
         self.assertEqual(rows(self.out / FETCH_SEP, "SELECT count(*) FROM response_fetches")[0][0], 1)  # r2
         for other in (M1_PART, M2_PART, M3_PART, M4_PART, M5_PART, CONFIG_OCT, CONFIG_SEP):
             self.assertEqual(rows(self.out / other, "SELECT count(*) FROM response_fetches")[0][0], 0, other)
-        # fetch:<event_id> の rate_points は、その取得の応答（r1）の本籍に置かれる（取得の日付の部品ではない）
-        self.assertEqual(rows(self.out / CONFIG_OCT, "SELECT series_id FROM rate_points"), [("sw",)])
+        # fetch:<event_id> の rate_points は、response_fetches の event_id が同じ行（r1 の取得）と同じ fetches/<日> の部品に置かれる。
+        # その取得の応答（r1）の部品には置かれない
+        self.assertEqual(rows(self.out / FETCH_OCT, "SELECT series_id FROM rate_points"), [("sw",)])
+        self.assertEqual(rows(self.out / CONFIG_OCT, "SELECT count(*) FROM rate_points")[0][0], 0)
         self.assertEqual(rows(self.out / M1_PART, "SELECT series_id FROM rate_points"), [("s",)])
         # 本文の写し: 共有本文は両方の応答部品にあり、写しとして記録される
         for p in (CONFIG_OCT, CONFIG_SEP):
@@ -447,7 +473,12 @@ class FullBuildTests(PartsTestBase):
         self.assertEqual(rows(cat, "SELECT through_event_id,rule_version FROM status"),
                          [(result["through_event_id"], HOME_RULE_VERSION)])
         self.assertGreater(rows(cat, "SELECT count(*) FROM table_homes")[0][0], 10)
-        self.assertEqual(rows(cat, "SELECT count(*) FROM recipes")[0][0], 0)
+        from ikarchive.parts_guide import RECIPES
+
+        self.assertEqual(len(RECIPES), 13)
+        self.assertEqual(rows(cat, "SELECT count(*) FROM recipes")[0][0], 13)
+        self.assertEqual(rows(cat, "SELECT question_ja,steps_ja,sql FROM recipes ORDER BY rowid"),
+                         [tuple(r) for r in RECIPES])
         self.assertGreater(rows(cat, "SELECT count(*) FROM source_schema WHERE type='trigger'")[0][0], 0)
         self.assertEqual(rows(cat, "SELECT ja FROM labels WHERE kind='analysis_set' AND code='xmatch'"), [("Xマッチ",)])
         self.assertEqual(rows(cat, "SELECT count(*) FROM files")[0][0], len(part_sha(self.out)))
@@ -554,8 +585,15 @@ class FullBuildTests(PartsTestBase):
             "unknown-date",
         ):
             self.assertIn(needle, text, needle)
-        for stale in ("<YYYY-MM-DD>.sqlite3`: 試合ごと", "matches/<analysis_set>/<rule_raw>/unknown-date.sqlite3"):
+        for stale in ("<YYYY-MM-DD>.sqlite3`: 試合ごと", "matches/<analysis_set>/<rule_raw>/unknown-date.sqlite3",
+                      "空のファイルが残る", "`{}`"):
             self.assertNotIn(stale, text, stale)
+        # 行が一つも無くなった部品は削除される。取得時点の値は取得の記録と同じ部品にある
+        for needle in ("行が一つも無くなった", "Drive からも消", "fetch:<event_id>", "unplaced/rate_points.sqlite3"):
+            self.assertIn(needle, text, needle)
+        for _question, steps, sql in RECIPES:
+            self.assertNotIn("空のまま残", steps)
+            self.assertNotIn("rows_json <>", sql)
         # table_homes の説明が版 3
         self.assertIn("<match_key>", homes["matches"][2])
         self.assertIn("<HH>", homes["responses"][2])
@@ -563,6 +601,13 @@ class FullBuildTests(PartsTestBase):
         self.assertIn("fetched_at", homes["response_fetches"][1])
         self.assertIn("response_id", homes["sightings"][1])
         self.assertNotIn("(account, kind, match_key)", homes["sightings"][1])
+        # rate_points の fetch:<event_id> の行は、response_fetches の event_id が同じ行の本籍（fetches の日の部品）。無ければ unplaced
+        self.assertIn("fetch:<event_id>", homes["rate_points"][1])
+        self.assertIn("response_fetches.event_id", homes["rate_points"][1])
+        self.assertIn("unplaced", homes["rate_points"][1])
+        self.assertIn("fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3", homes["rate_points"][2])
+        self.assertIn("unplaced/rate_points.sqlite3", homes["rate_points"][2])
+        self.assertNotIn("応答の本籍", homes["rate_points"][2])
         # 取り直しの回数の recipe は fetches の部品でそのまま動く
         refetch_sql = next(sql for question, _steps, sql in RECIPES if "取り直した" in question)
         self.assertEqual(len(rows(self.out / FETCH_OCT, refetch_sql)), 6)
@@ -684,6 +729,86 @@ class HomeRuleTests(PartsTestBase):
                          [("2026-10", "2026-10-08")])
 
 
+    def test_fetch_snapshot_rate_points_follow_their_fetch_row(self):
+        """fetch:<event_id> の rate_points は、response_fetches の event_id が同じ行と同じ本籍（その取得の日の fetches の部品）。
+        その行が無ければ unplaced/rate_points。取得の行の日付が変わる・消える・あとから現れるのに、差分更新でも追随する。"""
+        r1, r2 = self.src.config_ids
+        event1, event2 = f"ev{r1}", f"ev{r2}"
+        conn = self.src.connect()
+        with conn:
+            insert = "INSERT INTO rate_points VALUES('acc','sw','ブキ','weapon',NULL,?,NULL,3.5,'api_snapshot','primary')"
+            conn.execute(insert, (f"fetch:{event2}",))
+            conn.execute(insert, ("fetch:nowhere",))  # 取得の行が無い event_id
+            conn.execute(insert, ("fetch:",))  # event_id が空
+        conn.close()
+        self.build()
+        self.audit_clean()
+
+        def snapshots(path):
+            return rows(self.out / path, "SELECT match_key FROM rate_points WHERE match_key LIKE 'fetch:%' "
+                                         "ORDER BY match_key")
+
+        self.assertEqual(snapshots(FETCH_OCT), [(f"fetch:{event1}",)])
+        self.assertEqual(snapshots(FETCH_SEP), [(f"fetch:{event2}",)])
+        self.assertEqual(snapshots("unplaced/rate_points.sqlite3"), [("fetch:",), ("fetch:nowhere",)])
+        for path in (CONFIG_OCT, CONFIG_SEP, M1_PART):  # 取得の応答の部品・試合の部品には置かれない
+            self.assertEqual(snapshots(path), [], path)
+
+        # (a) 取得の行の日付が変わると、取得時点の値もその日の部品へ移る。応答の部品は作り直さない
+        self.src.execute("UPDATE response_fetches SET fetched_at='2026-10-12T01:00:00+00:00' WHERE event_id=?", (event1,))
+        result = self.build()
+        day12 = "fetches/2026-10/2026-10-12.sqlite3"
+        self.assertEqual(snapshots(day12), [(f"fetch:{event1}",)])
+        self.assertEqual(snapshots(FETCH_OCT), [])
+        self.assertNotIn(CONFIG_OCT, self.paths(result))
+        self.audit_clean()
+        self.assert_same_as_fresh_build("fetch date moved")
+        # (b) 取得の行が消えると、取得時点の値は unplaced/rate_points へ移る。行が無くなった日の部品は片付く
+        self.src.execute("DELETE FROM response_fetches WHERE event_id=?", (event1,))
+        result = self.build()
+        self.assertEqual(snapshots("unplaced/rate_points.sqlite3"), [("fetch:",), (f"fetch:{event1}",), ("fetch:nowhere",)])
+        self.assertIn(day12, result["removed_parts"])
+        self.assert_part_gone(day12)
+        self.audit_clean()
+        self.assert_same_as_fresh_build("fetch row deleted")
+        # (c) 取得の行があとから現れると、unplaced にあった行がその日の部品へ移る（取得の行の出現だけが引き金）
+        self.src.execute("INSERT INTO response_fetches(event_id,response_id,fetched_at,headers_json) VALUES(?,?,?,?)",
+                         ("nowhere", r1, "2026-10-14T01:00:00+00:00", "{}"))
+        self.build()
+        self.assertEqual(snapshots("fetches/2026-10/2026-10-14.sqlite3"), [("fetch:nowhere",)])
+        self.assertEqual(snapshots("unplaced/rate_points.sqlite3"), [("fetch:",), (f"fetch:{event1}",)])
+        self.audit_clean()
+        self.assert_same_as_fresh_build("fetch row appeared")
+        # (d) 取得の行の fetched_at が解析できなければ fetches/unknown-date
+        self.src.execute("UPDATE response_fetches SET fetched_at='zzz' WHERE event_id='nowhere'")
+        self.build()
+        self.assertEqual(snapshots("fetches/unknown-date.sqlite3"), [("fetch:nowhere",)])
+        self.assertNotIn("fetches/2026-10/2026-10-14.sqlite3", part_sha(self.out))
+        self.audit_clean()
+        self.assert_same_as_fresh_build("fetch date unparseable")
+        # (e) 取得の行が元の日付で戻ると、event1 の取得時点の値も戻り、unplaced/rate_points には空行しか残らない
+        self.src.execute("INSERT INTO response_fetches(event_id,response_id,fetched_at,headers_json) VALUES(?,?,?,?)",
+                         (event1, r1, "2026-10-05T02:00:00+00:00", "{}"))
+        self.build()
+        self.assertEqual(snapshots(FETCH_OCT), [(f"fetch:{event1}",)])
+        self.assertEqual(snapshots("unplaced/rate_points.sqlite3"), [("fetch:",)])
+        self.audit_clean()
+        self.assert_same_as_fresh_build("fetch row returned")
+
+    def test_snapshot_rule_does_not_depend_on_the_response_home(self):
+        """取得時点の値の本籍は応答の本籍に依らない。取得の記録の応答が別の時の部品へ移っても、取得時点の値は動かない。"""
+        r1 = self.src.config_ids[0]
+        self.build()
+        before = part_sha(self.out)
+        self.src.execute("UPDATE responses SET fetched_at='2026-10-05T10:00:00+00:00' WHERE id=?", (r1,))
+        result = self.build()
+        self.assertEqual(rows(self.out / FETCH_OCT, "SELECT match_key FROM rate_points"), [(f"fetch:ev{r1}",)])
+        # 応答（と本文・entities・資産参照）は別の時の部品へ移るが、response_fetches と取得時点の値の部品 FETCH_OCT は不変
+        self.assertEqual(part_sha(self.out)[FETCH_OCT], before[FETCH_OCT])
+        self.assertNotIn(FETCH_OCT, self.paths(result))
+        self.audit_clean()
+
+
 class AuditThroughTests(PartsTestBase):
     def test_changes_after_build_are_explained(self):
         self.build()
@@ -725,6 +850,31 @@ class AuditThroughTests(PartsTestBase):
         self.assertEqual(info["unexplained"], 1)
         self.assertEqual(len(info["first_unexplained_rowids"]), 1)
         self.assertGreater(info["changed_after_build"], 0)
+
+    def test_audit_survives_a_part_that_vanishes_and_does_not_hide_its_rows(self):
+        # 監査が部品の一覧を取ってから開くまでの間に、行が無くなった部品が片付けられる（ファイルが消える）体
+        self.build()
+        self.assertEqual(self.audit()["vanished"], [])
+        real_connect = sqlite3.connect
+        target = (self.out / M2_PART).resolve().as_uri()
+
+        def connect_after_the_part_vanished(database, *args, **kwargs):
+            if str(database).startswith(target):
+                (self.out / M2_PART).unlink()
+            return real_connect(database, *args, **kwargs)
+
+        with mock.patch.object(sqlite3, "connect", connect_after_the_part_vanished):
+            report = self.audit()  # 落ちない
+        self.assertEqual(report["vanished"], [M2_PART])
+        # 読めなかった部品の行は、ほかの部品にも無いので、見落とさずに不一致として数える
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["tables"]["matches"]["unexplained"], 1)
+        self.assertEqual(report["tables"]["documents"]["unexplained"], 1)
+        # 開けない理由が「部品が無い」ではないとき（住所にあるのに開けない）は、読み飛ばさずに例外を出す
+        (self.out / M1_PART).unlink()
+        (self.out / M1_PART).mkdir()
+        with self.assertRaises(sqlite3.OperationalError):
+            self.audit()
 
     def test_no_catalog_behaves_as_before(self):
         self.build()
@@ -776,7 +926,8 @@ class WeirdValueTests(PartsTestBase):
 
 
 def dump_parts(out: Path) -> dict:
-    """部品ごとの全表の全行（_part は作成時刻が入るので除く）。空の表と空の部品は含めない。"""
+    """部品ごとの全表の全行（_part は作成時刻が入るので除く）。空の表は含めない。行が一つも無い部品は {} として含める
+    （片付けそこねた空の部品があれば、新しい出力先への全件作成と食い違う）。"""
     result = {}
     for p in sorted(out.rglob("*.sqlite3")):
         rel = p.relative_to(out).as_posix()
@@ -793,13 +944,12 @@ def dump_parts(out: Path) -> dict:
                     tables[name] = found
         finally:
             conn.close()
-        if tables:
-            result[rel] = tables
+        result[rel] = tables
     return result
 
 
 def dump_catalog(out: Path) -> dict:
-    """目録の中身（作成時刻・SHA-256 など作るたびに変わる列と、空の部品の行は除く）。"""
+    """目録の中身（作成時刻・SHA-256 など作るたびに変わる列は除く。files は空の部品の行も含めて全部）。"""
     cat = out / "catalog.sqlite3"
     result = {}
     for table in ("match_index", "response_index", "asset_index", "labels", "table_homes", "recipes",
@@ -807,7 +957,7 @@ def dump_catalog(out: Path) -> dict:
         result[table] = sorted(rows(cat, f"SELECT * FROM {table}"), key=repr)
     result["files"] = sorted(
         rows(cat, "SELECT path,domain,analysis_set,rule_raw,month,day,operation,period,response_id,match_key,hour,"
-                  "rows_json FROM files WHERE rows_json<>'{}'"),
+                  "rows_json FROM files"),
         key=repr,
     )
     result["status"] = rows(cat, "SELECT through_event_id,rule_version FROM status")
@@ -909,32 +1059,32 @@ class IncrementalTests(PartsTestBase):
         result = self.build()
         rebuilt = self.paths(result)
         goal = match_path("m2", rule="GOAL")
-        self.assertEqual(self.non_feed(rebuilt), {M2_PART, goal})  # m1 の部品も、m3 の部品も触れない
+        # 新しい場所の部品だけを作る。m1 の部品も m3 の部品も触れない。元の m2 の部品は作り直さず、片付ける
+        self.assertEqual(self.non_feed(rebuilt), {goal})
+        self.assertEqual(result["removed_parts"], [M2_PART])
         self.assertEqual(self.changed_parts(before), rebuilt)
         self.assertEqual(rows(self.out / goal, "SELECT match_key FROM matches ORDER BY 1"), [("m2",)])
         # 動いた試合の詳細の応答・目撃記録・本文もいっしょに動く
         self.assertEqual(rows(self.out / goal, "SELECT id FROM responses"), [(self.src.detail_id["m2"],)])
         self.assertEqual(rows(self.out / goal, "SELECT path FROM sightings"), [("$.x",)])
         self.assertEqual(rows(self.out / goal, "SELECT count(*) FROM bodies")[0][0], 1)
-        # 元の部品は削除されず、空の部品になる
-        old = self.out / M2_PART
-        self.assertTrue(old.is_file())
-        for table in ("matches", "documents", "match_classification", "responses", "sightings", "bodies"):
-            self.assertEqual(rows(old, f"SELECT count(*) FROM {table}")[0][0], 0, table)
+        # 元の部品は行が一つも無くなったので、削除される（出力先・状態 DB・目録のどこにも残らない）
+        self.assert_part_gone(M2_PART)
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT part_path FROM match_index WHERE match_key='m2'"),
                          [(goal,)])
         self.assertEqual(result["match_index"], {"mode": "delta", "recomputed": 1, "reused": 4})
         self.audit_clean()
-        # 部品に残る最後の試合が動いたら、旧部品は削除されず空の部品になる
+        self.assert_same_as_fresh_build("m2 moved")
+        # 部品に残る最後の試合が動いたときも同じ
         self.src.execute("UPDATE match_classification SET rule_raw='X',rule_name='X' WHERE match_key='m4'")
-        self.build()
-        old = self.out / M4_PART
-        self.assertTrue(old.is_file())
-        for table in ("matches", "documents", "match_classification", "responses", "bodies"):
-            self.assertEqual(rows(old, f"SELECT count(*) FROM {table}")[0][0], 0, table)
-        self.assertEqual(rows(old, "SELECT count(*) FROM _part")[0][0], 5)
-        self.assertEqual(rows(old, "SELECT count(*) FROM sqlite_master WHERE type='view'")[0][0] > 0, True)
+        result = self.build()
+        self.assertEqual(result["removed_parts"], [M4_PART])
+        self.assert_part_gone(M4_PART)
         self.audit_clean()
+        self.assert_same_as_fresh_build("m4 moved")
+        # 何も変えなければ、片付ける部品は無い
+        again = self.build()
+        self.assertEqual((again["rebuilt_parts"], again["removed_parts"]), ([], []))
 
     def test_delete_is_reflected(self):
         self.build()
@@ -949,11 +1099,12 @@ class IncrementalTests(PartsTestBase):
             conn.execute("DELETE FROM jobs WHERE operation='op2'")
         conn.close()
         result = self.build()
-        self.assertIn("system/jobs.sqlite3", self.paths(result))
-        self.assertEqual(rows(self.out / "system/jobs.sqlite3", "SELECT count(*) FROM jobs")[0][0], 0)
+        # system/jobs には op2 の行しか無かったので、行が無くなった部品は片付けられる
+        self.assertEqual(result["removed_parts"], ["system/jobs.sqlite3"])
+        self.assert_part_gone("system/jobs.sqlite3")
         self.audit_clean()
 
-    def test_deleted_match_leaves_an_empty_part_and_no_index_row(self):
+    def test_deleted_match_removes_its_part_and_index_row(self):
         self.build()
         conn = self.src.connect()
         with conn:
@@ -968,7 +1119,8 @@ class IncrementalTests(PartsTestBase):
         self.assertEqual(result["match_index"]["recomputed"], 0)
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM match_index WHERE match_key='m4'")[0][0], 0)
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM match_index")[0][0], 4)
-        self.assertEqual(rows(self.out / M4_PART, "SELECT count(*) FROM matches")[0][0], 0)
+        self.assertEqual(result["removed_parts"], [M4_PART])  # 消えた試合の部品は、空のまま残さず片付ける
+        self.assert_part_gone(M4_PART)
         self.audit_clean()
         # 消えた試合の前回の行は状態 DB からも捨てられる（次の周期も差分のまま、使い回しは 4 件）
         again = self.build()
@@ -987,9 +1139,8 @@ class IncrementalTests(PartsTestBase):
             self.src.match(conn, "nomatch", played="2026-08-01T00:00:00Z", analysis_set="nawabari", rule="TURF")
         conn.close()
         result = self.build()
-        rebuilt = self.paths(result)
-        self.assertIn("unplaced/match_tags.sqlite3", rebuilt)
-        self.assertEqual(rows(self.out / "unplaced/match_tags.sqlite3", "SELECT count(*) FROM match_tags")[0][0], 0)
+        self.assertEqual(result["removed_parts"], ["unplaced/match_tags.sqlite3"])  # 行が無くなった unplaced は片付ける
+        self.assert_part_gone("unplaced/match_tags.sqlite3")
         adopted = match_path("nomatch", analysis_set="nawabari", rule="TURF", day="2026-08/2026-08-01")
         self.assertEqual(rows(self.out / adopted, "SELECT tag FROM match_tags"), [("孤児",)])
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT tags FROM match_index WHERE match_key='nomatch'"),
@@ -1017,14 +1168,18 @@ class IncrementalTests(PartsTestBase):
         result = self.build()
         adopted = match_path("adopt", day="2026-09/2026-09-12")  # orphan_rows の詳細の playedTime
         self.assertIn(adopted, self.paths(result))
+        # 試合が現れて行が移ったので、行が一つも無くなった unplaced の 2 部品と、時の応答の部品は片付く。
+        # system/jobs は op2 の行が残るので片付かない
+        self.assertEqual(set(result["removed_parts"]),
+                         {"unplaced/documents.sqlite3", "unplaced/rate_points.sqlite3", hourly})
+        for gone in result["removed_parts"]:
+            self.assert_part_gone(gone)
+        self.assertIn("system/jobs.sqlite3", part_sha(self.out))
         self.assertEqual(rows(self.out / adopted, "SELECT match_key FROM documents"), [("adopt",)])
         self.assertEqual(rows(self.out / adopted, "SELECT match_key FROM rate_points"), [("adopt",)])
         self.assertEqual(rows(self.out / adopted, "SELECT match_key FROM jobs"), [("adopt",)])
         self.assertEqual(rows(self.out / adopted, "SELECT id FROM responses"), [(rid,)])
-        for table, part in (("documents", "unplaced/documents"), ("rate_points", "unplaced/rate_points")):
-            self.assertEqual(rows(self.out / (part + ".sqlite3"), f"SELECT count(*) FROM {table}")[0][0], 0, table)
         self.assertEqual(rows(self.out / "system/jobs.sqlite3", "SELECT count(*) FROM jobs WHERE match_key='adopt'")[0][0], 0)
-        self.assertEqual(rows(self.out / hourly, "SELECT count(*) FROM responses")[0][0], 0)
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT part_path,detail_available FROM match_index "
                                                             "WHERE match_key='adopt'"), [(adopted, 1)])
         self.audit_clean()
@@ -1040,7 +1195,7 @@ class IncrementalTests(PartsTestBase):
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT part_path,detail_available FROM match_index "
                                                             "WHERE match_key='pend'"), [(pending, 0)])
         self.audit_clean()
-        # 詳細が届くと、分類と日時が決まり、試合は新しい部品へ移る（元の部品は空のまま残る）
+        # 詳細が届くと、分類と日時が決まり、試合は新しい部品へ移る（元の部品は行が無くなるので片付く）
         conn = self.src.connect()
         with conn:
             self.src.next_id = 300
@@ -1050,7 +1205,8 @@ class IncrementalTests(PartsTestBase):
         arrived = match_path("pend")
         self.assertIn(arrived, self.paths(result))
         self.assertEqual(rows(self.out / arrived, "SELECT count(*) FROM matches")[0][0], 1)
-        self.assertEqual(rows(self.out / pending, "SELECT count(*) FROM matches")[0][0], 0)
+        self.assertEqual(result["removed_parts"], [pending])  # 元の部品は片付く
+        self.assert_part_gone(pending)
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT part_path,detail_available,stage FROM match_index "
                                                             "WHERE match_key='pend'"), [(arrived, 1, "ステージ")])
         self.audit_clean()
@@ -1092,6 +1248,232 @@ class IncrementalTests(PartsTestBase):
         self.audit_clean()
         self.assertEqual(rows(self.out / match_path("late"), "SELECT count(*) FROM matches WHERE match_key='late'")[0][0], 1)
         self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM match_index WHERE match_key='late'")[0][0], 1)
+
+    def test_weapon_snapshot_refetch_rebuilds_only_the_fetch_day(self):
+        # 取り直しで取得時点の値（fetch:<event_id> の rate_points）が増えても、古い応答の部品は作り直さない
+        self.build()
+        before = part_sha(self.out)
+        r1 = self.src.config_ids[0]
+        conn = self.src.connect()
+        with conn:
+            event = self.src.refetch(conn, r1, "2026-10-07T01:00:00+00:00")
+            conn.execute("INSERT INTO rate_points VALUES('acc','sw','ブキ','weapon',NULL,?,NULL,2.75,'api_snapshot','primary')",
+                         (f"fetch:{event}",))
+            # 古い取得の確認済みの印（同じ日の fetches の部品だけが作り直される）
+            conn.execute("UPDATE response_fetches SET acknowledged=1 WHERE event_id=?", (f"ev{r1}",))
+        conn.close()
+        result = self.build()
+        rebuilt = self.paths(result)
+        day = "fetches/2026-10/2026-10-07.sqlite3"
+        self.assertEqual({p for p in rebuilt if not p.startswith("system/")}, {day, FETCH_OCT})
+        self.assertEqual(self.changed_parts(before), rebuilt)  # 作り直していない部品は SHA-256 が不変
+        after = part_sha(self.out)
+        for untouched in (CONFIG_OCT, CONFIG_SEP, M1_PART, M2_PART, FETCH_SEP):
+            self.assertEqual(after[untouched], before[untouched], untouched)
+        self.assertEqual(rows(self.out / day, "SELECT match_key FROM rate_points"), [(f"fetch:{event}",)])
+        self.assertEqual(sorted(r[0] for r in rows(self.out / FETCH_OCT, "SELECT match_key FROM rate_points")),
+                         [f"fetch:ev{r1}"])
+        self.assertEqual(result["removed_parts"], [])
+        self.audit_clean()
+
+    def test_every_build_fills_the_recipes_table(self):
+        from ikarchive.parts_guide import RECIPES
+
+        self.build()
+        cat = self.out / "catalog.sqlite3"
+        self.assertEqual(rows(cat, "SELECT count(*) FROM recipes")[0][0], 13)
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 100
+            self.src.match(conn, "m6")
+        conn.close()
+        result = self.build()
+        self.assertFalse(result["full_rebuild"])
+        self.assertEqual(rows(cat, "SELECT question_ja,steps_ja,sql FROM recipes ORDER BY rowid"),
+                         [tuple(r) for r in RECIPES])
+        again = self.build()  # 何も変わらない周期でも、目録は作り直され、手引きは同じ 13 件
+        self.assertEqual(again["rebuilt_parts"], [])
+        self.assertEqual(rows(cat, "SELECT count(*) FROM recipes")[0][0], 13)
+
+
+
+class EmptyPartTests(PartsTestBase):
+    """作り直した結果、本籍の行が一つも無い部品（スキーマと _part だけになるもの）は、作らず、あれば片付ける。"""
+
+    PENDING = "matches/unclassified/no-rule/unknown-date/pend.sqlite3"
+
+    def make_pending(self):
+        conn = self.src.connect()
+        with conn:
+            self.src.pending_match(conn, "pend")
+        conn.close()
+
+    def attach_pending_detail(self):
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 300
+            self.src.attach_detail(conn, "pend")
+        conn.close()
+
+    def test_first_full_build_creates_no_empty_part(self):
+        result = self.build()
+        self.assertTrue(result["full_rebuild"])
+        self.assertEqual(result["removed_parts"], [])
+        self.assert_no_empty_part()
+        self.audit_clean()
+        cat = self.out / "catalog.sqlite3"
+        self.assertEqual(rows(cat, "SELECT count(*) FROM files")[0][0], len(part_sha(self.out)))
+        self.assertEqual(rows(self.state, "SELECT count(*) FROM part_files")[0][0], len(part_sha(self.out)))
+
+    def test_part_whose_rows_all_moved_is_removed_from_disk_state_and_catalog(self):
+        self.make_pending()
+        self.build()
+        cat = self.out / "catalog.sqlite3"
+        # 前: 出力先・part_files・row_homes・目録 files のすべてにある
+        self.assertTrue((self.out / self.PENDING).is_file())
+        self.assertEqual(rows(self.state, "SELECT count(*) FROM part_files WHERE path=?", (self.PENDING,))[0][0], 1)
+        self.assertGreater(rows(self.state, "SELECT count(*) FROM row_homes WHERE part=?", (self.PENDING,))[0][0], 0)
+        self.assertEqual(rows(cat, "SELECT count(*) FROM files WHERE path=?", (self.PENDING,))[0][0], 1)
+        self.attach_pending_detail()
+        result = self.build()
+        arrived = match_path("pend")
+        self.assertIn(arrived, self.paths(result))
+        self.assertNotIn(self.PENDING, self.paths(result))  # 作り直さず、片付ける
+        self.assertEqual(result["removed_parts"], [self.PENDING])
+        self.assert_part_gone(self.PENDING)
+        self.assertEqual(rows(cat, "SELECT part_path FROM match_index WHERE match_key='pend'"), [(arrived,)])
+        self.assertEqual(rows(cat, "SELECT count(*) FROM files")[0][0], len(part_sha(self.out)))
+        self.assert_no_empty_part()
+        self.audit_clean()
+        self.assert_same_as_fresh_build("pending part removed")
+        # 次の周期は何もしない
+        again = self.build()
+        self.assertEqual((again["rebuilt_parts"], again["removed_parts"]), ([], []))
+
+    def test_removed_part_comes_back_when_rows_return(self):
+        part = "unplaced/match_tags.sqlite3"  # seed の孤児タグ（試合が無い）だけが入っている
+        self.build()
+        self.assertTrue((self.out / part).is_file())
+        self.src.execute("DELETE FROM match_tags WHERE match_key='nomatch'")
+        result = self.build()
+        self.assertEqual(result["removed_parts"], [part])
+        self.assert_part_gone(part)
+        self.src.execute("INSERT INTO match_tags VALUES('acc','another','再び孤児',NULL,'t','t')")
+        result = self.build()
+        self.assertEqual(result["removed_parts"], [])
+        self.assertIn(part, self.paths(result))
+        self.assertEqual(rows(self.out / part, "SELECT tag FROM match_tags"), [("再び孤児",)])
+        self.assertEqual(rows(self.state, "SELECT count(*) FROM part_files WHERE path=?", (part,))[0][0], 1)
+        self.assertEqual(rows(self.out / "catalog.sqlite3", "SELECT count(*) FROM files WHERE path=?", (part,))[0][0], 1)
+        self.audit_clean()
+        self.assert_same_as_fresh_build("part came back")
+
+    def test_part_file_lost_before_the_state_was_committed_is_still_cleaned_up(self):
+        # 部品のファイルを消したあと状態 DB を確定する前に止まった体: ファイルは無いのに part_files には記録がある
+        self.make_pending()
+        self.build()
+        self.attach_pending_detail()
+        (self.out / self.PENDING).unlink()
+        result = self.build()
+        self.assertEqual(result["removed_parts"], [self.PENDING])
+        self.assert_part_gone(self.PENDING)
+        self.audit_clean()
+        self.assert_same_as_fresh_build("file already gone")
+
+    def test_missed_deletion_still_empties_the_part_and_drops_its_row_homes(self):
+        # 変更追跡が削除を取りこぼした体: 状態 DB の row_homes には消えた行の記録が残り、部品のファイルも無い。
+        # 作り直そうとして行が一つも無かった部品は、row_homes の記録も外して片付ける
+        part = "unplaced/match_tags.sqlite3"
+        self.build()
+        self.src.execute("DELETE FROM match_tags WHERE match_key='nomatch'")
+        through = rows(self.src.path, "SELECT max(event_id) FROM archive_change_feed")[0][0]
+        conn = sqlite3.connect(self.state)
+        conn.execute("INSERT OR REPLACE INTO meta VALUES('through_event_id',?)", (str(through),))  # この削除は処理済みの体
+        conn.commit()
+        conn.close()
+        self.assertGreater(rows(self.state, "SELECT count(*) FROM row_homes WHERE part=?", (part,))[0][0], 0)
+        (self.out / part).unlink()
+        result = self.build()
+        self.assertFalse(result["full_rebuild"])
+        self.assertEqual(result["removed_parts"], [part])
+        self.assert_part_gone(part)  # 変更追跡の記録を読み飛ばしたので、監査は回さない（その記録の行が部品に無い）
+
+    def test_files_that_are_not_recorded_parts_are_never_removed(self):
+        # 負の対照: 部品でないファイル・状態 DB に記録の無い `.sqlite3` は、部品が空になる周期でも消えない
+        self.build()
+        day_dir = "matches/xmatch/AREA/2026-10/2026-10-05"
+        stray = {
+            "NOTES.txt": b"memo",
+            f"{day_dir}/notes.txt": b"memo2",
+            f"{day_dir}/stray.sqlite3": b"a sqlite-looking file that is not a recorded part",
+        }
+        for rel, data in stray.items():
+            (self.out / rel).write_bytes(data)
+        # 状態 DB に記録の無い部品: 記録を外してから、その部品の行をすべて動かす
+        conn = sqlite3.connect(self.state)
+        conn.execute("DELETE FROM part_files WHERE path=?", (M4_PART,))
+        conn.commit()
+        conn.close()
+        unrecorded = (self.out / M4_PART).read_bytes()
+        self.src.execute("UPDATE match_classification SET rule_raw='GOAL',rule_name='GOAL' WHERE match_key='m2'")
+        self.src.execute("UPDATE match_classification SET rule_raw='X',rule_name='X' WHERE match_key='m4'")
+        result = self.build()
+        self.assertEqual(result["removed_parts"], [M2_PART])  # 記録のある空の部品だけが片付く
+        self.assert_part_gone(M2_PART)
+        for rel, data in stray.items():
+            self.assertEqual((self.out / rel).read_bytes(), data, rel)
+        self.assertEqual((self.out / M4_PART).read_bytes(), unrecorded)
+        self.assertTrue((self.out / "catalog.sqlite3").is_file())
+
+    def test_addresses_that_are_not_parts_stop_the_removal_and_delete_nothing(self):
+        self.build()
+        outside = self.out.parent / "outside.sqlite3"
+        outside.write_bytes(b"outside")
+        (self.out / "notes.txt").write_bytes(b"notes")
+        symlink = self.out / "link.sqlite3"
+        links = True
+        try:
+            symlink.symlink_to(outside)
+        except OSError:
+            links = False
+        bad_addresses = [
+            "catalog.sqlite3", "../outside.sqlite3", "notes.txt", "/nonexistent-dir/absolute.sqlite3",
+            "matches//double-slash.sqlite3", "matches/../catalog.sqlite3", ".tmp-parts/x.sqlite3", "back\\slash.sqlite3",
+        ] + (["link.sqlite3"] if links else [])
+        # スキーマが変わると全部品を作り直すので、記録だけがある住所はすべて「作り直したが行が無い部品」になる
+        conn = self.src.connect()
+        conn.execute("CREATE TABLE extra(v)")
+        conn.commit()
+        conn.close()
+        for bad in bad_addresses:
+            with self.subTest(address=bad):
+                conn = sqlite3.connect(self.state)
+                conn.execute("INSERT OR REPLACE INTO part_files VALUES(?,?,?,?,?)", (bad, 1, "x", "t", 1))
+                conn.commit()
+                conn.close()
+                catalog = (self.out / "catalog.sqlite3").read_bytes()
+                with self.assertRaises(PartsQuestion) as ctx:
+                    self.build()
+                self.assertTrue(str(ctx.exception).startswith("QUESTION:"), str(ctx.exception))
+                self.assertEqual((self.out / "catalog.sqlite3").read_bytes(), catalog)
+                self.assertEqual(outside.read_bytes(), b"outside")
+                self.assertEqual((self.out / "notes.txt").read_bytes(), b"notes")
+                if links:
+                    self.assertTrue(symlink.is_symlink())
+                # 記録は残る（状態 DB の更新は取り消された）。次の確認のために外す
+                conn = sqlite3.connect(self.state)
+                self.assertEqual(conn.execute("SELECT count(*) FROM part_files WHERE path=?", (bad,)).fetchone()[0], 1)
+                conn.execute("DELETE FROM part_files WHERE path=?", (bad,))
+                conn.commit()
+                conn.close()
+        # 不正な記録を外せば、そのまま作れる（試験のために置いた記号リンクと部品でないファイルは片付ける）
+        if links:
+            symlink.unlink()
+        (self.out / "notes.txt").unlink()
+        result = self.build()
+        self.assertTrue(result["full_rebuild"])
+        self.assertEqual(result["removed_parts"], [])
+        self.audit_clean()
 
 
 RANK = "EventMatchRankingPeriodQuery"
@@ -1351,7 +1733,9 @@ class DeltaCycleCostTests(PartsTestBase):
             conn.execute("INSERT INTO asset_refs VALUES(?,?,?)", (r, "u1", "$.z"))
             self.src.list_response(conn, "VsHistoryQuery", "2026-10-06T03:00:00+00:00",
                                    [("vs", "m1"), ("vs", "m2"), ("vs", "m6")])
-            self.src.refetch(conn, self.src.detail_id["m1"], "2026-10-06T04:00:00+00:00")
+            event = self.src.refetch(conn, self.src.detail_id["m1"], "2026-10-06T04:00:00+00:00")
+            conn.execute("INSERT INTO rate_points VALUES('acc','sw','ブキ','weapon',NULL,?,NULL,2.5,'api_snapshot','primary')",
+                         (f"fetch:{event}",))  # 取得時点の値は取得の行（response_fetches）を索引で引いて本籍を決める
             self.src.refetch(conn, self.src.config_ids[0], "2026-10-06T04:01:00+00:00")
             conn.execute("UPDATE match_classification SET rule_raw='GOAL',rule_name='GOAL' WHERE match_key='m2'")
             conn.execute("DELETE FROM match_tags WHERE tag='タグ甲'")
@@ -1373,16 +1757,26 @@ class DeltaCycleCostTests(PartsTestBase):
         self.audit_clean()
 
     def test_refetch_and_new_list_response_cycles_scan_nothing_big(self):
+        # 取得の行が無い取得時点の値（unplaced/rate_points にある）があっても、取り直しの周期は何も全走査しない
+        self.src.execute("INSERT INTO rate_points VALUES('acc','sw','ブキ','weapon',NULL,'fetch:nowhere',NULL,1.5,"
+                         "'api_snapshot','primary')")
         self.build()
+        self.assertTrue((self.out / "unplaced/rate_points.sqlite3").is_file())
         conn = self.src.connect()
         with conn:
             self.src.next_id = 710
-            self.src.refetch(conn, self.src.detail_id["m1"], "2026-10-06T04:00:00+00:00")
+            event = self.src.refetch(conn, self.src.detail_id["m1"], "2026-10-06T04:00:00+00:00")
+            conn.execute("INSERT INTO rate_points VALUES('acc','sw','ブキ','weapon',NULL,?,NULL,2.5,'api_snapshot','primary')",
+                         (f"fetch:{event}",))
         conn.close()
         log: list = []
         self.build(scan_log=log)
         self.assertFalse({t for t, _ in log} & BIG_TABLES, log)
         self.assertTrue({t for t, _ in log} <= SMALL_TABLES, log)
+        self.assertEqual(rows(self.out / "fetches/2026-10/2026-10-06.sqlite3", "SELECT match_key FROM rate_points"),
+                         [(f"fetch:{event}",)])
+        self.assertEqual(rows(self.out / "unplaced/rate_points.sqlite3", "SELECT match_key FROM rate_points"),
+                         [("fetch:nowhere",)])
         conn = self.src.connect()
         with conn:
             self.src.list_response(conn, "VsHistoryQuery", "2026-10-06T05:00:00+00:00", [("vs", "m1"), ("vs", "m2")])
@@ -1564,6 +1958,9 @@ class DeltaCycleCostTests(PartsTestBase):
             fresh_out = Path(self.tmp.name) / ("fresh-" + step.__name__)
             fresh = build_parts(self.src.path, fresh_out, Path(self.tmp.name) / ("fresh-" + step.__name__ + ".state"))
             self.assertEqual(fresh["match_index"]["mode"], "full", step.__name__)
+            self.assertEqual(fresh["removed_parts"], [], step.__name__)  # 初回の全件作成は空の部品を作らない
+            self.assertEqual(set(part_sha(self.out)), set(part_sha(fresh_out)), step.__name__)
+            self.assert_no_empty_part()
             self.assertEqual(dump_parts(self.out), dump_parts(fresh_out), step.__name__)
             # 目録の match_index（差分更新）は全件計算と同じ
             self.assertEqual(dump_catalog(self.out), dump_catalog(fresh_out), step.__name__)
@@ -1821,6 +2218,22 @@ class RandomMutations:
         conn.execute("INSERT OR IGNORE INTO rate_points VALUES('acc',?,'L','weapon',NULL,?,NULL,1.5,'api_snapshot','primary')",
                      ("sw%d" % self.rnd.randint(1, 3), "fetch:" + self.rnd.choice(events)))
 
+    def op_orphan_snapshot(self, conn):
+        # 取得の行が無い event_id の取得時点の値（unplaced/rate_points に置かれる）。のちに取得の行が現れることがある
+        conn.execute("INSERT OR IGNORE INTO rate_points VALUES('acc',?,'L','weapon',NULL,?,NULL,1.5,'api_snapshot','primary')",
+                     ("sw%d" % self.rnd.randint(1, 3), "fetch:late%d" % self.rnd.randint(1, 4)))
+
+    def op_late_fetch_row(self, conn):
+        # 取得の行があとから現れる（取得時点の値が先にあった体）。日付は解析できないものも含む
+        ids = self.column(conn, "SELECT id FROM responses")
+        if ids:
+            conn.execute("INSERT OR IGNORE INTO response_fetches(event_id,response_id,fetched_at,headers_json) VALUES(?,?,?,?)",
+                         ("late%d" % self.rnd.randint(1, 4), self.rnd.choice(ids), self.rnd.choice(self.FETCHED), "{}"))
+
+    def op_delete_fetch_row(self, conn):
+        # 取得の行だけが消える（その event_id の取得時点の値は残り、unplaced/rate_points へ移る）
+        conn.execute("DELETE FROM response_fetches WHERE rowid=?", (self.pick_rowid(conn, "response_fetches"),))
+
 
 class RandomMutationTests(PartsTestBase):
     def test_random_mutations_delta_equals_fresh_full_build(self):
@@ -1842,8 +2255,12 @@ class RandomMutationTests(PartsTestBase):
                     self.assertEqual(result["match_index"]["mode"], "delta", (seed, cycle))
                     assert_audit_clean(self, audit(src.path, out))
                     fresh = tmp / f"fresh{cycle}"
-                    build_parts(src.path, fresh, tmp / f"fresh{cycle}.state")
+                    fresh_result = build_parts(src.path, fresh, tmp / f"fresh{cycle}.state")
                     context = (seed, cycle, done[-8:])
+                    self.assertEqual(fresh_result["removed_parts"], [], context)  # 初回の全件作成は空の部品を作らない
+                    self.assertEqual(set(part_sha(out)), set(part_sha(fresh)), context)
+                    for rel, tables in dump_parts(out).items():
+                        self.assertTrue(tables, (context, "行が一つも無い部品が残っている", rel))
                     self.assertEqual(dump_parts(out), dump_parts(fresh), context)
                     self.assertEqual(dump_catalog(out), dump_catalog(fresh), context)
                     self.assertEqual(
@@ -1867,6 +2284,21 @@ class NoFeedTests(PartsTestBase):
         self.assertEqual(second["match_index"]["mode"], "full")
         self.audit_clean()
         self.assertEqual(rows(self.out / M1_PART, "SELECT last_seen FROM matches WHERE match_key='m1'"), [("z",)])
+
+    def test_full_rebuild_removes_a_part_that_became_empty(self):
+        self.build()
+        part = "unplaced/match_tags.sqlite3"
+        self.assertTrue((self.out / part).is_file())
+        self.src.execute("DELETE FROM match_tags WHERE match_key='nomatch'")
+        result = self.build()
+        self.assertTrue(result["full_rebuild"])
+        self.assertEqual(result["removed_parts"], [part])
+        self.assert_part_gone(part)
+        self.audit_clean()
+        again = self.build()  # 変更追跡が無いので毎回全件作成。空の部品は作られない
+        self.assertTrue(again["full_rebuild"])
+        self.assertEqual(again["removed_parts"], [])
+        self.assert_no_empty_part()
 
 
 class InternalAndQuestionTests(PartsTestBase):
@@ -1936,6 +2368,7 @@ class CliTests(PartsTestBase):
         for item in result["rebuilt_parts"]:
             self.assertEqual(set(item), {"path", "sha256", "bytes"})
         self.assertEqual(result["match_index"], {"mode": "full", "recomputed": 5, "reused": 0})
+        self.assertEqual(result["removed_parts"], [])  # 初回の全件作成は空の部品を作らず、片付けるものも無い
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = parts_build.main(["audit", "--source", str(self.src.path), "--out", str(self.out)])

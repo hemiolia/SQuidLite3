@@ -1,4 +1,4 @@
-# SQuidLite3 データ配置（設計 0.4・2026-10-05 Opus 5.5）
+# SQuidLite3 データ配置（設計 0.4・2026-10-05 Opus 5.5。2026-10-06 に空の部品の片付け・fetch 行の rate_points の本籍・目録 files の列を追記）
 
 ## この設計が満たす前田さんの指示（要点。全文は開発ログの原文）
 
@@ -45,9 +45,16 @@
 - 試合は1試合1部品: `matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>.sqlite3`（日時不明は `matches/<analysis_set>/<rule_raw>/unknown-date/<match_key>.sqlite3`）。
 - 試合詳細でない応答: `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<HH>.sqlite3`（fetched_at の日本時間の時）。ランキング系は従来どおり1応答1部品。
 - `sightings` は、その応答（response_id）の本籍に置く（一覧の目撃記録は一覧の応答の部品へ、詳細の目撃記録は試合の部品へ）。
-- `response_fetches` は、自身の fetched_at の日本時間の日付で `fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`。
+- `response_fetches` は、自身の fetched_at の日本時間の日付で `fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`。fetched_at を解析できない行は `fetches/unknown-date.sqlite3`（観測日時などで埋めない）。
+- `rate_points` のうち match_key が `fetch:<event_id>` の行（ブキのチョーシなど取得時点の値）は、`response_fetches.event_id` がその event_id の行の本籍（その取得の日の `fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`、fetched_at を解析できなければ `fetches/unknown-date.sqlite3`）。対応する `response_fetches` の行が無ければ `unplaced/rate_points.sqlite3`。応答の本籍には依らないので、取り直しのたびに古い応答の部品が作り直されることは無い。
 - そのほかは版 2 と同じ。
 - 規則の版が変わったときは、空の出力先に全部品を作る（古い版の部品を同じ場所に混ぜない）。
+
+### 空になった部品の片付け（版 3 に追加）
+
+- 作り直した結果、本籍の行（写しを含む）が1つも無い部品（スキーマと `_part` だけになるもの）は作らない。すでにある部品がそうなったとき（試合の分類や日時があとから決まって新しい部品へ移った、行が消えた、など）は、出力先のファイルを削除し、状態 DB の `part_files`・`row_homes` と目録の `files` から外す。初回の全件作成では空の部品を作らない。したがって `files` に載る部品は、どれも行が1つ以上ある。
+- 削除の対象は派生の部品だけ。出力先の `.sqlite3` のうち状態 DB の `part_files` に記録があるものだけを消す。正本・目録・部品でないファイル・記録の無い `.sqlite3` は同じ住所にあっても消さない。部品として消してよい住所でないもの（目録、出力先の外、`.sqlite3` でないものなど）が記録にあれば、何も消さずに止まる。
+- worker は Drive からも消す。状態 DB の `published` にあって `part_files` に無く、手元にファイルも無い部品を `rclone deletefile <remote>/<path>`（run_rclone 経由、シェル不使用）で消し、消せたら `published` から外す。消せなかったら `published` に残し、次の周期に再試行する（Drive に既に無いとき＝rclone の終了コード 3・4 は消せたものとして扱う）。全部品の照合が済み、新しい目録を送って照合できたあとに消す（Drive 上の目録が Drive に無い部品を指す時間を作らない。Opus 判断 2026-10-06）。目録を送れなかった周期は消さずに次の周期へ持ち越す。消した部品の住所は周期の JSON 行の `deleted` に出す。
 
 ## 置き場所
 
@@ -59,9 +66,10 @@ db/
   README_FOR_AI.md          目録から生成する読み方の案内（人と AI 向け）
   catalog.sqlite3           目録（公開の確定点）
   catalog.xlsx              目録の xlsx 版
-  matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3
-  responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>.sqlite3
+  matches/<analysis_set>/<rule_raw>/<YYYY-MM>/<YYYY-MM-DD>/<match_key>.sqlite3   （版 3: 1 試合 1 部品）
+  responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<HH>.sqlite3                      （版 3: 日本時間の時ごと）
   responses/<ランキング系の operation>/<YYYY-MM>/<YYYY-MM-DD>/<response_id>.sqlite3
+  fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3                                          （版 3: response_fetches と取得時点の rate_points）
   images/<SHA-256 の先頭2桁>.sqlite3
   images/no-body.sqlite3
   system/<表名>.sqlite3
@@ -83,7 +91,7 @@ db/
 | match_refs, sightings, documents | (account, kind, match_key) の試合の本籍。試合行が無ければ `unplaced/` |
 | match_tags | (account, match_key) が一致する試合の本籍。kind が二つ当たれば vs を優先。無ければ `unplaced/` |
 | rate_points（match_key が `fetch:` で始まらない） | (account, match_key) の試合の本籍（kind は vs を優先） |
-| rate_points（match_key が `fetch:<event_id>`） | `response_fetches.event_id` がその event_id の応答の本籍 |
+| rate_points（match_key が `fetch:<event_id>`） | `response_fetches.event_id` がその event_id の行の本籍（版 3: その取得の日の `fetches/<YYYY-MM>/<YYYY-MM-DD>`）。その行が無ければ `unplaced/rate_points` |
 | jobs（kind と match_key がある） | その試合の本籍。試合行が無ければ `system/jobs` |
 | jobs（それ以外） | `system/jobs` |
 | responses | 応答の本籍 |
@@ -100,13 +108,13 @@ db/
 
 ## 目録 catalog.sqlite3
 
-- `files`: path, domain, analysis_set, rule_raw, month, operation, period, bytes, sha256, rows_json（表ごとの本籍行数と写し行数）, built_through_event_id, built_at
+- `files`: path, domain, analysis_set, rule_raw, month, day, operation, period, response_id, match_key, hour, bytes, sha256, rows_json（表ごとの本籍行数と写し行数）, built_through_event_id, built_at。住所から決まる列は、`domain`＝住所の先頭の区間（matches / responses / fetches / images / system / unplaced）、matches の部品は `analysis_set`・`rule_raw`・`month`・`day`・`match_key`、responses の部品は `operation`・`month`・`day`・`period`（＝`day`）と、通常の operation は `hour`（日本時間の時、2桁）・ランキング系は `response_id`、fetches の部品は `month`・`day`。該当しない列は NULL。日時不明の部品は `month`・`day`（responses は `period` も）が `unknown-date`。`files` に載る部品は、どれも行が1つ以上ある（空の部品は載せない）
 - `match_index`: account, kind, match_key, analysis_set, rule_raw, rule_name, played_time, stage, judgement, my_weapon, tags, detail_available, part_path
 - `response_index`: response_id, account, operation, fetched_at, http_status, part_path
 - `asset_index`: url, state, body_sha256, content_type, part_path
 - `table_homes`: table_name, rule_ja, path_pattern
 - `labels`: kind（analysis_set / rule_raw / operation）, code, ja
-- `recipes`: question_ja, steps_ja, sql（例: Xマッチのルール別勝率は `match_index` だけで足りる。Xマッチの各試合の全プレイヤーのブキは `matches/xmatch/*/*.sqlite3` を開き `battle_players` ビュー。画像は `asset_index` で url から部品を引く）
+- `recipes`: question_ja, steps_ja, sql（`parts_guide.RECIPES` の13件。目録を作るたびに埋める。例: Xマッチのルール別勝率は `match_index` だけで足りる。Xマッチの各試合の全プレイヤーのブキは `matches/xmatch/*/*.sqlite3` を開き `battle_players` ビュー。画像は `asset_index` で url から部品を引く）
 - `status`: through_event_id, built_at, published_at, last_audit_at, last_audit_result, rule_version
 - `source_schema`: 正本の sqlite_master 全行（トリガー含む）
 - `source_sqlite_internal`: sqlite_sequence と sqlite_stat* の全行
@@ -117,12 +125,12 @@ db/
 2. `through = MAX(archive_change_feed.event_id)`。
 3. 全試合の本籍と全応答の本籍を計算し、状態 DB の前回値と比べる。変わった試合・応答は、旧本籍と新本籍の両方を「作り直す部品」に入れる。
 4. 前回の through より後の変更追跡の各行について、`old_rowid` を状態 DB の `row_homes` で引いた部品と、`new_rowid` の行の現在の本籍を「作り直す部品」に入れる。
-5. 作り直す部品ごとに、一時ファイルへ全表・全索引・全ビューを作り、本籍がその部品である行と写しを入れ、`_part` 表（住所・規則版・through・作成時刻・正本スキーマのハッシュ）を書き、fsync して置き換える。`row_homes` をその部品の行で置き換える。
+5. 作り直す部品ごとに、一時ファイルへ全表・全索引・全ビューを作り、本籍がその部品である行と写しを入れ、`_part` 表（住所・規則版・through・作成時刻・正本スキーマのハッシュ）を書き、fsync して置き換える。`row_homes` をその部品の行で置き換える。本籍の行が1つも無い部品は作らず、あれば削除して `part_files`・`row_homes`・目録から外す（上の「空になった部品の片付け」）。
 6. 作り直した部品を Drive へ送り、Drive が計算した SHA-256 と照合する。一致しなければ再送し、成功するまで目録を進めない。
-7. 目録を作り直して送り、照合する。状態 DB の through を進める。
-8. 初回は全部品を作る。
+7. 目録を作り直して送り、照合する。状態 DB の through を進める。そのあとで、手元から削除された部品を Drive からも消す。
+8. 初回は全部品を作る（空の部品は作らない）。
 
-完全性の監査（日次）は、全表について正本と本籍部品の和を `rowid` と全列値のハッシュで照合し、結果を目録の `status` に記録する。
+完全性の監査（日次）は、全表について正本と本籍部品の和を `rowid` と全列値のハッシュで照合し、結果を目録の `status` に記録する。監査の途中で、行が無くなった部品が片付けられても（ファイルが消えても）落ちず、`vanished` に住所を載せて読み飛ばす（その部品の行がほかの部品にも無ければ、不一致として数える）。
 
 ## 統合版
 

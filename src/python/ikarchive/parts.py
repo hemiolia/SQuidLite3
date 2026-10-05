@@ -3,6 +3,8 @@
 正本の SQLite を読み取り専用で開き、同じ静止点から「本籍」ごとの小さな SQLite 部品
 （正本と同じ全表・全索引・全ビュー）と目録 catalog.sqlite3 を作る。
 正本へは書き込まない。純粋なライブラリで、ネットワークにも Drive にも触れない。
+作り直した結果、本籍の行が一つも無い部品は作らず、すでにあれば出力先から消して状態 DB と目録から外す
+（消すのは状態 DB の part_files に記録がある `.sqlite3` だけ）。
 
 設計書: docs/design/SQuidLite3_データ配置.md（「版 3 の改定」の「本籍規則 版 3」）
 """
@@ -18,6 +20,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from .parts_guide import write_recipes
 
 HOME_RULE_VERSION = 3
 CHANGE_TABLE = "archive_change_feed"
@@ -88,8 +92,11 @@ TABLE_HOMES = (
      "応答の本籍と同じ（responses の行と同じ部品）"),
     ("documents", "(account, kind, match_key) の試合の本籍。試合行が無ければ unplaced", _MATCH_PATTERN),
     ("match_tags", "(account, match_key) が一致する試合の本籍（vs 優先）。無ければ unplaced", _MATCH_PATTERN),
-    ("rate_points", "match_key が fetch: で始まらなければその試合の本籍、fetch:<event_id> なら response_fetches.event_id の応答の本籍",
-     _MATCH_PATTERN + " または 応答の本籍と同じ（responses の行と同じ部品）"),
+    ("rate_points",
+     "match_key が fetch: で始まらなければその試合の本籍（試合行が無ければ unplaced）。"
+     "fetch:<event_id> なら response_fetches.event_id がその event_id の行の本籍（その取得の日の fetches の部品。"
+     "その行が無ければ unplaced）",
+     _MATCH_PATTERN + " または " + _FETCH_PATTERN + " または unplaced/rate_points.sqlite3"),
     ("jobs", "kind と match_key があり、その試合行があればその試合の本籍。それ以外は system/jobs",
      _MATCH_PATTERN + " または system/jobs.sqlite3"),
     ("responses",
@@ -413,9 +420,12 @@ def _hm_select(table: str, restrict: bool = False) -> str:
             f"AND k.match_key=x.match_key),{unplaced}), 'home' FROM {base}"
         )
     if table == "rate_points":
+        # fetch:<event_id> の行（ブキのチョーシなど取得時点の値）は、response_fetches.event_id がその event_id の行と
+        # 同じ本籍（その行自身の fetched_at の JST の日付の fetches の部品）。その行が無ければ unplaced。
+        # 応答の本籍には依らないので、取り直しで古い応答の部品が作り直されることは無い。
         return (
             "SELECT x.rowid, COALESCE(CASE WHEN substr(x.match_key,1,6)='fetch:' THEN "
-            "(SELECT rh.part FROM src.response_fetches f JOIN response_home rh ON rh.response_id=f.response_id "
+            "(SELECT fetch_part(CAST(f.fetched_at AS BLOB)) FROM src.response_fetches f "
             "WHERE f.event_id=substr(x.match_key,7)) "
             "ELSE (SELECT k.part FROM mk_home k WHERE k.account=x.account AND k.match_key=x.match_key) END,"
             f"{unplaced}), 'home' FROM {base}"
@@ -743,6 +753,9 @@ def _plan_delta(conn: sqlite3.Connection, tables: dict[str, Any], prev: int) -> 
           rowid で引いて再計算する。どれも作り直す部品に入る行なので、部品の大きさ以上の読みは生じない。
       response_fetches の本籍は行自身の fetched_at だけで決まる（版 3）ので、(a) の対象にならない。
           変更追跡に現れた行と、その行が前回あった日付の部品の行だけを再計算する。
+          fetch:<event_id> の rate_points の本籍も、その event_id の response_fetches の行の日付で決まる（版 3）。
+          取得の行が変わる・消えるときは、その行が前回あった日付の部品に同じ日の rate_points の行があるので同じ扱いで拾う。
+          取得の行が現れるときだけ、unplaced/rate_points の行（取得の行が無くて置かれていた行）を再計算する。
     旧本籍と新本籍の差（row_homes との差）から作り直す部品を決める。
     """
     names = list(tables)
@@ -805,6 +818,17 @@ def _plan_delta(conn: sqlite3.Connection, tables: dict[str, Any], prev: int) -> 
             "INSERT OR IGNORE INTO tp SELECT path FROM state.part_files "
             "WHERE path LIKE 'unplaced/%' OR path IN (?,?)",
             (f"system/{encode_segment('jobs')}{PART_SUFFIX}", f"system/{encode_segment('issues')}{PART_SUFFIX}"),
+        )
+    # fetch:<event_id> の rate_points の本籍は、response_fetches の event_id が一致する行の日付で決まる。
+    # 取得の行が現れる・変わるとき、それまで取得の行が無くて unplaced/rate_points にあった行がその日の部品へ移る。
+    # 取得の行が消える・日付が変わるときは、その行の旧本籍（feed_old_parts）に同じ日の rate_points の行がある。
+    # rate_points は索引で引けない表なので、unplaced/rate_points にある行を状態 DB の row_homes から再計算の対象にする。
+    if "rate_points" in tables and "response_fetches" in tables and conn.execute(
+        "SELECT 1 FROM feed_ev WHERE table_name='response_fetches' AND new_rid IS NOT NULL LIMIT 1"
+    ).fetchone():
+        conn.execute(
+            "INSERT OR IGNORE INTO tp SELECT path FROM state.part_files WHERE path=?",
+            (f"unplaced/{encode_segment('rate_points')}{PART_SUFFIX}",),
         )
 
     # 候補 rowid
@@ -901,6 +925,82 @@ def _plan_delta(conn: sqlite3.Connection, tables: dict[str, Any], prev: int) -> 
     conn.execute("INSERT OR IGNORE INTO rebuild SELECT part FROM feed_old_parts")
 
 
+# ---------------------------------------------------------------------------
+# 空になった部品の片付け
+# ---------------------------------------------------------------------------
+
+def _staged_parts(conn: sqlite3.Connection, tables: dict[str, Any]) -> set[str]:
+    """作業表 stg_<表> に行が一つでもある部品の住所。
+
+    作り直す部品のうちここに無いものは、本籍の行が一つも無い（スキーマと _part だけになる）ので作らない。
+    """
+    found: set[str] = set()
+    for table in tables:
+        for (part,) in conn.execute(f"SELECT DISTINCT _part FROM {_q('stg_' + table)}"):
+            found.add(part)
+    return found
+
+
+def _removable_part_file(out: Path, rel: Any) -> Path:
+    """出力先から消してよい部品のファイルを返す。消してよいのは、出力先の中にある `.sqlite3` の通常ファイル
+    （すでに無ければ無いまま）で、目録でも作成中の一時ディレクトリの中身でもないものだけ。
+    それ以外の住所なら、何も消さずに PartsQuestion で止める（部品でないものを、部品として消さない）。
+    """
+    problem: Optional[str] = None
+    target = out
+    if not isinstance(rel, str) or not rel.endswith(PART_SUFFIX):
+        problem = f"拡張子が {PART_SUFFIX} ではない"
+    elif rel == CATALOG_NAME:
+        problem = "目録である"
+    else:
+        segments = rel.split("/")
+        if "\x00" in rel or "\\" in rel or any(seg in ("", ".", "..") for seg in segments):
+            problem = "出力先の外や不正な区間を指す"
+        elif segments[0] == TMP_DIR_NAME:
+            problem = "作成中の一時ディレクトリの中である"
+        else:
+            target = out / rel
+            real_out = os.path.realpath(out)
+            real_parent = os.path.realpath(target.parent)
+            if real_parent != real_out and not real_parent.startswith(real_out + os.sep):
+                problem = "出力先の外にある"
+            elif target.is_symlink() or (target.exists() and not target.is_file()):
+                problem = "通常のファイルではない"
+    if problem is not None:
+        raise PartsQuestion(
+            f"QUESTION: 空になった部品として消そうとした住所 {rel!r} は、部品として消してよいものではない（{problem}）。"
+            "何も消さずに止めた。状態 DB の part_files の記録を確かめること。"
+        )
+    return target
+
+
+def _remove_empty_parts(conn: sqlite3.Connection, out: Path, empties: list[str]) -> list[str]:
+    """作り直そうとして本籍の行が一つも無かった部品（empties）を片付け、外した住所を返す（状態 DB の更新の中で呼ぶ）。
+
+    状態 DB の row_homes からその部品の記録を外す。出力先のファイルは、状態 DB の part_files に記録がある部品だけを
+    消す（記録の無い `.sqlite3` や部品でないファイルは、同じ住所にあっても消さない）。消したら part_files からも外す。
+    ファイルを消す前に、消す住所を全部検査する（ひとつでも不正なら何も消さずに PartsQuestion）。
+    ファイルを消してから状態 DB を確定する順なので、途中で止まっても、次の周期は記録が残る部品のファイルが無いこと
+    から作り直しに入り、同じ結果になる（やり直せる）。
+    """
+    targets: list[tuple[str, Path]] = []
+    for path in empties:
+        conn.execute("DELETE FROM state.row_homes WHERE part=?", (path,))
+        if conn.execute("SELECT 1 FROM state.part_files WHERE path=?", (path,)).fetchone():
+            targets.append((path, _removable_part_file(out, path)))
+    removed: list[str] = []
+    for path, target in targets:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            _fsync_dir(target.parent)
+        conn.execute("DELETE FROM state.part_files WHERE path=?", (path,))
+        removed.append(path)
+    return removed
+
+
 def build_parts(
     source_path: str | os.PathLike,
     out_dir: str | os.PathLike,
@@ -916,6 +1016,12 @@ def build_parts(
     （古い版の部品を同じ場所に混ぜない）。出力先が空なら状態を白紙に戻して全部品を作る。
     目録 match_index は、差分周期では前回の行を使い、作り直した試合部品に属する試合と本籍が変わった試合だけ計算し直す
     （戻り値の match_index に mode・recomputed・reused が入る）。
+
+    作り直した結果、本籍の行が一つも無い部品（スキーマと _part だけになるもの）は作らない。すでにある部品がそうなったとき
+    （試合が新しい場所へ移った、行が消えたなど）は、出力先のファイルを消し、状態 DB の part_files・row_homes と
+    目録の files から外す（戻り値の removed_parts）。消すのは状態 DB の part_files に記録がある `.sqlite3` だけで、
+    それ以外は同じ住所にあっても消さない。Drive 側の削除は build_parts の仕事ではない（worker が行う）。
+    目録は作るたびに recipes 表を parts_guide.RECIPES で埋める。
 
     after_snapshot はテスト用: 作業 DB への写しが済み、正本から離れた直後に呼ぶ。
     scan_log はテスト用: リストを渡すと、正本の表を索引なしで全走査した SQL が (表名, SQL) で入る。
@@ -1051,8 +1157,14 @@ def build_parts(
         if after_snapshot is not None:
             after_snapshot()
         work_uri = _ro_uri(work_file)
+        # 作り直す部品のうち、本籍の行が一つも無いもの（スキーマと _part だけになるもの）は作らない。
+        # すでにある空の部品は、下の状態 DB の更新の中で片付ける（出力先・目録・状態 DB から外す）。
+        staged = _staged_parts(conn, tables)
+        empties = [path for path in rebuilt if path not in staged]
         results = []
         for path in rebuilt:
+            if path not in staged:
+                continue
             results.append(
                 _write_part(
                     out / path, out / TMP_DIR_NAME, schema, work_uri,
@@ -1099,6 +1211,7 @@ def build_parts(
                     "INSERT OR REPLACE INTO state.part_files VALUES(?,?,?,?,?)",
                     (res["path"], res["bytes"], res["sha256"], built_at, through),
                 )
+            removed = _remove_empty_parts(conn, out, empties)
             if through is None:
                 conn.execute("DELETE FROM state.meta WHERE key='through_event_id'")
             else:
@@ -1118,6 +1231,8 @@ def build_parts(
             "through_event_id": through,
             "full_rebuild": full,
             "rebuilt_parts": results,
+            # 行が一つも無くなったので出力先・目録・状態 DB から外した部品の住所（Drive 側の削除は worker が行う）
+            "removed_parts": removed,
             "catalog": catalog,
             # 目録 match_index の行を、この周期に JSON から計算し直した数（recomputed）と前回の行を使った数（reused）
             "match_index": {key: mi_stats[key] for key in ("mode", "recomputed", "reused")},
@@ -1364,6 +1479,7 @@ def _write_catalog(out: Path, state: Path, work_uri: str, through: Optional[int]
         conn.execute("BEGIN")
         for ddl in _CATALOG_DDL:
             conn.execute(ddl)
+        write_recipes(conn)  # 分析の手引き recipes（parts_guide.RECIPES）。目録を作るたびに埋める
         counts: dict[str, dict[str, dict[str, int]]] = {}
         for part, table, role, n in conn.execute(
             "SELECT part,table_name,role,count(*) FROM s.row_homes GROUP BY part,table_name,role"
@@ -1465,6 +1581,10 @@ def audit(source_path: str | os.PathLike, parts_dir: str | os.PathLike) -> dict[
     目録に through_event_id があれば、それより後の変更追跡に現れる (表, rowid) の不一致は
     作成後の変化（changed_after_build）として、現れない不一致（unexplained）と分けて数える。
     ok は全表で unexplained が 0 のときに真。
+
+    部品の一覧を取ってから開くまでの間に、行が無くなった部品が片付けられる（ファイルが消える）ことがある。
+    その部品は読めなかったものとして vanished に住所を載せて読み飛ばす（落ちない）。その部品の行は、ほかの部品にも
+    無ければ不一致として数えるので、見落とすことはない。
     """
     parts_root = Path(parts_dir)
     through = _catalog_through(parts_root)
@@ -1510,9 +1630,16 @@ def audit(source_path: str | os.PathLike, parts_dir: str | os.PathLike) -> dict[
     part_digests: dict[str, dict[int, list[bytes]]] = {t: {} for t in names}
     copies: list[tuple[str, int, bytes, str]] = []
     errors: list[str] = []
+    vanished: list[str] = []
     for path in part_paths:
         rel = path.relative_to(parts_root).as_posix()
-        conn = sqlite3.connect(_ro_uri(path), uri=True)
+        try:
+            conn = sqlite3.connect(_ro_uri(path), uri=True)
+        except sqlite3.OperationalError:
+            if path.exists():
+                raise
+            vanished.append(rel)  # 一覧を取ったあとに片付けられた部品
+            continue
         try:
             have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "_copies" not in have or "_part" not in have:
@@ -1577,5 +1704,6 @@ def audit(source_path: str | os.PathLike, parts_dir: str | os.PathLike) -> dict[
         "copies": {"checked": len(copies), "mismatched": len(copy_bad), "first_mismatch": copy_bad[:10],
                    "changed_after_build": copy_after},
         "part_files": len(part_paths),
+        "vanished": vanished,
         "errors": errors,
     }

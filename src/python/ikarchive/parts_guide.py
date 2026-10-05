@@ -45,10 +45,11 @@ RECIPES: list[tuple[str, str, str]] = [
     (
         "試合のファイルの一覧（あるモード・ルール・期間の試合が入っているファイル）が欲しい",
         "catalog.sqlite3 の files 表で domain が matches の行を、analysis_set（モード）・rule_raw（ルール）・month・day・"
-        "match_key で絞る。path がそのファイル。試合の分類や日時があとから決まると試合は新しい場所へ移り、"
-        "元のファイルは空のまま残るので、rows_json が {} のファイルは飛ばす。1 試合の場所だけなら match_index の part_path。",
+        "match_key で絞る。path がそのファイル。files 表にある部品は、どれも行が 1 つ以上ある（試合の分類や日時があとから"
+        "決まると試合は新しい場所へ移り、行が無くなった元のファイルは削除されて files 表からも消える）。"
+        "1 試合の場所だけなら match_index の part_path。",
         "SELECT path, match_key, month, day FROM files WHERE domain = 'matches' AND analysis_set = :analysis_set "
-        "AND rule_raw = :rule_raw AND rows_json <> '{}' ORDER BY day, match_key",
+        "AND rule_raw = :rule_raw ORDER BY day, match_key",
     ),
     (
         "バイトの WAVE ごとの結果やオオモノを見たい",
@@ -59,7 +60,8 @@ RECIPES: list[tuple[str, str, str]] = [
     (
         "パワー・ポイント・レート・納品数の推移を見たい",
         "試合に付くレートは各試合のファイルの rate_points 表にある（series_id ごとの系列）。"
-        "ブキのチョーシなど取得時点の値は match_key が fetch: で始まる行で、その取得の応答と同じ部品にある。"
+        "ブキのチョーシなど取得時点の値は match_key が fetch:<event_id> の行で、その取得の記録（response_fetches の、"
+        "event_id が同じ行）と同じ fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3 の部品にある（応答の部品ではない）。"
         "系列の一覧と所在は files 表の rows_json（部品ごとの表の行数）から rate_points を含む部品を引く。",
         "SELECT series_id, label, played_time, value FROM rate_points ORDER BY series_id, played_time",
     ),
@@ -95,7 +97,8 @@ RECIPES: list[tuple[str, str, str]] = [
     (
         "取得がうまくいったか、何が未取得かを知りたい",
         "system/jobs.sqlite3（取得キュー。state が done・retry・unavailable・out_of_scope など）、"
-        "system/runs.sqlite3（収集の各回）、system/issues.sqlite3 と各部品の issues 表（監査記録）。",
+        "system/runs.sqlite3（収集の各回）、system/issues.sqlite3 と各部品の issues 表（監査記録）。"
+        "行が一つも無い部品は作られないので、住所は files 表で確かめる（試合に紐づく取得キューの行は、その試合の部品の jobs 表にある）。",
         "SELECT state, count(*) FROM jobs GROUP BY state",
     ),
     (
@@ -164,7 +167,9 @@ def render_readme(catalog: sqlite3.Connection) -> str:
         "ランキング系の種類だけは 1 応答 1 部品で `responses/<operation>/<YYYY-MM>/<YYYY-MM-DD>/<response_id>.sqlite3`。"
         "一覧の応答の目撃記録（`sightings`）は、その一覧の応答の部品にある（詳細の応答の目撃記録は試合のファイルにある）。")
     add("- `fetches/<YYYY-MM>/<YYYY-MM-DD>.sqlite3`: 取得の記録（`response_fetches`）。取得した日（日本時間）ごと。"
-        "同じ応答を取り直した記録はここに増え、応答の部品は変わらない。")
+        "同じ応答を取り直した記録はここに増え、応答の部品は変わらない。"
+        "ブキのチョーシなど取得時点の値（`rate_points` のうち `match_key` が `fetch:<event_id>` の行）も、"
+        "`event_id` が同じ取得の記録と同じこの部品にある（その取得の記録が無ければ `unplaced/rate_points.sqlite3`）。")
     add("- `images/<SHA-256 の先頭2桁>.sqlite3`: 画像。")
     add("- `system/`: 取得キュー・収集の各回・監査・設定などの運用記録。`system/archive_change_feed/` は変更の記録。")
     add("- `unplaced/`: 上の規則で決まらなかった行（参照先の無い行など）。捨てずにここに置く。")
@@ -179,8 +184,10 @@ def render_readme(catalog: sqlite3.Connection) -> str:
         "ランキング系は `responses/<operation>/unknown-date/<response_id>.sqlite3`、取得の記録は `fetches/unknown-date.sqlite3`）。"
         "英数字・`_`・`-` 以外の文字（`match_key` の `:` など）は `~` と16進2桁で書く。")
     add("")
-    add("試合の分類や日時があとから決まると、その試合は新しい場所のファイルへ移り、元の場所には空のファイルが残る"
-        "（`files.rows_json` が `{}`）。試合の今の場所は `match_index.part_path` が正しい。")
+    add("試合の分類や日時があとから決まると、その試合は新しい場所のファイルへ移る。行が一つも無くなった元のファイルは"
+        "削除され（Drive からも消える）、`files` 表にも載らない。行が一つも無い部品は最初から作られないので、"
+        "`files` 表に載っていない住所のファイルは無い（例: 取得キューの行がすべて試合に属していれば `system/jobs.sqlite3` は無い）。"
+        "`files` 表にある部品は、どれも行が 1 つ以上ある。試合の今の場所は `match_index.part_path` が正しい。")
     add("")
     add("どの部品も正本と同じ表・索引・ビューを持つ。部品を一つ開けば、正本と同じ SQL（`battle_players` や `analysis_xmatch` などのビュー）がその範囲でそのまま動く。"
         "複数の試合を分析するときは、`files` 表（`domain` が `matches`。`analysis_set`・`rule_raw`・`month`・`day`・`match_key` で絞る）で該当ファイルを列挙し、"
@@ -225,8 +232,10 @@ def render_readme(catalog: sqlite3.Connection) -> str:
         add("")
     add("## 更新と完全性")
     add("")
-    add("NAS の正本が更新されると、変わった部品だけが作り直され、Drive へ送られ、Drive 側の SHA-256 で照合されたあとで最後に `catalog.sqlite3` が置き換わる。"
-        "`catalog.sqlite3` の `files` にある SHA-256 と部品が一致しないときは、更新の途中なので少し待って読み直す。")
+    add("NAS の正本が更新されると、変わった部品だけが作り直され、Drive へ送られ、Drive 側の SHA-256 で照合される。"
+        "行が一つも無くなった部品は、そのあとで Drive からも消される。最後に `catalog.sqlite3` が置き換わる。"
+        "`catalog.sqlite3` の `files` にある SHA-256 と部品が一致しないとき、または `files` にある部品が見つからないときは、"
+        "更新の途中なので少し待って読み直す。")
     if status:
         add("")
         for key in ("through_event_id", "built_at", "published_at", "last_audit_at", "last_audit_result", "rule_version"):

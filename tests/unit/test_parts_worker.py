@@ -38,14 +38,22 @@ class FakeRclone:
         self.corrupt: set[str] = set()  # 届いたが中身が違うことにする（SHA が一致しない）
         self.drop: set[str] = set()  # 届かないことにする
         self.hashsum_error = False
+        self.delete_fail: set[str] = set()  # deletefile が（一般の例外で）失敗することにする。Drive の側は変わらない
+        self.delete_code: dict[str, int] = {}  # deletefile が、その rclone の終了コードで失敗することにする
+        self.events: list[tuple[str, str]] = []  # 時系列: ("copy", 相対パス) と ("delete", 相対パス)
+
+    DELETE_PREFIX = "gdrive:SQuidLite3/db/"
 
     def __call__(self, rclone, config, args):
         self.calls.append([rclone, config, *args])
+        if args[0] == "deletefile":
+            return self._deletefile(args)
         files = self._files_from(args)
         if args[0] == "copy":
             src = Path(args[1])
             for rel in files:
                 self.copied_order.append(rel)
+                self.events.append(("copy", rel))
                 if rel in self.drop:
                     continue
                 target = self.remote / rel
@@ -63,6 +71,21 @@ class FakeRclone:
                     lines.append(f"{hashlib.sha256(target.read_bytes()).hexdigest()}  {rel}")
             return "\n".join(lines) + "\n"
         raise AssertionError(args)
+
+    def _deletefile(self, args):
+        """`rclone deletefile <remote>/<path>`。引数は 1 つだけ。Drive に無ければ rclone と同じく終了コード 4。"""
+        assert len(args) == 2 and args[1].startswith(self.DELETE_PREFIX), args
+        rel = args[1][len(self.DELETE_PREFIX):]
+        if rel in self.delete_fail:
+            raise RuntimeError("deletefile failed")
+        if rel in self.delete_code:
+            raise parts_worker.RcloneError("deletefile failed", self.delete_code[rel])
+        target = self.remote / rel
+        if not target.is_file():
+            raise parts_worker.RcloneError("object not found", 4)
+        target.unlink()
+        self.events.append(("delete", rel))
+        return ""
 
     @staticmethod
     def _files_from(args):
@@ -103,6 +126,17 @@ class WorkerTestBase(unittest.TestCase):
             return {p: s for p, s in conn.execute("SELECT path,sha256 FROM part_files")}
         finally:
             conn.close()
+
+    def argv(self):
+        o = self.opts
+        return ["--source", o.source, "--out", o.out, "--state", o.state, "--work-dir", o.work_dir,
+                "--remote", o.remote, "--rclone", o.rclone, "--rclone-config", o.rclone_config, "--once"]
+
+    def run_main(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = parts_worker.main(argv)
+        return code, buf.getvalue()
 
     def remote_catalog_published_at(self):
         conn = sqlite3.connect(f"{(self.remote / 'catalog.sqlite3').resolve().as_uri()}?mode=ro", uri=True)
@@ -260,17 +294,6 @@ class RuleVersionTests(WorkerTestBase):
 
 
 class MainTests(WorkerTestBase):
-    def argv(self):
-        o = self.opts
-        return ["--source", o.source, "--out", o.out, "--state", o.state, "--work-dir", o.work_dir,
-                "--remote", o.remote, "--rclone", o.rclone, "--rclone-config", o.rclone_config, "--once"]
-
-    def run_main(self, argv):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-            code = parts_worker.main(argv)
-        return code, buf.getvalue()
-
     def test_once_prints_one_json_line(self):
         code, text = self.run_main(self.argv())
         self.assertEqual(code, 0)
@@ -279,10 +302,11 @@ class MainTests(WorkerTestBase):
         data = json.loads(lines[0])
         self.assertEqual(
             set(data),
-            {"through_event_id", "rebuilt", "uploaded", "verified", "failed", "catalog_published",
-             "lag_seconds", "duration_seconds"},
+            {"through_event_id", "rebuilt", "uploaded", "verified", "failed", "deleted", "delete_failed",
+             "catalog_published", "lag_seconds", "duration_seconds"},
         )
         self.assertTrue(data["catalog_published"])
+        self.assertEqual((data["deleted"], data["delete_failed"]), ([], 0))
 
     def test_second_worker_exits_zero_without_working(self):
         lock_path = Path(self.opts.state).with_name(Path(self.opts.state).name + ".lock")
@@ -323,6 +347,235 @@ class MainTests(WorkerTestBase):
         self.assertEqual(json.loads(text)["failed"], 1)
 
 
+PENDING = "matches/unclassified/no-rule/unknown-date/pend.sqlite3"  # 詳細が未取得の試合の部品
+
+
+class DeletionTests(WorkerTestBase):
+    """行が一つも無くなった部品を、Drive からも `rclone deletefile <remote>/<path>` で消す。"""
+
+    def start_with_pending_match(self):
+        """詳細が未取得の試合の部品を Drive に送った状態から始める。"""
+        conn = self.src.connect()
+        with conn:
+            self.src.pending_match(conn, "pend")
+        conn.close()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["failed"], summary["deleted"], summary["delete_failed"]), (0, [], 0))
+        self.assertTrue((self.remote / PENDING).is_file())
+        self.assertIn(PENDING, self.published())
+        self.assertEqual(self.deletefile_calls(), [])
+        self.fake.calls.clear()
+        self.fake.copied_order.clear()
+        self.fake.events.clear()
+
+    def attach_detail(self):
+        """詳細が届いて、試合が新しい場所の部品へ移る（元の部品は行が無くなる）。移り先の住所を返す。"""
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 300
+            self.src.attach_detail(conn, "pend")
+        conn.close()
+        return match_path("pend")
+
+    def deletefile_calls(self):
+        return [c for c in self.fake.calls if c[2] == "deletefile"]
+
+    def remote_catalog_files(self) -> set:
+        conn = sqlite3.connect(f"{(self.remote / 'catalog.sqlite3').resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            return {r[0] for r in conn.execute("SELECT path FROM files")}
+        finally:
+            conn.close()
+
+    def test_part_that_lost_all_rows_is_deleted_from_drive_after_the_catalog(self):
+        self.start_with_pending_match()
+        arrived = self.attach_detail()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual(summary["deleted"], [PENDING])
+        self.assertEqual((summary["failed"], summary["delete_failed"]), (0, 0))
+        self.assertTrue(summary["catalog_published"])
+        # 手元・状態 DB・Drive のどこにも残らない
+        self.assertFalse((self.root / "parts" / PENDING).exists())
+        self.assertNotIn(PENDING, self.part_files())
+        self.assertNotIn(PENDING, self.published())
+        self.assertFalse((self.remote / PENDING).exists())
+        # 移り先は Drive にあり、照合されている
+        self.assertIn(arrived, self.published())
+        self.assertEqual(hashlib.sha256((self.remote / arrived).read_bytes()).hexdigest(), self.part_files()[arrived])
+        # rclone は run_rclone 経由で、リストの引数（シェルを通さない）として <remote>/<path> を一つ渡される
+        self.assertEqual(self.deletefile_calls(),
+                         [["/usr/bin/rclone-fake", "/nonexistent/rclone.conf", "deletefile",
+                           f"gdrive:SQuidLite3/db/{PENDING}"]])
+        # 順序: 移り先の部品を送って照合し、新しい目録（公開の確定点）を送って照合してから、古い部品を消す。
+        # Drive 上の目録が Drive に無い部品を指す時間を作らない。
+        events = self.fake.events
+        self.assertLess(events.index(("copy", arrived)), events.index(("copy", "catalog.sqlite3")))
+        self.assertLess(events.index(("copy", "catalog.sqlite3")), events.index(("delete", PENDING)))
+        self.assertEqual(events[-1], ("delete", PENDING))
+        self.assertEqual(self.fake.copied_order[-2:], ["README_FOR_AI.md", "catalog.sqlite3"])
+        # Drive の目録は、消した部品を載せず、移り先を載せる
+        listed = self.remote_catalog_files()
+        self.assertNotIn(PENDING, listed)
+        self.assertIn(arrived, listed)
+        assert_audit_clean(self, audit(self.src.path, self.root / "parts"))
+
+    def test_failed_deletion_stays_published_and_is_retried_next_cycle(self):
+        self.start_with_pending_match()
+        self.attach_detail()
+        self.fake.delete_fail = {PENDING}
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"], summary["failed"]), ([], 1, 0))
+        self.assertIn(PENDING, self.published())  # published に残る
+        self.assertTrue((self.remote / PENDING).is_file())  # Drive にも残る
+        self.assertNotIn(PENDING, self.part_files())  # もう部品ではない
+        self.assertTrue(summary["catalog_published"])  # 消せなくても目録は送る（目録は消した部品を載せない）
+        self.assertNotIn(PENDING, self.remote_catalog_files())
+        self.assertEqual(len(self.deletefile_calls()), 1)
+        # 次の周期: 再試行して消せる。部品は送らず、目録は変わらないので送り直さない
+        self.fake.delete_fail = set()
+        self.fake.calls.clear()
+        self.fake.copied_order.clear()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"]), ([PENDING], 0))
+        self.assertEqual((summary["rebuilt"], summary["uploaded"]), (0, 0))
+        self.assertFalse(summary["catalog_published"])
+        self.assertNotIn(PENDING, self.published())
+        self.assertFalse((self.remote / PENDING).exists())
+        self.assertEqual(self.fake.copied_order, [])
+        # その次の周期: 消すものは無い。rclone は呼ばれない
+        self.fake.calls.clear()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"]), ([], 0))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_file_already_absent_on_drive_counts_as_deleted(self):
+        self.start_with_pending_match()
+        self.attach_detail()
+        (self.remote / PENDING).unlink()  # Drive の側では既に無い（rclone は終了コード 4 で失敗する）
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"]), ([PENDING], 0))
+        self.assertNotIn(PENDING, self.published())
+        self.assertEqual(len(self.deletefile_calls()), 1)  # 呼んだ上で、既に無かったと分かった
+
+    def test_other_rclone_errors_are_not_deletions(self):
+        self.start_with_pending_match()
+        self.attach_detail()
+        self.fake.delete_code = {PENDING: 7}  # 致命的エラー（終了コード 7）は、消せたことにしない
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"]), ([], 1))
+        self.assertIn(PENDING, self.published())
+        self.assertTrue((self.remote / PENDING).is_file())
+
+    def test_deletion_waits_until_every_part_is_verified(self):
+        self.start_with_pending_match()
+        arrived = self.attach_detail()
+        self.fake.corrupt = {arrived}  # 移り先の部品が壊れて届く
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual((summary["deleted"], summary["delete_failed"]), ([], 0))
+        self.assertFalse(summary["catalog_published"])
+        self.assertEqual(self.deletefile_calls(), [])  # 移った行の送り先がそろうまで、元の部品を消さない
+        self.assertTrue((self.remote / PENDING).is_file())
+        self.assertIn(PENDING, self.published())
+        # 次の周期: 部品がそろい、目録を送って照合してから消す
+        self.fake.corrupt = set()
+        self.fake.events.clear()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["failed"], summary["deleted"]), (0, [PENDING]))
+        self.assertTrue(summary["catalog_published"])
+        self.assertEqual(self.fake.events[-1], ("delete", PENDING))
+        self.assertLess(self.fake.events.index(("copy", "catalog.sqlite3")), self.fake.events.index(("delete", PENDING)))
+
+    def test_part_recreated_before_the_retry_is_sent_again_not_deleted(self):
+        part = "unplaced/match_tags.sqlite3"  # seed の孤児タグだけが入っている
+        parts_worker.run_cycle(self.opts)
+        self.assertIn(part, self.published())
+        self.src.execute("DELETE FROM match_tags WHERE match_key='nomatch'")
+        self.fake.delete_fail = {part}
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"]), ([], 1))
+        self.assertIn(part, self.published())
+        # 消せないうちに、同じ住所へ行が戻って部品が作り直された: 消さずに送り直す
+        self.src.execute("INSERT INTO match_tags VALUES('acc','another','再び孤児',NULL,'t','t')")
+        self.fake.delete_fail = set()
+        self.fake.calls.clear()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["deleted"], summary["delete_failed"], summary["failed"]), ([], 0, 0))
+        self.assertEqual(self.deletefile_calls(), [])
+        self.assertEqual(self.published()[part][0], self.part_files()[part])
+        self.assertEqual(hashlib.sha256((self.remote / part).read_bytes()).hexdigest(), self.part_files()[part])
+        assert_audit_clean(self, audit(self.src.path, self.root / "parts"))
+
+    def test_nothing_but_removed_parts_is_ever_deleted(self):
+        # 負の対照: 通常の周期（初回・何も変わらない・試合の追加）では deletefile を呼ばない
+        parts_worker.run_cycle(self.opts)
+        parts_worker.run_cycle(self.opts)
+        conn = self.src.connect()
+        with conn:
+            self.src.next_id = 100
+            self.src.match(conn, "m6")
+        conn.close()
+        parts_worker.run_cycle(self.opts)
+        self.assertEqual(self.deletefile_calls(), [])
+        published = self.published()
+        self.assertIn("README_FOR_AI.md", published)
+        self.assertIn("catalog.sqlite3", published)
+        # published に、消してはならない記録を仕込む。目録・README のほか、部品でない記録、不正な住所、
+        # 手元にファイルがある住所は、part_files に無くても消さない
+        out = self.root / "parts"
+        (out / "present.sqlite3").write_bytes(b"still here")
+        planted = ["present.sqlite3", "notes/readme.txt", "../escape.sqlite3", "matches//double.sqlite3",
+                   "back\\slash.sqlite3"]
+        genuine = "matches/gone/orphan.sqlite3"  # published にあり、part_files に無く、手元にも無い
+        conn = sqlite3.connect(self.opts.state)
+        for path in planted + [genuine]:
+            conn.execute("INSERT INTO published(path,sha256,bytes,published_at) VALUES(?,?,?,?)", (path, "x", 1, "t"))
+        conn.commit()
+        conn.close()
+        self.fake.calls.clear()
+        summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual(summary["deleted"], [genuine])
+        self.assertEqual(self.deletefile_calls(),
+                         [["/usr/bin/rclone-fake", "/nonexistent/rclone.conf", "deletefile",
+                           f"gdrive:SQuidLite3/db/{genuine}"]])
+        after = self.published()
+        for path in planted + ["README_FOR_AI.md", "catalog.sqlite3"]:
+            self.assertIn(path, after, path)
+        self.assertNotIn(genuine, after)
+        self.assertEqual((out / "present.sqlite3").read_bytes(), b"still here")
+
+    def test_catalog_is_sent_again_when_a_part_left_the_catalog_even_if_nothing_else_changed(self):
+        # 通常は変更追跡の through が進むので目録は送り直されるが、部品が目録から外れた周期は、それだけでも送り直す
+        parts_worker.run_cycle(self.opts)
+        real_build = parts_worker.build_parts
+
+        def build_that_removed_a_part(*args, **kwargs):
+            result = real_build(*args, **kwargs)
+            result["removed_parts"] = ["unplaced/some-removed-part.sqlite3"]
+            return result
+
+        idle = parts_worker.run_cycle(self.opts)  # 対照: 何も変わらず、部品も外れない周期は目録を送らない
+        self.assertFalse(idle["catalog_published"])
+        with mock.patch.object(parts_worker, "build_parts", build_that_removed_a_part):
+            summary = parts_worker.run_cycle(self.opts)
+        self.assertEqual((summary["rebuilt"], summary["uploaded"]), (0, 0))
+        self.assertTrue(summary["catalog_published"])
+
+    def test_deletion_failure_makes_once_exit_one_and_removal_shows_in_the_json_line(self):
+        self.start_with_pending_match()
+        self.attach_detail()
+        self.fake.delete_fail = {PENDING}
+        code, text = self.run_main(self.argv())
+        self.assertEqual(code, 1)
+        data = json.loads(text)
+        self.assertEqual((data["deleted"], data["delete_failed"], data["failed"]), ([], 1, 0))
+        self.fake.delete_fail = set()
+        code, text = self.run_main(self.argv())
+        self.assertEqual(code, 0)
+        data = json.loads(text)
+        self.assertEqual((data["deleted"], data["delete_failed"]), ([PENDING], 0))
+
+
 class HashsumParseTests(unittest.TestCase):
     def test_parse(self):
         h = "a" * 64
@@ -330,6 +583,21 @@ class HashsumParseTests(unittest.TestCase):
             parts_worker.parse_hashsum(f"{h}  matches/a b/x.sqlite3\nnot a line\n{h.upper()}  y.sqlite3\n"),
             {"matches/a b/x.sqlite3": h, "y.sqlite3": h},
         )
+
+
+class RemotePathTests(unittest.TestCase):
+    def test_remote_path(self):
+        self.assertEqual(parts_worker.remote_path("gdrive:SQuidLite3/db", "a/b.sqlite3"), "gdrive:SQuidLite3/db/a/b.sqlite3")
+        self.assertEqual(parts_worker.remote_path("gdrive:SQuidLite3/db/", "a/b.sqlite3"), "gdrive:SQuidLite3/db/a/b.sqlite3")
+        self.assertEqual(parts_worker.remote_path("gdrive:", "a/b.sqlite3"), "gdrive:a/b.sqlite3")
+
+    def test_part_addresses(self):
+        ok = parts_worker._is_part_address
+        self.assertTrue(ok("matches/xmatch/AREA/2026-10/2026-10-05/m1.sqlite3"))
+        self.assertTrue(ok("unplaced/match_tags.sqlite3"))
+        for bad in ("catalog.sqlite3", "README_FOR_AI.md", "notes/readme.txt", "../x.sqlite3", "/abs.sqlite3",
+                    "a//b.sqlite3", "a/./b.sqlite3", "a\\b.sqlite3", "a/b.sqlite3\x00"):
+            self.assertFalse(ok(bad), bad)
 
 
 if __name__ == "__main__":
